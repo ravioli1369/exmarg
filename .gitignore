@@ -26,6 +26,7 @@ data/year/
 !src/exmarg/priors.py
 !src/exmarg/profiles.py
 !src/exmarg/tables.py
+!src/exmarg/glitches.py
 !src/exmarg/search/
 !src/exmarg/search/*.py
 !src/exmarg/data/
@@ -57,6 +58,11 @@ data/year/
 !scripts/build_population.py
 !scripts/build_tables/
 !scripts/build_tables/*.py
+!scripts/validate/
+!scripts/validate/*.py
+!scripts/real_data/
+!scripts/real_data/*.py
 !tests/
 !tests/conftest.py
 !tests/test_tables.py
+!tests/*.py
