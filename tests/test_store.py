@@ -16,7 +16,7 @@ def test_unbias_subtracts_the_second_differences():
     got = (T - unbias(T.astype(np.float32)))[:, :, 1:-1, 1:-1]
     err = np.abs(got - second / 12.0).max()
     assert err < 5e-6, 'interior of T - unbias(T) differs from (second differences)/12 by %.1e' % err
-    edge = np.abs((T - unbias(T.astype(np.float32)))[:, :, 0, 1:-1] - (second - 2 * 1.3 * hb ** 2) / 12.0).max()
+    edge = np.abs((T - unbias(T.astype(np.float32)))[:, :, 0, 1:-1] - ((second - 2 * 1.3 * hb ** 2) / 12.0)[:, :, 0, :]).max()
     assert edge < 5e-6, 'the end point along beta must keep its value along beta (error %.1e)' % edge
 
 
