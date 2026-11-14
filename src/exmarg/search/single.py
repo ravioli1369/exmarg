@@ -244,6 +244,12 @@ def _weights(weights, nt, xp):
     return xp.ones(nt) if weights is None else xp.asarray(weights, xp.float64)
 
 
+def _weight_rows(weights, nt, xp):
+    """weights as rows (n_w, n_time), and whether they were given as one row"""
+    W = _weights(weights, nt, xp)
+    return (W[None, :], True) if W.ndim == 1 else (W, False)
+
+
 def _wmax(lq, ln_u, xp):
     return xp.exp(2.0 * lq.max(axis=1).astype(xp.float64) - xp.asarray(ln_u, xp.float64))
 
@@ -294,54 +300,56 @@ def _quiet_columns(lnT, J, xp):
 def ln_evidence(lq, ln_u, lnT, weights=None, xp=np, block=256, vloud=VLOUD):
     """ln E[m, c] = ln (1/n_time) sum_t weights[t] T_c(w_m(t)) for tabulated columns.
 
-    lq, ln_u, weights  as for histogram
+    lq, ln_u           as for histogram
     lnT                (NV, n_col) ln T_c(V^2), e.g. glitch_columns() and merger_columns(s) side by side,
                        non-decreasing in v (every column of this module is), on the device of xp
+    weights            None, (n_time,) a weight per arrival time, or (n_w, n_time) n_w sets of them, read in
+                       one pass over the trajectories
 
     below vloud T is interpolated linearly in v, E = (H @ T - D @ Q) / n_time with the histogram H and the
     curvature term D @ Q of the interpolation; above vloud ln T is interpolated linearly in v, one arrival time
-    at a time.  returns (n_template, n_col) float64 on the device."""
+    at a time.  returns (n_template, n_col), or (n_w, n_template, n_col), float64 on the device."""
     nm, nt = lq.shape
-    wt = _weights(weights, nt, xp)
+    W, one = _weight_rows(weights, nt, xp)
     J = int(round(vloud / DV)) + 2
     B, Q, top = _quiet_columns(lnT, J, xp)              # every column spans less than 600 nats below vloud
     nc = lnT.shape[1]
-    out = xp.empty((nm, nc))
+    out = xp.empty((W.shape[0], nm, nc))
     for a in range(0, nm, block):
         b = min(a + block, nm)
         v = _v(lq[a:b], ln_u[a:b], xp)
         j, f = _cic(v, xp)
-        H, D = _quiet(v, j, f, wt, xp, J)
-        with np.errstate(divide="ignore"):
-            quiet = xp.log(_dot(H, B) - _dot(D, Q)) + top[None, :]
         jm, fm = _cic(v.max(axis=1), xp)                # the loudest time of each template sets its scale
         shift = (1.0 - fm)[:, None] * lnT[jm] + fm[:, None] * lnT[jm + 1]
         r, t = xp.nonzero(v > vloud)
         val = (1.0 - f[r, t])[:, None] * lnT[j[r, t]] + f[r, t][:, None] * lnT[j[r, t] + 1]
-        loud = xp.bincount((r[:, None] * nc + xp.arange(nc)[None, :]).ravel(),
-                           weights=(wt[t][:, None] * xp.exp(val - shift[r])).ravel(), minlength=(b - a) * nc)
-        with np.errstate(divide="ignore"):
-            out[a:b] = xp.logaddexp(quiet, xp.log(loud.reshape(b - a, nc)) + shift) - np.log(nt)
-    return out
+        X, idx = xp.exp(val - shift[r]), (r[:, None] * nc + xp.arange(nc)[None, :]).ravel()
+        for i, wt in enumerate(W):
+            H, D = _quiet(v, j, f, wt, xp, J)
+            loud = xp.bincount(idx, weights=(wt[t][:, None] * X).ravel(), minlength=(b - a) * nc)
+            with np.errstate(divide="ignore"):
+                quiet = xp.log(_dot(H, B) - _dot(D, Q)) + top[None, :]
+                out[i, a:b] = xp.logaddexp(quiet, xp.log(loud.reshape(b - a, nc)) + shift) - np.log(nt)
+    return out[0] if one else out
 
 
 def ln_merger_at(lq, ln_u, s, weights=None, xp=np, block=256, vloud=VLOUD):
     """ln Lam^I(m) = ln (1/n_time) sum_t weights[t] Phi(w_m(t); s[m]) at a signal power per template.
 
     s (n_template,) on the host, the rest as for ln_evidence, whose interpolation it repeats with Phi computed at
-    the grid points it needs.  returns (n_template,) float64 on the device."""
+    the grid points it needs.  returns (n_template,), or (n_w, n_template), float64 on the device."""
     nm, nt = lq.shape
-    wt = _weights(weights, nt, xp)
+    W, one = _weight_rows(weights, nt, xp)
     s = np.asarray(s, float)
     J = int(round(vloud / DV)) + 2
-    out = xp.empty(nm)
+    out = xp.empty((W.shape[0], nm))
     for a in range(0, nm, block):
         b = min(a + block, nm)
         sb = s[a:b]
         v = _v(lq[a:b], ln_u[a:b], xp)
         j, f = _cic(v, xp)
         jm, _ = _cic(v.max(axis=1), xp)
-        H, D = _quiet(v, j, f, wt, xp, J)
+        H, D = _quiet(v, j, f, xp.ones(nt), xp, J)     # the grid points and cells the times reach
         rq, cq = xp.nonzero(H)
         rd, cd = xp.nonzero(D)
         rl, tl = xp.nonzero(v > vloud)
@@ -357,12 +365,15 @@ def ln_merger_at(lq, ln_u, s, weights=None, xp=np, block=256, vloud=VLOUD):
         P = [xp.exp(val[part[i]:part[i + 1]] - shift[rd]) for i in range(4, 8)]           # Phi at j-1, j, j+1, j+2
         Q = xp.minimum(0.25 * (P[0] - P[1] - P[2] + P[3]), P[1] + P[2])
         lin = (1.0 - f[rl, tl]) * lj + f[rl, tl] * lj1
-        tot = (xp.bincount(rq, weights=H[rq, cq] * xp.exp(lnq - shift[rq]), minlength=b - a)
-               - xp.bincount(rd, weights=D[rd, cd] * Q, minlength=b - a)
-               + xp.bincount(rl, weights=wt[tl] * xp.exp(lin - shift[rl]), minlength=b - a))
-        with np.errstate(divide="ignore"):
-            out[a:b] = shift + xp.log(tot) - np.log(nt)
-    return out
+        eq, el = xp.exp(lnq - shift[rq]), xp.exp(lin - shift[rl])
+        for i, wt in enumerate(W):
+            H, D = _quiet(v, j, f, wt, xp, J)
+            tot = (xp.bincount(rq, weights=H[rq, cq] * eq, minlength=b - a)
+                   - xp.bincount(rd, weights=D[rd, cd] * Q, minlength=b - a)
+                   + xp.bincount(rl, weights=wt[tl] * el, minlength=b - a))
+            with np.errstate(divide="ignore"):
+                out[i, a:b] = shift + xp.log(tot) - np.log(nt)
+    return out[0] if one else out
 
 
 def _host(a):
@@ -412,11 +423,37 @@ def glitch_time_series(lq, ln_u, pi_k, pi_m=None, xp=np, edges=RHO_EDGES, block=
 def glitch_time_weights(ln_lg, half_window, xp=np):
     """kbar(t') = 1 - sum_{|t - t'| <= half_window} l_g(t) / sum_t l_g(t), the probability that the glitch is
     away from t', circular in t, clipped to [0, 1].  ln_lg (n_time,) = glitch_time_series(...), half_window in
-    samples.  returns (n_time,)"""
+    samples (< 0: an empty window, kbar = 1).  returns (n_time,)"""
     n = ln_lg.size
     hw = int(half_window)
+    if hw < 0:
+        return xp.ones(n)
     if 2 * hw + 1 >= n:
         return xp.zeros(n)
     p = xp.exp(ln_lg - ln_lg.max())
     c = xp.concatenate([xp.zeros(1), xp.cumsum(xp.concatenate([p[n - hw:], p, p[:hw]]))])
     return xp.clip(1.0 - (c[2 * hw + 1:] - c[:n]) / p.sum(), 0.0, 1.0)
+
+
+def near_fraction(kbar, lags, xp=np):
+    """o(t) = <1 - kbar[(t + tau) mod n_time]>_tau, the mean with equal weights over the lags tau (samples) of the
+    probability that the glitch with the time weights kbar (n_time,) is near the time t + tau: o_H(t) of the L
+    arrival time t is near_fraction(kbar_H, lags), o_L(t') of the H arrival time t' near_fraction(kbar_L, -lags).
+    returns (n_time,)"""
+    near = 1.0 - kbar
+    acc = xp.zeros(near.shape)
+    for tau in np.asarray(lags, int).ravel():
+        acc += xp.roll(near, -int(tau))
+    return acc / np.asarray(lags).size
+
+
+def amplitude_weights(edges=RHO_EDGES, gamma=4.0, rho_min=4.0):
+    """pi_k (n_rho,): the probability of the amplitude bin [edges[k], edges[k+1]] for dN/drho ~ rho^-gamma above
+    rho_min and zero below, normalized over the bins; the default is the fiducial law of the glitch-time weights"""
+    e = np.asarray(edges, float)
+    a, b = np.maximum(e[:-1], rho_min), e[1:]
+    ok = b > a
+    a, b = np.where(ok, a, 1.0), np.where(ok, b, 1.0)
+    w = np.log(b / a) if gamma == 1.0 else (a ** (1.0 - gamma) - b ** (1.0 - gamma)) / (gamma - 1.0)
+    w = np.where(ok, w, 0.0)
+    return w / w.sum()
