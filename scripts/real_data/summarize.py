@@ -77,7 +77,7 @@ def fit(out, variant, a):
     path = os.path.join(out, variant)
     if not glob.glob(os.path.join(path, 'plant_*.npz')):
         return None
-    return plant_fit.report(path, veto_w=a.veto_w, w_inf_max=a.w_inf_max, rho_mins=a.rho_min)
+    return plant_fit.report(path, veto_w=a.veto_w, w_inf_max=a.w_inf_max, rho_mins=a.rho_min, monitor_cut=a.monitor_cut)
 
 
 def main(argv=None):
@@ -87,15 +87,18 @@ def main(argv=None):
     p.add_argument('--rho-min', type=float, nargs='+', default=None, help='as plant_fit.py (default 5 4.5 6)')
     p.add_argument('--veto-w', type=float, default=plant_fit.VETO_W)
     p.add_argument('--w-inf-max', type=float, default=plant_fit.W_INF_MAX)
+    p.add_argument('--monitor-cut', type=float, default=None, help='as plant_fit.py: set aside segments with a band '
+                   'power this many widths above the median')
     a = p.parse_args(argv)
     results = {}
     for v in ORDER:
         results[v] = fit(a.out, v, a)
         print('fitted %s' % v if results[v] is not None else 'no files in %s' % os.path.join(a.out, v), flush=True)
     rho = next((r['rho_min'] for r in results.values() if r is not None), None)
-    print('\nthe week, in the order fixed before the first run; loudness veto w > %g, glitch law from rho_min %s; '
+    print('\nthe week, in the order fixed before the first run; loudness veto w > %g%s, glitch law from rho_min %s; '
           'evidence: ln of the evidence ratio against no mergers, prior uniform in ln nbar on [%g, %g]\n'
-          % (a.veto_w, plant_fit._f(rho, '%g'), plant_fit.PRIOR[0], plant_fit.PRIOR[1]))
+          % (a.veto_w, '' if a.monitor_cut is None else ', band-power cut at %g widths' % a.monitor_cut,
+             plant_fit._f(rho, '%g'), plant_fit.PRIOR[0], plant_fit.PRIOR[1]))
     print('\n'.join(table([row(v, results[v]) for v in ORDER])), flush=True)
     passed = all(results[v] is not None and results[v]['ok'] for v in ORDER)
     if not a.recorded:

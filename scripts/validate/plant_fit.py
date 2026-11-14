@@ -235,7 +235,7 @@ def _consistent_with_zero(r):
 
 
 def report(directory, rho_min_fit=False, veto_w=VETO_W, w_inf_max=W_INF_MAX, rho_mins=None, veto_law='hard',
-           veto_offset=VETO_OFFSET, veto_width=VETO_WIDTH):
+           veto_offset=VETO_OFFSET, veto_width=VETO_WIDTH, monitor_cut=None):
     """everything plant_fit prints: dict with lines (the text), kind, counts, keep, rho_cut, fits, scan, unit, curves,
     criteria [(name, ok, text, counted)], ok (every counted criterion passes).  rho_mins: lower ends of the fitted
     glitch law, the first for every fit and criterion, all of them for the joint fit side by side (default: the
@@ -302,6 +302,15 @@ def report(directory, rho_min_fit=False, veto_w=VETO_W, w_inf_max=W_INF_MAX, rho
     rho_cut = float(np.sqrt(2.0 * veto_w))
     loud = {I: d['wmax_' + I] > veto_w for I in 'HL'}
     keep = ~(loud['H'] | loud['L'])
+    noisy = {I: np.zeros(n, bool) for I in 'HL'}
+    if monitor_cut is not None:
+        if 'monitor_H' not in d or 'monitor_L' not in d:
+            raise SystemExit('--monitor-cut needs the band-power monitors that analyse.py stores')
+        for I in 'HL':
+            mon = np.asarray(d['monitor_' + I], float)
+            width = 0.5 * (np.quantile(mon, 0.84, axis=0) - np.quantile(mon, 0.16, axis=0))
+            noisy[I] = ((mon - np.median(mon, axis=0)) / width).max(axis=1) >= monitor_cut
+        keep &= ~(noisy['H'] | noisy['L'])
     out = ~keep
     signal = d['merger_H'] | d['merger_L']
     L.append('\nloudness veto: a segment is set aside when wmax_H or wmax_L exceeds %g (single-detector matched-filter '
@@ -310,6 +319,11 @@ def report(directory, rho_min_fit=False, veto_w=VETO_W, w_inf_max=W_INF_MAX, rho
         ([('merger %d' % (out & signal).sum())] if merger_known else []) + \
         ([('neither glitch nor merger %d' % (out & ~gH & ~gL & ~signal).sum())]
          if glitch_known and merger_known else [])
+    if monitor_cut is not None:
+        L.append('band-power cut: a segment is also set aside when the whitened power of one of its bands, in either '
+                 'detector, is %g or more widths above the median over the segments (width: half the 16 to 84 percent '
+                 'range); H %d, L %d, either %d'
+                 % (monitor_cut, noisy['H'].sum(), noisy['L'].sum(), (noisy['H'] | noisy['L']).sum()))
     L.append('  set aside %d of %d segments%s' % (out.sum(), n, '; by truth (a segment can count twice): ' + ', '.join(
         by_truth) if by_truth else ''))
     L.append('  by detector: H above %g in %d%s, L in %d%s'
@@ -484,10 +498,14 @@ def main(argv=None):
                         'Neither removes the bias of the slopes (6 sigma at 300000 toy segments; none with a veto on '
                         'the true SNR): the evidences assume the amplitude uniform inside a bin, which the veto on the '
                         'noisy SNR changes next to the cut')
+    p.add_argument('--monitor-cut', type=float, default=None,
+                   help='also set aside a segment whose whitened power in one band of one detector is this many '
+                        'widths (half the 16 to 84 percent range) above the median (needs the monitors of analyse.py)')
     p.add_argument('--veto-offset', type=float, default=VETO_OFFSET, help='soft: mean of sqrt(2 wmax) - rho')
     p.add_argument('--veto-width', type=float, default=VETO_WIDTH, help='soft: its standard deviation')
     a = p.parse_args(argv)
-    r = report(a.results, a.rho_min_fit, a.veto_w, a.w_inf_max, a.rho_min, a.veto_law, a.veto_offset, a.veto_width)
+    r = report(a.results, a.rho_min_fit, a.veto_w, a.w_inf_max, a.rho_min, a.veto_law, a.veto_offset, a.veto_width,
+               a.monitor_cut)
     print('\n'.join(r['lines']), flush=True)
     return 0 if r['ok'] else 1
 
