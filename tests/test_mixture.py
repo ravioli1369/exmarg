@@ -268,6 +268,34 @@ def test_amplitude_weights_rho_max():
             mixture.amplitude_weights(EDGES, 3.0, r0, r1)
 
 
+def law_soft(edges, gamma, rho_min, veto, rho_max=np.inf):
+    """bin probabilities of rho^-gamma Phi((cut - rho - offset) / width) on [rho_min, rho_max], by quadrature"""
+    from scipy.special import ndtr
+    cut, off, width = veto
+    lo, hi = np.maximum(edges[:-1], rho_min), np.minimum(edges[1:], rho_max)
+    p = np.array([quad(lambda r: r ** -gamma * ndtr((cut - r - off) / width), a, b, epsabs=0, epsrel=1e-13)[0]
+                  if b > a else 0.0 for a, b in zip(lo, hi)])
+    return p / p.sum()
+
+
+def test_amplitude_weights_soft_veto():
+    """pi_k of the glitches that pass a soft veto, rho^-gamma Phi((cut - rho - offset) / width), against quadrature
+    (cut inside a bin and on an edge, gamma across 1 and negative, narrow and wide widths, with rho_max): agree to
+    1e-10; a cut far above the last edge is the law without a veto, and a narrow width tends to the hard cut at
+    cut - offset"""
+    for g, r0, veto, r1 in ((3.0, 6.0, (12.0, 0.1, 1.0), np.inf), (3.0, 6.0, (11.0, 0.0, 0.3), np.inf),
+                            (1.0, 3.3, (12.0, 0.2, 1.0), np.inf), (-2.0, 4.5, (20.0, -0.5, 2.0), np.inf),
+                            (6.0, 2.0, (8.0, 0.1, 1.0), 25.0), (2.5, 6.0, (12.0, 0.1, 1.0), 13.0)):
+        pk = mixture.amplitude_weights(EDGES, g, r0, None if r1 == np.inf else r1, veto)
+        ref = law_soft(EDGES, g, r0, veto, r1)
+        assert np.max(np.abs(pk - ref)) < 1e-10, (g, r0, veto, r1, np.max(np.abs(pk - ref)))
+        assert abs(pk.sum() - 1) < 1e-13 and np.all(pk[EDGES[1:] <= r0] == 0)
+    far = mixture.amplitude_weights(EDGES, 3.0, 6.0, veto=(1e4, 0.0, 1.0))
+    assert np.allclose(far, mixture.amplitude_weights(EDGES, 3.0, 6.0), rtol=1e-12, atol=0)
+    narrow = mixture.amplitude_weights(EDGES, 3.0, 6.0, veto=(12.1, 0.1, 1e-3))
+    assert np.max(np.abs(narrow - mixture.amplitude_weights(EDGES, 3.0, 6.0, 12.0))) < 2e-3
+
+
 def test_log_and_linear_forms_agree():
     """ln_ variants equal the logs of the linear ones to 1e-12, a trailing grid broadcasts, eps = 0 gives Lambda_S,
     and time_curve equals the integral over the prior done segment by segment"""
@@ -677,6 +705,13 @@ def test_fit_rho_max():
     r = fit(ev, fixed=('nbar', 'eps_H', 'eps_L', 'gamma_H', 'gamma_L'), start=dict(st, rho_min_H=9.5, rho_min_L=9.5),
             rho_max=12.0)
     assert 2.0 <= r['rho_min_H'] <= 10.0 and 2.0 <= r['rho_min_L'] <= 10.0, (r['rho_min_H'], r['rho_min_L'])
+    v = (12.0, 0.1, 1.0)
+    s = fit(ev, fixed=ONLY_NBAR, start=st, veto=v)
+    t = fit(ev, fixed=('eps_H', 'eps_L'), start=st, pi_k_H=mixture.amplitude_weights(EDGES, 3.0, 6.0, veto=v),
+            pi_k_L=mixture.amplitude_weights(EDGES, 4.0, 6.0, veto=v))
+    msg = 'soft veto: nbar %.9g, ln L %.9g; bins: nbar %.9g, ln L %.9g' % (s['nbar'], s['lnl'], t['nbar'], t['lnl'])
+    assert abs(s['nbar'] / t['nbar'] - 1) < 1e-9 and abs(s['lnl'] - t['lnl']) < 1e-9 * abs(s['lnl']), msg
+    assert abs(s['lnl'] - a['lnl']) > 1.0, msg
 
 
 def test_two_stage_loud():

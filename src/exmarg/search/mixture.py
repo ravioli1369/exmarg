@@ -29,9 +29,10 @@ overflow.
 
 import numpy as np
 from scipy.optimize import minimize
-from scipy.special import exprel, logsumexp
+from scipy.special import exprel, log_ndtr, logsumexp
 
 PARAMETERS = ('nbar', 'eps_H', 'eps_L', 'gamma_H', 'gamma_L', 'rho_min_H', 'rho_min_L')
+_GL = np.polynomial.legendre.leggauss(24)
 
 
 def _log(x):
@@ -45,7 +46,7 @@ def _trail(a, ndim):
     return a.reshape(a.shape + (1,) * (ndim - a.ndim))
 
 
-def ln_amplitude_weights(rho_edges, gamma, rho_min, rho_max=None):
+def ln_amplitude_weights(rho_edges, gamma, rho_min, rho_max=None, veto=None):
     """ln pi_k (n_rho,), see amplitude_weights"""
     e = np.asarray(rho_edges, float)
     a, b = np.maximum(e[:-1], rho_min), e[1:] if rho_max is None else np.minimum(e[1:], rho_max)
@@ -53,6 +54,14 @@ def ln_amplitude_weights(rho_edges, gamma, rho_min, rho_max=None):
     if not ok.any() or a[ok][0] <= 0.0:
         raise ValueError('rho_min = %g, rho_max = %s leave no bin of positive amplitude in [%g, %g]'
                          % (rho_min, rho_max, e[0], e[-1]))
+    if veto is not None:
+        cut, offset, width = veto
+        la, lb = np.log(a[ok]), np.log(b[ok])
+        x = 0.5 * (lb - la)[:, None] * _GL[0][None, :] + 0.5 * (lb + la)[:, None]
+        lnf = (1.0 - gamma) * x + log_ndtr((cut - np.exp(x) - offset) / width) + np.log(_GL[1])[None, :]
+        lnw = np.full(a.size, -np.inf)
+        lnw[ok] = np.log(0.5 * (lb - la)) + logsumexp(lnf, axis=1)
+        return lnw - logsumexp(lnw)
     la = np.log(np.where(ok, a, 1.0))
     d = np.log(np.where(ok, b, np.e)) - la
     x = (1.0 - gamma) * d                                   # int_a^b rho^-gamma = a^(1-gamma) d exprel(x)
@@ -60,11 +69,13 @@ def ln_amplitude_weights(rho_edges, gamma, rho_min, rho_max=None):
     return lnw - logsumexp(lnw)
 
 
-def amplitude_weights(rho_edges, gamma, rho_min, rho_max=None):
+def amplitude_weights(rho_edges, gamma, rho_min, rho_max=None, veto=None):
     """pi_k (n_rho,): the probability of the bin [rho_edges[k], rho_edges[k+1]] for dN/drho ~ rho^-gamma on
     [rho_min, rho_max] and zero outside, normalized over the bins (rho_edges (n_rho + 1,) ascending; rho_max None: the
-    last edge)"""
-    return np.exp(ln_amplitude_weights(rho_edges, gamma, rho_min, rho_max))
+    last edge).  veto = (cut, offset, width): the law of the glitches that pass a veto on the measured SNR at cut, the
+    measured SNR being rho + offset + width N(0, 1): rho^-gamma times Phi((cut - rho - offset) / width) integrated over
+    each bin (Gauss-Legendre in ln rho, 24 nodes), in place of a hard cut"""
+    return np.exp(ln_amplitude_weights(rho_edges, gamma, rho_min, rho_max, veto))
 
 
 def _template_average(E, pi_m, log):
@@ -199,13 +210,13 @@ def _ln_dot(scaled, pi_k):
 class _Model:
     """ln L(theta) on fixed per-segment arrays; per-bin arrays are rescaled per segment for a fast pi_k product"""
 
-    def __init__(self, lam, lam_gH, lam_gL, lam_gHL, E_H, E_L, rho_edges, pi_m, log, sg, pi_k, rho_max=None):
+    def __init__(self, lam, lam_gH, lam_gL, lam_gHL, E_H, E_L, rho_edges, pi_m, log, sg, pi_k, rho_max=None, veto=None):
         conv = (lambda a: np.asarray(a, float)) if log else _log
         avg = (lambda a: _template_average(a, pi_m, True)) if log else \
             (lambda a: _log(_template_average(a, pi_m, False)))
         self.lnS = conv(lam)
         self.lnHL = None if lam_gHL is None else conv(lam_gHL)
-        self.edges, self.sg, self.pi_k, self.rho_max = np.asarray(rho_edges, float), sg, pi_k, rho_max
+        self.edges, self.sg, self.pi_k, self.rho_max, self.veto = np.asarray(rho_edges, float), sg, pi_k, rho_max, veto
         self.A = {I: _scaled(avg(E)) for I, E in (('H', E_H), ('L', E_L))}
         self.lng, self.Y = {}, {}
         for I, a in (('H', lam_gH), ('L', lam_gL)):
@@ -218,7 +229,7 @@ class _Model:
         for I in 'HL':
             pk = self.pi_k[I]
             if pk is None:
-                pk = amplitude_weights(self.edges, th['gamma_' + I], th['rho_min_' + I], self.rho_max)
+                pk = amplitude_weights(self.edges, th['gamma_' + I], th['rho_min_' + I], self.rho_max, self.veto)
             lnG[I] = _ln_dot(self.A[I], pk)
             lng[I] = self.lng[I] if self.Y[I] is None else _ln_dot(self.Y[I], pk) - lnG[I]
         lnB, cH, cL = _ln_mixture(self.lnS, lng['H'], lng['L'], lnG['H'], lnG['L'], th['eps_H'], th['eps_L'],
@@ -246,7 +257,7 @@ def _hessian(f, x, lo, hi, h, diagonal=False):
 
 
 def fit(lam, lam_gH, lam_gL, E_H, E_L, rho_edges, start=None, fixed=('rho_min_H', 'rho_min_L'), bounds=None,
-        pi_m=None, log=False, sg=True, lam_gHL=None, pi_k_H=None, pi_k_L=None, rho_max=None):
+        pi_m=None, log=False, sg=True, lam_gHL=None, pi_k_H=None, pi_k_L=None, rho_max=None, veto=None):
     """the maximum of ln L over PARAMETERS = (nbar, eps_H, eps_L, gamma_H, gamma_L, rho_min_H, rho_min_L).
 
     lam                  (n_segment,) Lambda_S averaged over the population
@@ -269,6 +280,8 @@ def fit(lam, lam_gH, lam_gL, E_H, E_L, rho_edges, start=None, fixed=('rho_min_H'
                          law, whose gamma and rho_min are then fixed
     rho_max              upper end of the power law of both detectors, held fixed: no weight above it, the bins
                          renormalized (None: the last edge), e.g. sqrt(2 w) of a veto on the loudest w
+    veto                 (cut, offset, width), held fixed: the law times the probability of passing a veto on the
+                         measured SNR, a soft cut (amplitude_weights)
 
     L-BFGS-B in logit(nbar), logit(eps), gamma, ln rho_min; the covariance is the inverse of minus the Hessian in
     the parameters themselves, by central differences (moved inside the bounds for an estimate on one).
@@ -277,7 +290,7 @@ def fit(lam, lam_gH, lam_gL, E_H, E_L, rho_edges, start=None, fixed=('rho_min_H'
     (n_free, n_free), lnl (the maximum), result (scipy OptimizeResult)"""
     pk = dict(H=pi_k_H, L=pi_k_L)
     model = _Model(lam, lam_gH, lam_gL, lam_gHL, E_H, E_L, rho_edges, pi_m, log, sg,
-                   {I: None if v is None else np.asarray(v, float) for I, v in pk.items()}, rho_max)
+                   {I: None if v is None else np.asarray(v, float) for I, v in pk.items()}, rho_max, veto)
     fixed = tuple(fixed) + tuple(p + '_' + I for I in 'HL' if pk[I] is not None for p in ('gamma', 'rho_min'))
     e = model.edges
     th0 = dict(nbar=0.01, eps_H=0.01, eps_L=0.01, gamma_H=3.0, gamma_L=3.0, rho_min_H=e[0], rho_min_L=e[0])

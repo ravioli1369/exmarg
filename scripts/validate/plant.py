@@ -262,9 +262,14 @@ def batches(start, n, batch):
     return list(zip(cuts[:-1], cuts[1:]))
 
 
+def default_ymin():
+    """ymin of pe_redshift: D0 / D_L(zmax) (1 - 1e-6), so that the row z = zmax of the grid is inside the store"""
+    return float(D0 / _dl_of_z(GRID['zmax'])[0] * (1.0 - 1e-6))
+
+
 def campaign(args):
     """the settings that fix the data and the analysis: the same in every file of a campaign"""
-    ymin = float(D0 / _dl_of_z(GRID['zmax'])[0] * (1.0 - 1e-6)) if args.ymin is None else float(args.ymin)
+    ymin = default_ymin() if args.ymin is None else float(args.ymin)
     cfg = dict(version=VERSION, seed=args.seed, nbar=args.nbar, eps_H=args.eps_H, eps_L=args.eps_L,
                glitch_kind=args.glitch_kind, gamma=args.gamma, rho_min=args.rho_min, rho_max=args.rho_max,
                control=args.control, shift=SHIFT, T=T, fmin=FMIN, fmax=FMAX, zmin=args.zmin, mdet_range=MDET,

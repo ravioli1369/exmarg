@@ -491,7 +491,7 @@ def test_plant_fit_bookkeeping(toy_dirs, capsys):
         c = mixture.time_curve(v, grid_, prior, log=True)
         assert np.allclose(r['curves'][key], c, rtol=0, atol=1e-9)
         assert 'end %+.3f, max %+.3f at segment %d of %d' % (c[-1], c.max(), np.argmax(c) + 1, keep.sum()) in text, key
-    crit = {name: (ok, msg) for name, ok, msg in r['criteria']}
+    crit = {name: (ok, msg) for name, ok, msg, _ in r['criteria']}
     err = J['err']['nbar']
     assert crit['mixture nbar within 2.5 sigma of the truth'][0] == (abs(J['nbar'] - TOY['nbar']) < 2.5 * err)
     assert not any(name.startswith('control') for name in crit) and crit['population covered: w_inf < 0.0005'][0]
@@ -519,7 +519,7 @@ def test_plant_fit_failure_and_control(toy_dirs, capsys):
     over the kept segments without a merger signal, not over those without a coherent merger"""
     path, ev, fl, per = toy_dirs['wrong truth']
     r = plant_fit.report(path)
-    crit = {name: (ok, msg) for name, ok, msg in r['criteria']}
+    crit = {name: (ok, msg) for name, ok, msg, _ in r['criteria']}
     J = r['fits']['joint']
     pull = (J['nbar'] - 0.2) / J['err']['nbar']
     assert not crit['mixture nbar within 2.5 sigma of the truth'][0] and abs(pull) > 2.5
@@ -527,15 +527,40 @@ def test_plant_fit_failure_and_control(toy_dirs, capsys):
     assert plant_fit.main([path]) == 1
     path, ev, fl, per = toy_dirs['control']
     r = plant_fit.report(path)
-    crit = {name: (ok, msg) for name, ok, msg in r['criteria']}
+    crit = {name: (ok, msg, counted) for name, ok, msg, counted in r['criteria']}
     J = r['fits']['joint']
-    assert r['truth']['nbar'] == 0.0
-    ok, msg = crit['control: nbar consistent with 0']
-    assert ok == (J['nbar'] < 2.5 * J['err']['nbar']) and not ok, msg
+    assert r['truth']['nbar'] == 0.0 and r['kind'] == 'control'
+    ok, msg, counted = crit['mixture: nbar consistent with 0']
+    assert counted and ok == (J['nbar'] < 2.5 * J['err']['nbar']) and not ok, msg
+    assert not crit['Gaussian: nbar consistent with 0'][2] and not crit['Gaussian: evidence below ln 100'][2]
     curve = r['curves']['mixture']
-    ok, msg = crit['control: time curve below ln 100']
+    ok, msg, counted = crit['mixture: evidence below ln 100']
     assert ok == (curve.max() < np.log(100)) and 'max %+.3f' % curve.max() in msg, msg
     keep = (per['wmax_H'] <= 72) & (per['wmax_L'] <= 72)
     assert not r['data']['coherent'].any() and r['unit']['all']['B - 1, joint fit'][2] == (~fl['m'] & keep).sum()
     capsys.readouterr()
     assert plant_fit.main([path]) == 1
+
+
+def test_plant_fit_soft_veto(toy_dirs):
+    """--veto-law soft: the joint and Smith and Thrane fits on the kept segments equal direct mixture.fit calls with
+    veto = (12, 0.1, 1.0) to 1e-12, the planted model of the unit mean has the planted law times the same probability
+    of passing the veto, and the output says which cut it used"""
+    path, ev, fl, per = toy_dirs['plant']
+    r = plant_fit.report(path, veto_law='soft')
+    keep = (per['wmax_H'] <= 72) & (per['wmax_L'] <= 72)
+    e = kept(ev, keep)
+    v = (12.0, 0.1, 1.0)
+    st = dict(nbar=0.01, eps_H=0.01, eps_L=0.01, gamma_H=3.0, gamma_L=3.0, rho_min_H=RHO_MIN, rho_min_L=RHO_MIN)
+    for key, sg in (('joint', True), ('smith_thrane', False)):
+        d = mixture.fit(e['S'], e['gH'], e['gL'], e['EH'], e['EL'], EDGES, start=st, log=True, sg=sg,
+                        fixed=('rho_min_H', 'rho_min_L'), lam_gHL=e['HL'], veto=v)
+        for p in d['free']:
+            assert abs(r['fits'][key][p] - d[p]) <= 1e-12 * abs(d[p]), (key, p, r['fits'][key][p], d[p])
+        assert abs(r['fits'][key]['lnl'] - d['lnl']) <= 1e-12 * abs(d['lnl'])
+    eps = {I: fl['g' + I][keep].mean() for I in 'HL'}
+    pis = mixture.amplitude_weights(EDGES, GAMMA, RHO_MIN, EDGES[-1], veto=v)
+    lnG = lambda E: mixture.ln_glitch_evidence(E, pis)
+    B = mixture.ln_mixture(e['S'], e['gH'], e['gL'], lnG(e['EH']), lnG(e['EL']), eps['H'], eps['L'], ln_lam_gHL=e['HL'])
+    assert np.allclose(r['lnB_true'], B, rtol=0, atol=1e-10)
+    assert 'soft cut' in '\n'.join(r['lines']) and 'the law up to 12 (soft)' in '\n'.join(r['lines'])
