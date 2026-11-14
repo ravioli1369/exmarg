@@ -457,7 +457,7 @@ def gather_gpu(traj, tables, mass_ids, lna, tab_ids, block=256, times=None, time
     return _variants(cp.asnumpy(_lse_lags(om, os_, n_time, cp)), nv, ns)
 
 
-def select_times(traj, tau_idx, n_loud, n_random, seed, xp=np, block=256):
+def select_times(traj, tau_idx, n_loud, n_random, seed, xp=np, block=256, shared=False):
     """the arrival times visited for every template.
 
     The n_loud times with the largest |z_L(t)|^2 + max_tau |z_H(t + tau)|^2 are
@@ -470,6 +470,11 @@ def select_times(traj, tau_idx, n_loud, n_random, seed, xp=np, block=256):
     traj      dict with lqH, lqL (n_template, n_time) on the device of xp
     tau_idx   the lags of the tables (contiguous integers)
     block     templates ranked at once (bounds the temporary memory)
+    shared    one random draw for every template instead of one per template.
+              The estimate of each template stays unbiased, and neighbouring
+              templates then err together: ln Lambda is interpolated between
+              templates, and the interpolation of two estimates with
+              independent errors, a geometric mean, is biased low.
 
     returns (sel, lw): (n_template, n_loud + n_random) int32 times, sorted,
     and float32 log weights, on the device of xp."""
@@ -480,7 +485,9 @@ def select_times(traj, tau_idx, n_loud, n_random, seed, xp=np, block=256):
     if not np.array_equal(np.sort(lags), np.arange(lo, hi + 1)):
         raise ValueError("lags are not contiguous")
     k = int(np.floor(np.log2(hi - lo + 1)))
-    pick = np.random.default_rng(seed).integers(0, nt - K, size=(nm, S))
+    pick = np.random.default_rng(seed).integers(0, nt - K, size=(1 if shared else nm, S))
+    if shared:
+        pick = np.broadcast_to(pick, (nm, S))
     sel = xp.empty((nm, K + S), xp.int32)
     for a in range(0, nm, block):
         b = min(a + block, nm)

@@ -195,3 +195,25 @@ def test_extreme_weights(case):
     got = gather_cpu(**a, time_weights=(wH, wL))
     assert np.all(np.isfinite(got))
     _close(got, reference(**a, lkH=wH, lkL=wL))
+
+
+def test_select_times_shared():
+    """shared=True: one random draw for every template.  Two templates with the same trajectory then visit the same
+    times, which the default (one draw per template) does not; the selection stays an unbiased estimate of the sum."""
+    rng = np.random.default_rng(5)
+    nt, K, S = 512, 32, 64
+    one = rng.standard_normal((1, nt)).astype(np.float32)
+    traj = dict(lqH=np.repeat(one, 3, axis=0), lqL=np.repeat(rng.standard_normal((1, nt)).astype(np.float32), 3, axis=0))
+    lags = np.arange(-3, 4)
+    sel, lw = select_times(traj, lags, K, S, 11, shared=True)
+    assert np.array_equal(sel[0], sel[1]) and np.array_equal(sel[0], sel[2]) and np.array_equal(lw[0], lw[1])
+    sel0, _ = select_times(traj, lags, K, S, 11)
+    assert not np.array_equal(sel0[0], sel0[1]), 'the default draws once per template'
+    f = np.exp(0.3 * rng.standard_normal(nt))                       # any positive function of the arrival time
+    est = []
+    for seed in range(400):
+        sel, lw = select_times(traj, lags, K, S, seed, shared=True)
+        est.append((f[sel[0]] * np.exp(lw[0])).sum())
+    est = np.array(est)
+    assert abs(est.mean() - f.sum()) < 4 * est.std(ddof=1) / np.sqrt(est.size), \
+        'selected sum %.3f +- %.3f, full sum %.3f' % (est.mean(), est.std(ddof=1) / np.sqrt(est.size), f.sum())

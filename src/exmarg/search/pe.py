@@ -267,7 +267,7 @@ def _single_nodes(one, lamN, geometry, n_rho, far=None, lc0=None):
 
 
 def _node_values(bank, seg, ev, store, geometry, groups, block, resident, n_loud, n_random, seed, single=None,
-                 glitch=None):
+                 glitch=None, shared_times=False):
     """ln Lambda of every template at every node of the redshift store, for the segments ev:
     (len(ev), n_node + 1, n_template), row n_node the boundary point at the smallest amplitude.
     with single (_single_setup) also the dict of _single_nodes, with glitch (_glitch_setup) its glitch terms"""
@@ -278,7 +278,8 @@ def _node_values(bank, seg, ev, store, geometry, groups, block, resident, n_loud
     gw = [None] * len(ev) if glitch is None else [_glitch_weights(t, glitch, single, xp) for t in traj]
     one = None if single is None else [_single_values(t, single, xp, g) for t, g in zip(traj, gw)]
     tw = [None if g is None else g["tw"] for g in gw]
-    times = [_gather.select_times(t, store.tau_idx, n_loud, n_random, seed + int(seg["rows"][e]), xp) if n_loud > 0 else None
+    times = [_gather.select_times(t, store.tau_idx, n_loud, n_random, seed + int(seg["rows"][e]), xp, shared=shared_times)
+             if n_loud > 0 else None
              for t, e in zip(traj, ev)]
     lamN = np.full((len(ev), nn + 1, bank.M.size), -np.inf)
     far = None if glitch is None else np.full((len(ev), 3, nn + 1, bank.M.size), -np.inf)
@@ -345,7 +346,7 @@ def _node_keys(gd):
 def pe_redshift(segments, bank, store, rows=None, chunk=8, zmax=8.0, nz=1600,
                 m1_range=(3.0, 150.0), nm1=1600, ymin=0.1267, nodes_per_launch=6, block=256,
                 mdet_range=(10.0, 500.0), resident=False, n_loud=1024, n_random=1024, seed=0, single=False,
-                glitch=None):
+                glitch=None, shared_times=False):
     """ln Lambda(m1_source, z) of each segment.
 
     segments          anything read_segments takes (see there)
@@ -365,6 +366,7 @@ def pe_redshift(segments, bank, store, rows=None, chunk=8, zmax=8.0, nz=1600,
     n_loud, n_random  arrival times visited per template (gather.select_times);
                       n_loud = 0 visits all of them
     seed              seed of the random draw (plus the segment index)
+    shared_times      the same random arrival times for every template (gather.select_times)
     single            also the single-detector evidences (needs sig2_H == sig2_L)
     glitch            None, or True or a dict of settings: also the merger likelihood ratios
                       given a glitch (implies single), with the glitch-time weights kbar of the
@@ -405,7 +407,8 @@ def pe_redshift(segments, bank, store, rows=None, chunk=8, zmax=8.0, nz=1600,
     extra = _single_out(single, seg["rows"].size, (m1.size, z.size), bank, gd)
     chunk = _fit_chunk(bank, store, chunk, nodes_per_launch, resident)
     for ev in _chunks(seg, chunk):
-        lamN = _node_values(bank, seg, ev, store, geometry, groups, block, resident, n_loud, n_random, seed, sd, gd)
+        lamN = _node_values(bank, seg, ev, store, geometry, groups, block, resident, n_loud, n_random, seed, sd, gd,
+                            shared_times)
         if single:
             lamN, one = lamN
         for j, e in enumerate(ev):
@@ -464,7 +467,7 @@ def _distance_integral(lnW, lam):
 
 def pe_intrinsic(segments, bank, store, rows=None, prior="volume", ymin=0.1267, chunk=4,
                  nodes_per_launch=6, block=256, resident=False, n_loud=1024, n_random=1024, seed=0, single=False,
-                 glitch=None):
+                 glitch=None, shared_times=False):
     """ln Lambda of each template of the bank, the distance integrated over its prior.
 
     segments          anything read_segments takes (see there)
@@ -482,6 +485,7 @@ def pe_intrinsic(segments, bank, store, rows=None, prior="volume", ymin=0.1267, 
     n_loud, n_random  arrival times visited per template (gather.select_times);
                       n_loud = 0 visits all of them
     seed              seed of the random draw (plus the segment index)
+    shared_times      the same random arrival times for every template (gather.select_times)
     single            also the single-detector evidences (needs sig2_H == sig2_L)
     glitch            None, or True or a dict of settings: also the merger likelihood ratios
                       given a glitch (see pe_redshift)
@@ -517,7 +521,8 @@ def pe_intrinsic(segments, bank, store, rows=None, prior="volume", ymin=0.1267, 
     extra = _single_out(single, seg["rows"].size, (bank.u.size,), bank, gd)
     chunk = _fit_chunk(bank, store, chunk, nodes_per_launch, resident)
     for ev in _chunks(seg, chunk):
-        lamN = _node_values(bank, seg, ev, store, geometry, groups, block, resident, n_loud, n_random, seed, sd, gd)
+        lamN = _node_values(bank, seg, ev, store, geometry, groups, block, resident, n_loud, n_random, seed, sd, gd,
+                            shared_times)
         if single:
             lamN, one = lamN
         for j, e in enumerate(ev):

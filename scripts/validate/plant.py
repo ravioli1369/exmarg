@@ -240,7 +240,7 @@ def reduce(res, pop, mdet_range=MDET):
     return out
 
 
-def make_analysis(store, device, resident=False, chunk=CHUNK, ymin=None):
+def make_analysis(store, device, resident=False, chunk=CHUNK, ymin=None, shared_times=False):
     """the analysis behind a narrow interface: factory(segments) builds the bank on these segments (every batch has the
     same frequency grid and noise curve) and returns pe(segments, seed, glitch) -> the pe_redshift dict on GRID, with
     glitch=True or None"""
@@ -251,7 +251,7 @@ def make_analysis(store, device, resident=False, chunk=CHUNK, ymin=None):
 
         def pe(seg, seed, glitch):
             return pe_redshift(seg, bank, store, chunk=chunk, resident=resident, seed=seed, ymin=ymin,
-                               mdet_range=MDET, glitch=True if glitch else None, **GRID)
+                               mdet_range=MDET, glitch=True if glitch else None, shared_times=shared_times, **GRID)
         return pe
     return factory
 
@@ -277,6 +277,8 @@ def campaign(args):
                n_random=1024, glitch_settings='pe default')
     if getattr(args, 'published_tables', False):
         cfg['tables'] = 'published'
+    if getattr(args, 'shared_times', False):
+        cfg['shared_times'] = True
     return json.loads(json.dumps(cfg))
 
 
@@ -373,6 +375,8 @@ def parser():
                    '0.99119, the lower edge of the grid cell at z = 1.025, puts the step on a cell edge')
     p.add_argument('--resident', action='store_true', help='keep every table on the GPU (needs ~48 GB)')
     p.add_argument('--plain', action='store_true', help='also run pe_redshift without glitch, to record its cost')
+    p.add_argument('--shared-times', action='store_true',
+                   help='the same random arrival times for every template (recorded in the campaign)')
     p.add_argument('--published-tables', action='store_true',
                    help='read the tables as published, without unbias (a comparison; recorded in the campaign)')
     p.add_argument('--out', required=True, help='directory of the result files')
@@ -397,7 +401,7 @@ def main(argv=None, factory=None):
             t = time.time()
             store = load_redshift_store(a.store, pinned=(a.device == 'gpu'), unbiased=not a.published_tables)
             print('%s  store loaded, %d nodes (%.0f s)' % (stamp(), store.s.size, time.time() - t), flush=True)
-            return make_analysis(store, a.device, a.resident, a.chunk, cfg['ymin'])(seg)
+            return make_analysis(store, a.device, a.resident, a.chunk, cfg['ymin'], a.shared_times)(seg)
     print('%s  campaign %s; segments %d to %d in batches of %d into %s'
           % (stamp(), json.dumps(cfg), a.start, a.start + a.n - 1, a.batch, a.out), flush=True)
     run(cfg, a.out, a.start, a.n, a.batch, factory, a.plain,

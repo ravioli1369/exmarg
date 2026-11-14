@@ -263,7 +263,7 @@ def test_analysis_wiring(monkeypatch):
     (s, bank, store, kw), (_, bank2, _, kw2) = seen
     assert s is seg and store == 'the store' and bank is bank2 and bank.device == 'cpu'
     assert np.array_equal(bank.M, plant.MASSES) and np.all(bank.q == 1) and np.all(bank.chi == 0)
-    assert kw == dict(chunk=128, resident=False, seed=17, ymin=0.0982, mdet_range=(20.0, 400.0), glitch=True,
+    assert kw == dict(chunk=128, resident=False, seed=17, ymin=0.0982, mdet_range=(20.0, 400.0), glitch=True, shared_times=False,
                       m1_range=(4.0, 200.0), nm1=150, zmax=10.0, nz=150), kw
     assert kw2 == dict(kw, glitch=None)
 
