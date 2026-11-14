@@ -71,7 +71,7 @@ def inputs(rng, n_template, n_time, beta, delta, ns, ntab):
     lna = rng.uniform(mid - 0.25 * (beta[-1] - beta[0]), mid + 0.25 * (beta[-1] - beta[0]), (n_template, ns))
     tab_ids = np.tile(np.arange(ns) % ntab, (n_template, 1))
     lk = [np.log(rng.uniform(0.0, 1.0, n_time)).astype(np.float32) for _ in range(2)]
-    lk[0][::7] = -np.inf                                # zero weights, clipped at -80
+    lk[0][::7] = -np.inf                                # zero weights, replaced by gather.LK_MIN where they are -inf
     return traj, lna, tab_ids, tuple(lk)
 
 

@@ -9,7 +9,7 @@ GPU sums in float32 and is held to 2e-4 against gather_cpu by scripts/validate/g
 import numpy as np
 import pytest
 
-from exmarg.search.gather import gather_cpu, select_times
+from exmarg.search.gather import LK_MIN, gather_cpu, select_times
 
 NPHI = 96
 RTOL = 1e-6
@@ -78,12 +78,12 @@ def _lse(a):
 
 def reference(traj, tables, mass_ids, lna, tab_ids, times=None, lkH=None, lkL=None):
     """(4, NS, nsel): ln( sum_tau sum_t exp(lnS + w_v) ) - ln n_time with w_0 = 0, w_1 = lkH(t + tau),
-    w_2 = lkL(t), w_3 = lkH(t + tau) + lkL(t) (log weights floored at -80), over every t or over the selected t
+    w_2 = lkL(t), w_3 = lkH(t + tau) + lkL(t) (log weights floored at LK_MIN), over every t or over the selected t
     with their log weights"""
     n_time = traj["lqH"].shape[1]
     zero = np.zeros(n_time)
-    wH = zero if lkH is None else np.maximum(np.asarray(lkH, np.float64), -80.0)
-    wL = zero if lkL is None else np.maximum(np.asarray(lkL, np.float64), -80.0)
+    wH = zero if lkH is None else np.maximum(np.asarray(lkH, np.float64), LK_MIN)
+    wL = zero if lkL is None else np.maximum(np.asarray(lkL, np.float64), LK_MIN)
     beta, delta = np.asarray(tables["beta"], float), np.asarray(tables["delta"], float)
     ns = np.shape(tab_ids)[1]
     out = np.empty((4, ns, len(mass_ids)))
@@ -176,19 +176,21 @@ def test_selected_times(case):
 def test_extreme_weights(case):
     a, lkH, lkL = case
     n_time = lkH.size
-    # every H weight zero (-inf, clipped at -80): variant 1 is variant 0 - 80 and variant 3 is variant 2 - 80
+    # every H weight zero (-inf, clipped at LK_MIN): variant 1 is variant 0 + LK_MIN and variant 3 is variant 2 + LK_MIN
     got = gather_cpu(**a, time_weights=(np.full(n_time, -np.inf, np.float32), lkL))
     assert np.all(np.isfinite(got))
-    np.testing.assert_allclose(got[1], got[0] - 80.0, rtol=0, atol=1e-9)
-    np.testing.assert_allclose(got[3], got[2] - 80.0, rtol=0, atol=1e-9)
-    # both zero everywhere: variant 3 is variant 0 - 160
+    np.testing.assert_allclose(got[1], got[0] + LK_MIN, rtol=0, atol=1e-9)
+    np.testing.assert_allclose(got[3], got[2] + LK_MIN, rtol=0, atol=1e-9)
+    # both zero everywhere: variant 3 is variant 0 + 2 LK_MIN
     inf = np.full(n_time, -np.inf, np.float32)
     got = gather_cpu(**a, time_weights=(inf, inf))
-    np.testing.assert_allclose(got[3], got[0] - 160.0, rtol=0, atol=1e-9)
-    # zero weight on half the times and below -80 on a few more, with the loud stretch (t = 38..45) knocked out in L
+    np.testing.assert_allclose(got[3], got[0] + 2 * LK_MIN, rtol=0, atol=1e-9)
+    # zero weight on half the times, large negative weights (-1e4, above the floor; -1e6, below it) on a few more,
+    # with the loud stretch (t = 38..45) knocked out in L
     wH, wL = lkH.copy(), lkL.copy()
     wH[::2] = -np.inf
-    wH[1:20:2] = -1e4
+    wH[1:20:4] = -1e4
+    wH[3:20:4] = -1e6
     wL[30:50] = -np.inf
     got = gather_cpu(**a, time_weights=(wH, wL))
     assert np.all(np.isfinite(got))

@@ -244,10 +244,44 @@ def _weights(weights, nt, xp):
     return xp.ones(nt) if weights is None else xp.asarray(weights, xp.float64)
 
 
-def _weight_rows(weights, nt, xp):
-    """weights as rows (n_w, n_time), and whether they were given as one row"""
-    W = _weights(weights, nt, xp)
+def _ln_weight_rows(weights, nt, xp, log):
+    """the logarithms of the weights as rows (n_w, n_time), and whether they were given as one row"""
+    W = xp.asarray(weights, xp.float64)
+    if not log:
+        with np.errstate(divide="ignore"):
+            W = xp.log(W)
     return (W[None, :], True) if W.ndim == 1 else (W, False)
+
+
+def _run_max(x, r, n, xp):
+    """the largest row of x (n_row, n_col) over each run of equal r (r sorted, template rows 0 .. n - 1), by
+    doubling: (n, n_col), -inf for the rows without any"""
+    counts = xp.bincount(r, minlength=n)
+    k, longest = 1, int(counts.max()) if r.size else 0
+    while k < longest:
+        same = (r[k:] == r[:-k])[:, None]
+        x = xp.concatenate([xp.where(same, xp.maximum(x[:-k], x[k:]), x[:-k]), x[-k:]])
+        k *= 2
+    out = xp.full((n,) + x.shape[1:], -np.inf)
+    has = counts > 0
+    out[has] = x[(xp.cumsum(counts) - counts)[has]]
+    return out
+
+
+def _ln_loud(x, r, n, shift, lwt, xp, nc):
+    """ln sum over the loud times of each template of exp x, x (n_loud, nc) = ln T + ln weight, as (n, nc): shifted
+    by the template's largest ln T plus the largest ln weight when the weights of the loud times span less than
+    600 nats (then no term within exp(-145) of the largest is lost), else by the largest x of each template"""
+    lfin = lwt[lwt > -np.inf]
+    if lfin.size and float(lfin.max() - lfin.min()) <= 600.0 and lfin.size == lwt.size:
+        sh = shift + lfin.max()
+    else:
+        sh = _run_max(x, r, n, xp)
+        sh = xp.where(sh > -np.inf, sh, 0.0)
+    idx = (r[:, None] * nc + xp.arange(nc)[None, :]).ravel()
+    tot = xp.bincount(idx, weights=xp.exp(x - sh[r]).ravel(), minlength=n * nc).reshape(n, nc)
+    with np.errstate(divide="ignore"):
+        return xp.log(tot) + sh
 
 
 def _wmax(lq, ln_u, xp):
@@ -297,24 +331,31 @@ def _quiet_columns(lnT, J, xp):
     return T[:J], xp.minimum(0.25 * (d2[:-1] + d2[1:]), T[:J - 1] + T[1:J]), top
 
 
-def ln_evidence(lq, ln_u, lnT, weights=None, xp=np, block=256, vloud=VLOUD):
+def ln_evidence(lq, ln_u, lnT, weights=None, xp=np, block=256, vloud=VLOUD, log_weights=False):
     """ln E[m, c] = ln (1/n_time) sum_t weights[t] T_c(w_m(t)) for tabulated columns.
 
     lq, ln_u           as for histogram
     lnT                (NV, n_col) ln T_c(V^2), e.g. glitch_columns() and merger_columns(s) side by side,
                        non-decreasing in v (every column of this module is), on the device of xp
     weights            None, (n_time,) a weight per arrival time, or (n_w, n_time) n_w sets of them, read in
-                       one pass over the trajectories
+                       one pass over the trajectories; their logarithms with log_weights, so that a weight below
+                       1e-308 next to a large T (a glitch rings both) is kept.  A row of unit weights is summed
+                       exactly as without weights
 
     below vloud T is interpolated linearly in v, E = (H @ T - D @ Q) / n_time with the histogram H and the
     curvature term D @ Q of the interpolation; above vloud ln T is interpolated linearly in v, one arrival time
-    at a time.  returns (n_template, n_col), or (n_w, n_template, n_col), float64 on the device."""
+    at a time, the sum taken in the log domain.  returns (n_template, n_col), or (n_w, n_template, n_col),
+    float64 on the device."""
     nm, nt = lq.shape
-    W, one = _weight_rows(weights, nt, xp)
     J = int(round(vloud / DV)) + 2
     B, Q, top = _quiet_columns(lnT, J, xp)              # every column spans less than 600 nats below vloud
     nc = lnT.shape[1]
-    out = xp.empty((W.shape[0], nm, nc))
+    if weights is None:
+        lnW, one = None, True
+    else:
+        lnW, one = _ln_weight_rows(weights, nt, xp, log_weights)
+    unit = [True] if lnW is None else [bool((lw == 0.0).all()) for lw in lnW]
+    out = xp.empty((len(unit), nm, nc))
     for a in range(0, nm, block):
         b = min(a + block, nm)
         v = _v(lq[a:b], ln_u[a:b], xp)
@@ -323,26 +364,42 @@ def ln_evidence(lq, ln_u, lnT, weights=None, xp=np, block=256, vloud=VLOUD):
         shift = (1.0 - fm)[:, None] * lnT[jm] + fm[:, None] * lnT[jm + 1]
         r, t = xp.nonzero(v > vloud)
         val = (1.0 - f[r, t])[:, None] * lnT[j[r, t]] + f[r, t][:, None] * lnT[j[r, t] + 1]
-        X, idx = xp.exp(val - shift[r]), (r[:, None] * nc + xp.arange(nc)[None, :]).ravel()
-        for i, wt in enumerate(W):
-            H, D = _quiet(v, j, f, wt, xp, J)
-            loud = xp.bincount(idx, weights=(wt[t][:, None] * X).ravel(), minlength=(b - a) * nc)
+        for i, u in enumerate(unit):
+            if u:
+                H, D = _quiet(v, j, f, xp.ones(nt), xp, J)
+                loud = xp.bincount((r[:, None] * nc + xp.arange(nc)[None, :]).ravel(),
+                                   weights=xp.exp(val - shift[r]).ravel(), minlength=(b - a) * nc)
+                with np.errstate(divide="ignore"):
+                    quiet = xp.log(_dot(H, B) - _dot(D, Q)) + top[None, :]
+                    out[i, a:b] = _logaddexp(quiet, xp.log(loud.reshape(b - a, nc)) + shift, xp) - np.log(nt)
+                continue
+            lw = lnW[i]
+            top_w = float(lw.max())
+            if top_w == -np.inf:
+                out[i, a:b] = -np.inf
+                continue
+            H, D = _quiet(v, j, f, xp.exp(lw - top_w), xp, J)   # T is bounded below vloud: no term lost here
             with np.errstate(divide="ignore"):
-                quiet = xp.log(_dot(H, B) - _dot(D, Q)) + top[None, :]
-                out[i, a:b] = xp.logaddexp(quiet, xp.log(loud.reshape(b - a, nc)) + shift) - np.log(nt)
+                quiet = xp.log(_dot(H, B) - _dot(D, Q)) + top[None, :] + top_w
+            loud = _ln_loud(val + lw[t][:, None], r, b - a, shift, lw[t], xp, nc)
+            out[i, a:b] = _logaddexp(quiet, loud, xp) - np.log(nt)
     return out[0] if one else out
 
 
-def ln_merger_at(lq, ln_u, s, weights=None, xp=np, block=256, vloud=VLOUD):
+def ln_merger_at(lq, ln_u, s, weights=None, xp=np, block=256, vloud=VLOUD, log_weights=False):
     """ln Lam^I(m) = ln (1/n_time) sum_t weights[t] Phi(w_m(t); s[m]) at a signal power per template.
 
     s (n_template,) on the host, the rest as for ln_evidence, whose interpolation it repeats with Phi computed at
     the grid points it needs.  returns (n_template,), or (n_w, n_template), float64 on the device."""
     nm, nt = lq.shape
-    W, one = _weight_rows(weights, nt, xp)
+    if weights is None:
+        lnW, one = None, True
+    else:
+        lnW, one = _ln_weight_rows(weights, nt, xp, log_weights)
+    unit = [True] if lnW is None else [bool((lw == 0.0).all()) for lw in lnW]
     s = np.asarray(s, float)
     J = int(round(vloud / DV)) + 2
-    out = xp.empty((W.shape[0], nm))
+    out = xp.empty((len(unit), nm))
     for a in range(0, nm, block):
         b = min(a + block, nm)
         sb = s[a:b]
@@ -365,14 +422,31 @@ def ln_merger_at(lq, ln_u, s, weights=None, xp=np, block=256, vloud=VLOUD):
         P = [xp.exp(val[part[i]:part[i + 1]] - shift[rd]) for i in range(4, 8)]           # Phi at j-1, j, j+1, j+2
         Q = xp.minimum(0.25 * (P[0] - P[1] - P[2] + P[3]), P[1] + P[2])
         lin = (1.0 - f[rl, tl]) * lj + f[rl, tl] * lj1
-        eq, el = xp.exp(lnq - shift[rq]), xp.exp(lin - shift[rl])
-        for i, wt in enumerate(W):
-            H, D = _quiet(v, j, f, wt, xp, J)
-            tot = (xp.bincount(rq, weights=H[rq, cq] * eq, minlength=b - a)
-                   - xp.bincount(rd, weights=D[rd, cd] * Q, minlength=b - a)
-                   + xp.bincount(rl, weights=wt[tl] * el, minlength=b - a))
+        eq = xp.exp(lnq - shift[rq])
+        if not all(unit):                                # the weighted quiet part has its own scale
+            qtop = _run_max(lnq[:, None], rq, b - a, xp)[:, 0]
+            eqw = xp.exp(lnq - qtop[rq])
+            Pw = [xp.exp(val[part[i]:part[i + 1]] - qtop[rd]) for i in range(4, 8)]
+            Qw = xp.minimum(0.25 * (Pw[0] - Pw[1] - Pw[2] + Pw[3]), Pw[1] + Pw[2])
+        for i, u in enumerate(unit):
+            if u:
+                tot = (xp.bincount(rq, weights=H[rq, cq] * eq, minlength=b - a)
+                       - xp.bincount(rd, weights=D[rd, cd] * Q, minlength=b - a)
+                       + xp.bincount(rl, weights=xp.exp(lin - shift[rl]), minlength=b - a))
+                with np.errstate(divide="ignore"):
+                    out[i, a:b] = shift + xp.log(tot) - np.log(nt)
+                continue
+            lw = lnW[i]
+            top_w = float(lw.max())
+            if top_w == -np.inf:
+                out[i, a:b] = -np.inf
+                continue
+            Hw, Dw = _quiet(v, j, f, xp.exp(lw - top_w), xp, J)
             with np.errstate(divide="ignore"):
-                out[i, a:b] = shift + xp.log(tot) - np.log(nt)
+                quiet = qtop + top_w + xp.log(xp.bincount(rq, weights=Hw[rq, cq] * eqw, minlength=b - a)
+                                              - xp.bincount(rd, weights=Dw[rd, cd] * Qw, minlength=b - a))
+            loud = _ln_loud((lin + lw[tl])[:, None], rl, b - a, shift[:, None], lw[tl], xp, 1)[:, 0]
+            out[i, a:b] = _logaddexp(quiet, loud, xp) - np.log(nt)
     return out[0] if one else out
 
 
@@ -416,35 +490,65 @@ def glitch_time_series(lq, ln_u, pi_k, pi_m=None, xp=np, edges=RHO_EDGES, block=
             val[r, t] = mx + xp.log(xp.exp(x - mx[:, None]).sum(axis=1))
         val += xp.asarray(lpm[a:b])[:, None]
         mx = val.max(axis=0)
-        out = xp.logaddexp(out, mx + xp.log(xp.exp(val - mx[None, :]).sum(axis=0)))
+        out = _logaddexp(out, mx + xp.log(xp.exp(val - mx[None, :]).sum(axis=0)), xp)
+    return out
+
+
+def _logaddexp(a, b, xp):
+    """ln(exp a + exp b), also for two -inf on the device (where a - b is nan)"""
+    if xp is np:
+        return np.logaddexp(a, b)
+    m = xp.maximum(a, b)
+    return xp.where(m == -np.inf, m, m + xp.log1p(xp.exp(-xp.abs(a - b))))
+
+
+def _ln_arcs(x, L, xp):
+    """ln sum_{i < L} exp x[(a + i) mod n] for every start a (n,), 0 <= L < n: the sums over 2^k consecutive
+    elements built by doubling and combined over the bits of L, every step a logaddexp, so no term is lost to the
+    dynamic range"""
+    out = xp.full(x.shape, -np.inf)
+    S, size, off = x, 1, 0
+    while size <= L:
+        if L & size:
+            out = _logaddexp(out, xp.roll(S, -off), xp)
+            off += size
+        S = _logaddexp(S, xp.roll(S, -size), xp)
+        size *= 2
     return out
 
 
 def glitch_time_weights(ln_lg, half_window, xp=np):
-    """kbar(t') = 1 - sum_{|t - t'| <= half_window} l_g(t) / sum_t l_g(t), the probability that the glitch is
-    away from t', circular in t, clipped to [0, 1].  ln_lg (n_time,) = glitch_time_series(...), half_window in
-    samples (< 0: an empty window, kbar = 1).  returns (n_time,)"""
+    """the glitch-time weights kbar(t') = sum_{|t - t'| > half_window} l_g(t) / sum_t l_g(t), the probability that
+    the glitch is away from t' (circular in t), and 1 - kbar(t'), the share of the window.  Both sums are taken
+    directly in the log domain (_ln_arcs), never as a difference, so each logarithm stays right when its value
+    underflows: next to a loud glitch ln kbar ~ -ln l_g, far from it ln(1 - kbar) ~ -ln l_g.
+
+    ln_lg        (n_time,) glitch_time_series(...)
+    half_window  in samples; < 0: an empty window, kbar = 1
+
+    returns ln kbar and ln(1 - kbar), each (n_time,) and <= 0."""
     n = ln_lg.size
     hw = int(half_window)
     if hw < 0:
-        return xp.ones(n)
+        return xp.zeros(n), xp.full(n, -np.inf)
     if 2 * hw + 1 >= n:
-        return xp.zeros(n)
-    p = xp.exp(ln_lg - ln_lg.max())
-    c = xp.concatenate([xp.zeros(1), xp.cumsum(xp.concatenate([p[n - hw:], p, p[:hw]]))])
-    return xp.clip(1.0 - (c[2 * hw + 1:] - c[:n]) / p.sum(), 0.0, 1.0)
+        return xp.full(n, -np.inf), xp.zeros(n)
+    m = ln_lg.max()
+    total = m + xp.log(xp.exp(ln_lg - m).sum())
+    away = xp.roll(_ln_arcs(ln_lg, n - 2 * hw - 1, xp), -(hw + 1)) - total       # from t' + hw + 1 round to t' - hw - 1
+    near = xp.roll(_ln_arcs(ln_lg, 2 * hw + 1, xp), hw) - total                   # from t' - hw to t' + hw
+    return xp.minimum(away, 0.0), xp.minimum(near, 0.0)
 
 
-def near_fraction(kbar, lags, xp=np):
-    """o(t) = <1 - kbar[(t + tau) mod n_time]>_tau, the mean with equal weights over the lags tau (samples) of the
-    probability that the glitch with the time weights kbar (n_time,) is near the time t + tau: o_H(t) of the L
-    arrival time t is near_fraction(kbar_H, lags), o_L(t') of the H arrival time t' near_fraction(kbar_L, -lags).
-    returns (n_time,)"""
-    near = 1.0 - kbar
-    acc = xp.zeros(near.shape)
+def ln_near_fraction(ln_near, lags, xp=np):
+    """ln o(t), o(t) = <1 - kbar[(t + tau) mod n_time]>_tau the mean with equal weights over the lags tau (samples)
+    of the probability that the glitch is near the time t + tau, from ln(1 - kbar) (n_time,) of
+    glitch_time_weights, in the log domain: ln o_H(t) of the L arrival time t is ln_near_fraction(ln_near_H, lags),
+    ln o_L(t') of the H arrival time t' ln_near_fraction(ln_near_L, -lags).  returns (n_time,)"""
+    acc = xp.full(ln_near.shape, -np.inf)
     for tau in np.asarray(lags, int).ravel():
-        acc += xp.roll(near, -int(tau))
-    return acc / np.asarray(lags).size
+        acc = _logaddexp(acc, xp.roll(ln_near, -int(tau)), xp)
+    return acc - np.log(np.asarray(lags).size)
 
 
 def amplitude_weights(edges=RHO_EDGES, gamma=4.0, rho_min=4.0):

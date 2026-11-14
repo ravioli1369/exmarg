@@ -33,7 +33,7 @@ import numpy as np
 import numba
 
 NPHI = 96                 # phase bins of the full circle; the tables hold NPHI/2 + 1
-LK_MIN = -80.0            # floor of the log time weights: exp(-80) ~ 2e-35 stands for zero without -inf in the sums
+LK_MIN = -1.0e5           # floor of the log time weights: stands for -inf (a zero weight), far below any ln kbar
 
 
 @numba.njit(inline="always")

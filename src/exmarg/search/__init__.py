@@ -23,5 +23,5 @@ from .bank import mass_bank
 from .store import load_redshift_store
 from .pe import pe_redshift, pe_intrinsic, distance_weights
 from .single import (RHO_EDGES, kernel, ln_kernel, response_distribution, glitch_columns, merger_columns,
-                     histogram, ln_evidence, ln_merger_at, glitch_time_series, glitch_time_weights, near_fraction,
+                     histogram, ln_evidence, ln_merger_at, glitch_time_series, glitch_time_weights, ln_near_fraction,
                      amplitude_weights)

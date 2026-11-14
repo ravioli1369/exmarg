@@ -203,61 +203,60 @@ def _glitch_setup(glitch, bank, seg, store):
 
 
 def _kbar(traj, I, gd, sd, xp):
-    """kbar_I (n_time,) of one segment with the fiducial glitch law of gd, on the device"""
+    """ln kbar_I and ln(1 - kbar_I) (n_time,) of one segment with the fiducial glitch law of gd, on the device"""
     lg = _single.glitch_time_series(traj["lq" + I], sd["ln_u"], gd["pi_k"], gd["pi_m"], xp)
     return _single.glitch_time_weights(lg, gd["half_window"], xp)
 
 
 def _glitch_weights(traj, gd, sd, xp):
-    """per segment, on the device: the log time weights (ln kbar_H, ln kbar_L) of the gather, the weights per time
-    of the one-detector sums on each trajectory (rows: 1, o, o kbar; o_H(t) on L, o_L(t') on H) and
-    c0 = (1/n_t) sum_t o_H(t) (1 - kbar_L(t))"""
-    kH, kL = _kbar(traj, "H", gd, sd, xp), _kbar(traj, "L", gd, sd, xp)
-    oH = _single.near_fraction(kH, gd["lags"], xp)                  # of the L arrival time t, kbar_H at t + tau
-    oL = _single.near_fraction(kL, -gd["lags"], xp)                 # of the H arrival time t', kbar_L at t' - tau
-    one = xp.ones(kH.shape)
-    with np.errstate(divide="ignore"):
-        tw = (xp.log(kH), xp.log(kL))
-    return dict(tw=tw, H=xp.stack([one, oL, oL * kH]), L=xp.stack([one, oH, oH * kL]),
-                c0=float(xp.mean(oH * (1.0 - kL))))
+    """per segment, on the device and in logs (a loud glitch takes kbar and o below 1e-308 where l_g or Phi is
+    above 1e308): the time weights (ln kbar_H, ln kbar_L) of the gather, the weights per time of the one-detector
+    sums on each trajectory (rows ln o, ln o + ln kbar; o_H(t) on L, o_L(t') on H) and
+    ln c0 = ln (1/n_t) sum_t o_H(t) (1 - kbar_L(t))"""
+    (kH, nH), (kL, nL) = _kbar(traj, "H", gd, sd, xp), _kbar(traj, "L", gd, sd, xp)
+    oH = _single.ln_near_fraction(nH, gd["lags"], xp)               # of the L arrival time t, kbar_H at t + tau
+    oL = _single.ln_near_fraction(nL, -gd["lags"], xp)              # of the H arrival time t', kbar_L at t' - tau
+    x = oH + nL
+    m = float(x.max())
+    lc0 = -np.inf if m == -np.inf else m + float(xp.log(xp.exp(x - m).sum())) - np.log(x.size)
+    return dict(tw=(kH, kL), H=xp.stack([oL, oL + kH]), L=xp.stack([oH, oH + kL]), lc0=lc0)
 
 
 def _single_values(traj, sd, xp, gw=None):
-    """per detector: ln E (n_w, n_template, n_rho + n_node), ln Lambda_S^I at the boundary point
-    (n_w, n_template) and wmax, for the weights per time of gw (n_w = 3) or none (n_w = 1)"""
+    """per detector: ln E (n_w, n_template, n_rho + n_node), ln Lambda_S^I at the boundary point (n_w, n_template)
+    and wmax, for no weights (n_w = 1) or, with the glitch weights gw, the log weight rows 0, ln o, ln o + ln kbar
+    (n_w = 3; the first is the plain sum)"""
     out = {}
-    nm = sd["ln_u"].size
     for I in "HL":
         lq = traj["lq" + I]
-        W = None if gw is None else gw[I]
-        lnE = _single._host(_single.ln_evidence(lq, sd["ln_u"], sd["lnT"], W, xp))
-        b = _single._host(_single.ln_merger_at(lq, sd["ln_u"], sd["s_b"], W, xp))
-        out[I] = (lnE.reshape(-1, nm, lnE.shape[-1]), b.reshape(-1, nm),
+        W = None if gw is None else xp.concatenate([xp.zeros((1, lq.shape[1])), gw[I]])
+        lnE = _single._host(_single.ln_evidence(lq, sd["ln_u"], sd["lnT"], W, xp, log_weights=True))
+        b = _single._host(_single.ln_merger_at(lq, sd["ln_u"], sd["s_b"], W, xp, log_weights=True))
+        out[I] = (lnE.reshape(-1, *lnE.shape[-2:]), b.reshape(-1, b.shape[-1]),
                   _single._host(_single._wmax(lq, sd["ln_u"], xp)))
     return out
 
 
-def _on_nodes(lnE, b, geometry, n_rho):
-    """one detector's values on the node geometry: lnE (n_template, n_rho + n_node) at the nodes, b (n_template,)
-    at the boundary point -> (n_node + 1, n_template), -inf off the valid pairs"""
+def _on_nodes(lnE, b, geometry):
+    """one detector's values on the node geometry: lnE (n_template, n_node) at the nodes, b (n_template,) at the
+    boundary point -> (n_node + 1, n_template), -inf off the valid pairs"""
     valid, bnode = geometry[0], geometry[3]
-    return np.concatenate([np.where(valid, lnE[:, n_rho:].T, -np.inf), np.where(bnode >= 0, b, -np.inf)[None]])
+    return np.concatenate([np.where(valid, lnE.T, -np.inf), np.where(bnode >= 0, b, -np.inf)[None]])
 
 
-def _single_nodes(one, lamN, geometry, n_rho, far=None, c0=None):
+def _single_nodes(one, lamN, geometry, n_rho, far=None, lc0=None):
     """the single-detector values on the node geometry of lamN (same valid pairs, same boundary row, -inf where
     lamN is), the glitch evidences and the largest w, stacked over the segments; with far (n_seg, 3, n_node + 1,
-    n_template), the gather sums weighted by kbar_H, kbar_L and both, and c0 (n_seg,) also lamN_gH, lamN_gL,
+    n_template), the gather sums weighted by kbar_H, kbar_L and both, and ln c0 (n_seg,) also lamN_gH, lamN_gL,
     lamN_gHL"""
-    nodes = lambda I, i: np.stack([_on_nodes(o[I][0][i], o[I][1][i], geometry, n_rho) for o in one])
+    nodes = lambda I, i: np.stack([_on_nodes(o[I][0][i][:, n_rho:], o[I][1][i], geometry) for o in one])
     out = {}
     for I in "HL":
         out["lamN_" + I] = nodes(I, 0)
         out["ln_glitch_" + I] = np.stack([o[I][0][0][:, :n_rho] for o in one])
         out["wmax_" + I] = np.stack([o[I][2] for o in one])
     if far is not None:
-        with np.errstate(divide="ignore"):
-            lc0 = np.log(np.asarray(c0, float))[:, None, None]
+        lc0 = np.asarray(lc0, float)[:, None, None]
         out["lamN_gH"] = np.logaddexp(far[:, 0], nodes("L", 1))
         out["lamN_gL"] = np.logaddexp(far[:, 1], nodes("H", 1))
         out["lamN_gHL"] = np.logaddexp(np.logaddexp(far[:, 2], nodes("L", 2)), np.logaddexp(nodes("H", 2), lc0))
@@ -314,8 +313,8 @@ def _node_values(bank, seg, ev, store, geometry, groups, block, resident, n_loud
     _release(bank)
     if single is None:
         return lamN
-    c0 = None if glitch is None else [g["c0"] for g in gw]
-    return lamN, _single_nodes(one, lamN, geometry, single["n_rho"], far, c0)
+    lc0 = None if glitch is None else [g["lc0"] for g in gw]
+    return lamN, _single_nodes(one, lamN, geometry, single["n_rho"], far, lc0)
 
 
 def _single_out(single, n_seg, shape, bank, gd=None):

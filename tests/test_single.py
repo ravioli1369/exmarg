@@ -164,19 +164,101 @@ def test_weighted_evidence_and_glitch_time_series():
 
 
 def test_glitch_time_weights():
-    """kbar by hand: one spike (0 inside the window, circularly, 1 outside), flat (1 - (2 W + 1) / n), and a
-    random l_g against the window sums written out"""
+    """kbar by hand: one spike (0 inside the window, circularly, 1 outside), flat (1 - (2 W + 1) / n), a random l_g
+    against the window sums written out, an empty window (kbar = 1) and one covering everything (kbar = 0)"""
     n, hw = 64, 5
     ln_lg = np.full(n, -1000.0)
     ln_lg[2] = 0.0
-    k = single.glitch_time_weights(ln_lg, hw)
+    ln_k, ln_n = single.glitch_time_weights(ln_lg, hw)
+    k = np.exp(ln_k)
     inside = np.zeros(n, bool)
     inside[[(2 + d) % n for d in range(-hw, hw + 1)]] = True
     assert np.array_equal(k[inside], np.zeros(inside.sum())) and np.array_equal(k[~inside], np.ones((~inside).sum()))
-    assert np.allclose(single.glitch_time_weights(np.zeros(n), hw), 1.0 - (2 * hw + 1) / n, rtol=0, atol=1e-14)
+    assert np.allclose(np.exp(ln_n), 1.0 - k, rtol=0, atol=1e-14)
+    ln_k, ln_n = single.glitch_time_weights(np.zeros(n), hw)
+    assert np.allclose(np.exp(ln_k), 1.0 - (2 * hw + 1) / n, rtol=0, atol=1e-14)
+    assert np.allclose(np.exp(ln_n), (2 * hw + 1) / n, rtol=1e-14, atol=0)
     rng = np.random.default_rng(2)
     ln_lg = rng.normal(0.0, 3.0, n)
     p = np.exp(ln_lg)
     ref = np.array([1.0 - sum(p[(t + d) % n] for d in range(-hw, hw + 1)) / p.sum() for t in range(n)])
-    assert np.allclose(single.glitch_time_weights(ln_lg, hw), ref, rtol=0, atol=1e-13)
-    assert np.array_equal(single.glitch_time_weights(ln_lg, n // 2), np.zeros(n))
+    ln_k, ln_n = single.glitch_time_weights(ln_lg, hw)
+    assert np.allclose(np.exp(ln_k), ref, rtol=0, atol=1e-13)
+    assert np.allclose(np.exp(ln_n), 1.0 - ref, rtol=0, atol=1e-13)
+    ln_k, ln_n = single.glitch_time_weights(ln_lg, -1)
+    assert np.array_equal(ln_k, np.zeros(n)) and np.all(ln_n == -np.inf)
+    ln_k, ln_n = single.glitch_time_weights(ln_lg, n // 2)
+    assert np.all(ln_k == -np.inf) and np.array_equal(ln_n, np.zeros(n))
+
+
+def test_glitch_time_weights_log_domain():
+    """ln kbar and ln(1 - kbar) next to and away from loud glitches, where one of them underflows: against the sums
+    inside and outside each window written here with scipy logsumexp (stable on its own, the largest term of each
+    sum taken out) and against the closed forms for a spike of ln l_g = 3000 on a flat floor of 0, with
+    ln sum_t l_g = ln(e^3000 + n - 1): inside its window ln kbar = ln(n - 2W - 1) - ln sum_t l_g and ln(1 - kbar) =
+    0 to rounding, outside it ln kbar = 0 to rounding and ln(1 - kbar) = ln(2W + 1) - ln sum_t l_g; then two spikes of
+    very different height and spikes at the wrap"""
+    n, W = 2048, 40
+
+    def ref(ln_lg):
+        d = np.arange(n)[:, None]
+        away = (d + W + 1 + np.arange(n - 2 * W - 1)[None, :]) % n
+        near = (d - W + np.arange(2 * W + 1)[None, :]) % n
+        return logsumexp(ln_lg[away], axis=1) - logsumexp(ln_lg), logsumexp(ln_lg[near], axis=1) - logsumexp(ln_lg)
+
+    def inside(t0):
+        d = np.abs(np.arange(n) - t0)
+        return np.minimum(d, n - d) <= W
+
+    total = np.logaddexp(3000.0, np.log(n - 1))
+    for t0 in (700, 3, n - 2):                                  # in the middle, and at the wrap on either side
+        ln_lg = np.zeros(n)
+        ln_lg[t0] = 3000.0
+        ln_k, ln_n = single.glitch_time_weights(ln_lg, W)
+        i = inside(t0)
+        err_k = np.abs(ln_k[i] / (np.log(n - 2 * W - 1) - total) - 1).max()
+        err_n = np.abs(ln_n[~i] / (np.log(2 * W + 1) - total) - 1).max()
+        print("spike 3000 at %d: inside ln kbar %.6f (relative error %.1e), outside ln(1 - kbar) %.6f (%.1e); "
+              "max |ln kbar| outside %.1e, max |ln(1 - kbar)| inside %.1e"
+              % (t0, ln_k[i][0], err_k, ln_n[~i][0], err_n, np.abs(ln_k[~i]).max(), np.abs(ln_n[i]).max()))
+        assert i.sum() == 2 * W + 1 and err_k < 1e-9 and err_n < 1e-9
+        assert np.abs(ln_k[~i]).max() < 1e-12 and np.abs(ln_n[i]).max() < 1e-12
+        assert np.all(np.exp(ln_k[i]) == 0.0) and np.all(np.exp(ln_n[~i]) == 0.0)   # what a linear kbar gives
+        for got, want in zip((ln_k, ln_n), ref(ln_lg)):
+            np.testing.assert_allclose(got, want, rtol=1e-12, atol=1e-12)
+    rng = np.random.default_rng(9)
+    for spikes in (((300, 3000.0), (1500, 400.0)), ((5, 2500.0), (n - 300, 900.0), (1000, 60.0))):
+        ln_lg = rng.normal(0.0, 1.0, n)
+        for t0, h in spikes:
+            ln_lg[t0] = h
+        ln_k, ln_n = single.glitch_time_weights(ln_lg, W)
+        for got, want in zip((ln_k, ln_n), ref(ln_lg)):
+            np.testing.assert_allclose(got, want, rtol=1e-12, atol=1e-12)
+        (t1, h1), (t2, h2) = spikes[:2]
+        assert abs(ln_k[t1] - (h2 - h1)) < 1.0 and abs(ln_k[t2]) < 1e-12    # the loudest sets the rest
+        assert abs(ln_n[t2] - (h2 - h1)) < 1.0
+
+
+def test_log_weights():
+    """ln_evidence and ln_merger_at with weights given as logarithms, against the exact sums over the times in the
+    log domain: a time with w = 2000 carries the weight exp(-1995) (a loud glitch: kbar tiny where T is huge), so
+    the answer is set by a product that linear weights would round to 0; and a second row whose weights span less
+    than 600 nats (the shift by the loudest time)"""
+    rng = np.random.default_rng(13)
+    lq, ln_u, w = trajectory(rng, 3, 4096, loud=[(1, 100, 2000.0), (2, 50, 30.0)])
+    nm, nt = w.shape
+    lw = np.stack([np.log(rng.uniform(0.01, 1.0, nt)), np.log(rng.uniform(0.01, 1.0, nt))])
+    lw[0, 100] = -1995.0
+    xs = np.array([0.5, 25.0, 2000.0])
+    got = single.ln_evidence(lq, ln_u, ln_l(single.V[:, None] ** 2, xs[None, :]), lw, log_weights=True)
+    ref = logsumexp(ln_l(w[None, :, :, None], xs) + lw[:, None, :, None], axis=2) - np.log(nt)
+    print("ln_evidence with log weights: max error %.1e; template 1, x = 2000: %.3f (linear weights: %.3f)"
+          % (np.abs(got - ref).max(), got[0, 1, 2],
+             single.ln_evidence(lq, ln_u, ln_l(single.V[:, None] ** 2, xs[None, :]), np.exp(lw[0]))[1, 2]))
+    assert np.abs(got - ref).max() < 2e-5 and got[0, 1, 2] > -10.0
+    s = np.array([0.3, 3000.0, 30.0])
+    got = single.ln_merger_at(lq, ln_u, s, lw, log_weights=True)
+    phi = np.stack([single._ln_phi(np.sqrt(w[m]), np.full(nt, s[m])) for m in range(nm)])
+    ref = logsumexp(phi[None] + lw[:, None, :], axis=2) - np.log(nt)
+    print("ln_merger_at with log weights: max error %.1e" % np.abs(got - ref).max())
+    assert np.abs(got - ref).max() < 2e-5
