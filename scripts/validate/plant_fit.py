@@ -39,7 +39,8 @@ PRIOR = (1e-4, 0.5)
 NBAR_GRID = np.geomspace(PRIOR[0], PRIOR[1], 600)
 VILLE = np.log(100.0)
 PULL = 2.5
-W_INF_MAX = 1e-4
+W_INF_MAX = 5e-4
+VETO_W = 72.0
 START = dict(nbar=0.01, eps_H=0.01, eps_L=0.01, gamma_H=3.0, gamma_L=3.0)
 SHARED = ('rho_edges', 'glitch_pi_k', 'glitch_window')
 
@@ -50,17 +51,19 @@ def _equal(a, b):
 
 def load(directory):
     """(campaign settings, rho_edges, the per-segment arrays of every plant_*.npz of directory concatenated in order of
-    k (the keys every file has), the 'run' entries of the files); the settings, rho_edges and the fiducial glitch law
-    and window must agree across the files"""
+    k (the keys every file has), the 'run' entries of the files, the (m1, z) grid indices (n_cell, 2) of the cells
+    without ln Lambda over all files or None when a file lacks them); the settings, rho_edges and the fiducial glitch
+    law and window must agree across the files"""
     files = sorted(glob.glob(os.path.join(directory, 'plant_*.npz')))
     if not files:
         raise SystemExit('no plant_*.npz in %s' % directory)
-    cfg, fixed, parts, runs = None, None, [], []
+    cfg, fixed, parts, runs, cells = None, None, [], [], []
     for path in files:
         with np.load(path) as f:
             meta = json.loads(str(f['meta']))
             same = [np.asarray(f[key], float) if key in f.files else None for key in SHARED]
-            arrays = {key: f[key] for key in f.files if key not in ('meta',) + SHARED}
+            arrays = {key: f[key] for key in f.files if key not in ('meta', 'w_inf_cells') + SHARED}
+            cells.append(f['w_inf_cells'] if 'w_inf_cells' in f.files else None)
         run = meta.pop('run')
         if cfg is None:
             cfg, fixed = meta, same
@@ -79,46 +82,57 @@ def load(directory):
     twice = data['k'][1:][np.diff(data['k']) == 0]
     if twice.size:
         raise SystemExit('segments in more than one file: %s' % twice[:10])
-    return cfg, fixed[0], data, runs
+    cells = None if any(c is None for c in cells) else np.unique(np.concatenate(cells).reshape(-1, 2), axis=0)
+    return cfg, fixed[0], data, runs, cells
 
 
 def truth(cfg):
-    """the true parameters of the fit and whether the data are a control (no coherent merger)"""
+    """the planted parameters and whether the data are a control (no coherent merger)"""
     tr = dict(nbar=cfg['nbar'] if cfg['control'] == 'none' else 0.0, eps_H=cfg['eps_H'], eps_L=cfg['eps_L'],
               gamma_H=cfg['gamma'], gamma_L=cfg['gamma'], rho_min_H=cfg['rho_min'], rho_min_L=cfg['rho_min'])
     return tr, cfg['control'] != 'none' or cfg['nbar'] == 0
 
 
-def fit(d, edges, free, start, sg=True, pi_k=(None, None)):
+def fit(d, edges, free, start, sg=True, pi_k=(None, None), rho_max=None):
     """mixture.fit on the stored logarithms, the parameters free and the others at start"""
     return mixture.fit(d['ln_lambda_bar'], d['ln_lambda_gH_bar'], d['ln_lambda_gL_bar'], d['ln_glitch_H'],
                        d['ln_glitch_L'], edges, start=start, log=True,
                        fixed=tuple(p for p in mixture.PARAMETERS if p not in free), sg=sg,
-                       lam_gHL=d['ln_lambda_gHL_bar'], pi_k_H=pi_k[0], pi_k_L=pi_k[1])
+                       lam_gHL=d['ln_lambda_gHL_bar'], pi_k_H=pi_k[0], pi_k_L=pi_k[1], rho_max=rho_max)
 
 
-def law_fit(d, edges, start, rho_min_fit=False, sg=True):
+def law_fit(d, edges, start, rho_min_fit=False, sg=True, rho_max=None):
     """nbar, eps_I and the power law of each detector free (rho_min too with rho_min_fit); the law of a detector whose
     eps ends at 0 is then held and the fit repeated.  returns the fit with 'held' the detectors whose law was held"""
     free = ['nbar', 'eps_H', 'eps_L', 'gamma_H', 'gamma_L'] + (['rho_min_H', 'rho_min_L'] if rho_min_fit else [])
-    r = fit(d, edges, free, start, sg)
+    r = fit(d, edges, free, start, sg, rho_max=rho_max)
     held = [I for I in 'HL' if r['eps_' + I] <= 1e-9]
     if held:
         free = [p for p in free if not (p.split('_')[0] in ('gamma', 'rho') and p[-1] in held)]
-        r = fit(d, edges, free, {p: r[p] for p in mixture.PARAMETERS}, sg)
+        r = fit(d, edges, free, {p: r[p] for p in mixture.PARAMETERS}, sg, rho_max=rho_max)
     r['held'] = held
     return r
 
 
-def fits(d, edges, cfg, rho_min_fit=False):
-    """every estimate of nbar: gauss, smith_thrane, joint, stage1 (fit_noise per detector), two_stage, two_stage_eps"""
+def stage_bins(edges, rho_min, rho_cut):
+    """(n_rho,) bool: the amplitude bins that overlap [rho_min, rho_cut), the only ones stage 1 is given"""
+    return (edges[1:] > rho_min) & (edges[:-1] < rho_cut)
+
+
+def fits(d, edges, cfg, rho_min_fit=False, rho_max=None, sel=None):
+    """every estimate of nbar: gauss, smith_thrane, joint (the power law up to rho_max), stage1 (fit_noise per detector
+    on the bins sel), two_stage, two_stage_eps (its weights, zero outside sel)"""
     start = dict(START, rho_min_H=cfg['rho_min'], rho_min_L=cfg['rho_min'])
+    sel = np.ones(edges.size - 1, bool) if sel is None else sel
     out = dict(gauss=fit(d, edges, ['nbar'], dict(start, eps_H=0.0, eps_L=0.0)),
-               smith_thrane=law_fit(d, edges, start, rho_min_fit, sg=False),
-               joint=law_fit(d, edges, start, rho_min_fit))
-    s1 = {I: mixture.fit_noise(d['ln_glitch_' + I], log=True) for I in 'HL'}
+               smith_thrane=law_fit(d, edges, start, rho_min_fit, sg=False, rho_max=rho_max),
+               joint=law_fit(d, edges, start, rho_min_fit, rho_max=rho_max))
+    s1 = {I: mixture.fit_noise(d['ln_glitch_' + I][:, sel], log=True) for I in 'HL'}
+    pk = []
+    for I in 'HL':
+        pk.append(np.zeros(edges.size - 1))
+        pk[-1][sel] = s1[I]['pi_k']
     s2 = dict(start, eps_H=s1['H']['eps'], eps_L=s1['L']['eps'])
-    pk = (s1['H']['pi_k'], s1['L']['pi_k'])
     out.update(stage1=s1, two_stage=fit(d, edges, ['nbar'], s2, pi_k=pk),
                two_stage_eps=fit(d, edges, ['nbar', 'eps_H', 'eps_L'], s2, pi_k=pk))
     return out
@@ -131,13 +145,13 @@ def ln_B(d, edges, eps_H, eps_L, pi_H, pi_L):
                               eps_L, ln_lam_gHL=d['ln_lambda_gHL_bar'])
 
 
-def planted_law(edges, cfg):
-    """the amplitude weights of the planted law, dN/drho ~ rho^-gamma on [rho_min, rho_max], on the bins"""
-    return mixture.amplitude_weights(np.minimum(edges, cfg['rho_max']), cfg['gamma'], cfg['rho_min'])
+def planted_law(edges, cfg, rho_cut=np.inf):
+    """the amplitude weights of the planted law, dN/drho ~ rho^-gamma on [rho_min, min(rho_max, rho_cut)]"""
+    return mixture.amplitude_weights(edges, cfg['gamma'], cfg['rho_min'], min(cfg['rho_max'], rho_cut))
 
 
-def fitted_law(edges, r, I):
-    return mixture.amplitude_weights(edges, r['gamma_' + I], r['rho_min_' + I])
+def fitted_law(edges, r, I, rho_max=None):
+    return mixture.amplitude_weights(edges, r['gamma_' + I], r['rho_min_' + I], rho_max)
 
 
 def mean_se(x):
@@ -174,11 +188,35 @@ def _pull(est, err, tr):
     return (est - tr) / err if err and np.isfinite(err) and err > 0 else np.nan
 
 
-def report(directory, rho_min_fit=False):
-    """everything plant_fit prints: dict with lines (the text), counts, fits, unit, curves, criteria [(name, ok, text)],
-    ok"""
-    cfg, edges, d, runs = load(directory)
-    tr, control = truth(cfg)
+def describe(d, i):
+    """the truth of segment i in words"""
+    m = ('merger (optimal SNR %.2f, z %.2f)' % (d['snr'][i], d['z'][i])) if d['merger'][i] else 'no merger'
+    parts = ['k %d: %s' % (d['k'][i], m)]
+    for I in 'HL':
+        g = ('%s glitch rho %.2f' % (d['kind_' + I][i], d['rho_' + I][i])) if d['glitch_' + I][i] else 'no glitch'
+        parts.append('%s %s, sqrt(2 wmax) %.2f' % (I, g, np.sqrt(2.0 * d['wmax_' + I][i])))
+    return '; '.join(parts)
+
+
+def cells_text(cfg, cells):
+    """the (m1, z) cells without ln Lambda recorded by plant.py, in words"""
+    if cells is None:
+        return 'cells not recorded in these files'
+    if not cells.size:
+        return 'no cell'
+    g = cfg['grid']
+    m1 = np.geomspace(g['m1_range'][0], g['m1_range'][1], g['nm1'])[cells[:, 0]]
+    z = np.linspace(0.02, g['zmax'], g['nz'])[cells[:, 1]]
+    Md = 2.0 * m1 * (1.0 + z)
+    return '%d cells, z %.3f to %.3f, m1 %.3f to %.3f, M_det %.1f to %.1f' % (
+        cells.shape[0], z.min(), z.max(), m1.min(), m1.max(), Md.min(), Md.max())
+
+
+def report(directory, rho_min_fit=False, veto_w=VETO_W, w_inf_max=W_INF_MAX):
+    """everything plant_fit prints: dict with lines (the text), counts, keep, rho_cut, fits, unit, curves, criteria
+    [(name, ok, text)], ok"""
+    cfg, edges, d, runs, cells = load(directory)
+    planted, control = truth(cfg)
     n = d['k'].size
     L = []
     gaps = int(d['k'][-1] - d['k'][0] + 1 - n)
@@ -205,14 +243,50 @@ def report(directory, rho_min_fit=False):
         for kind in np.unique(np.concatenate([d['kind_H'][gH], d['kind_L'][gL]])):
             counts.append(('glitches %s (H, L)' % kind, None,
                            ((d['kind_H'] == kind).sum(), (d['kind_L'] == kind).sum())))
-    L.append('\n%-36s %12s %14s' % ('', 'planted', 'realized'))
+    L.append('\n%-36s %12s %14s' % ('all segments', 'planted', 'realized'))
     for name, exp, got in counts:
         L.append('%-36s %12s %14s' % (name, '' if exp is None else '%.1f' % exp,
                                       ', '.join(map(str, got)) if isinstance(got, tuple) else str(got)))
     L.append('realized fractions: mergers %.5f, glitches H %.5f, L %.5f' % (m.mean(), gH.mean(), gL.mean()))
 
-    F = fits(d, edges, cfg, rho_min_fit)
-    L.append('\nnbar, truth %g (rho_min %s):' % (tr['nbar'], 'free' if rho_min_fit else 'held at %g' % cfg['rho_min']))
+    rho_cut = float(np.sqrt(2.0 * veto_w))
+    loud = {I: d['wmax_' + I] > veto_w for I in 'HL'}
+    keep = ~(loud['H'] | loud['L'])
+    out = ~keep
+    signal = d['merger_H'] | d['merger_L']
+    L.append('\nloudness veto: a segment is set aside when wmax_H or wmax_L exceeds %g (single-detector matched-filter '
+             'SNR sqrt(2 w) above %.4g)' % (veto_w, rho_cut))
+    L.append('  set aside %d of %d segments; by truth (a segment can count twice): glitch in H %d, glitch in L %d, '
+             'merger %d, neither glitch nor merger %d' % (out.sum(), n, (out & gH).sum(), (out & gL).sum(),
+                                                          (out & signal).sum(), (out & ~gH & ~gL & ~signal).sum()))
+    L.append('  by detector: H above %g in %d (glitch in H %d), L in %d (glitch in L %d)'
+             % (veto_w, loud['H'].sum(), (loud['H'] & gH).sum(), loud['L'].sum(), (loud['L'] & gL).sum()))
+    law_max = rho_cut if rho_cut < edges[-1] else None
+    sel = stage_bins(edges, cfg['rho_min'], rho_cut)
+    L.append('  the fitted laws stop at rho_cut = sqrt(2 x %g) = %.4g, where a glitch is set aside about half the time '
+             '(sqrt(2 wmax) is rho plus noise of unit width, plus the gain of the maximum over templates and times); '
+             'stage 1 and the two-stage fits use the %d bins that overlap [%g, %.4g), rho %.4g to %.4g'
+             % (veto_w, rho_cut, sel.sum(), cfg['rho_min'], rho_cut, edges[:-1][sel].min(), edges[1:][sel].max()))
+    for I in 'HL':
+        g, rho = d['glitch_' + I], d['rho_' + I]
+        near = g & (np.abs(rho - rho_cut) < 1.0)
+        off = np.sqrt(2.0 * d['wmax_' + I][g]) - rho[g]
+        L.append('  %s: planted glitches within 1 of rho_cut %d (set aside %d); rho above the cut but kept %d, below '
+                 'it but set aside %d; sqrt(2 wmax) - rho over the glitches %s +- %s (sd)'
+                 % (I, near.sum(), (near & loud[I]).sum(), (g & (rho > rho_cut) & ~loud[I]).sum(),
+                    (g & (rho <= rho_cut) & loud[I]).sum(), _f(off.mean() if off.size else np.nan, '%+.2f'),
+                    _f(off.std() if off.size > 1 else np.nan, '%.2f')))
+
+    k = {key: v[keep] for key, v in d.items()}
+    nk = int(keep.sum())
+    tr = dict(planted, eps_H=float(k['glitch_H'].mean()), eps_L=float(k['glitch_L'].mean()))
+    L.append('  kept %d segments; realized fractions among them: mergers %.5f, glitches H %.5f, L %.5f'
+             % (nk, k['merger'].mean(), tr['eps_H'], tr['eps_L']))
+
+    F = fits(k, edges, cfg, rho_min_fit, law_max, sel)
+    L.append('\nfits on the kept segments; nbar truth %g; eps truth: the realized fraction of kept segments with a '
+             'glitch; rho_min %s, the law up to %.4g:' % (tr['nbar'], 'free' if rho_min_fit else 'held at %g'
+                                                         % cfg['rho_min'], rho_cut))
     names = (('gauss', 'Gaussian likelihood (eps = 0)'), ('smith_thrane', 'Smith & Thrane (sg=False)'),
              ('joint', 'mixture, joint power-law fit'), ('two_stage', 'mixture, two-stage (bins and eps fixed)'),
              ('two_stage_eps', 'mixture, two-stage (bins fixed, eps free)'))
@@ -229,42 +303,51 @@ def report(directory, rho_min_fit=False):
             for p in ('eps_' + I, 'gamma_' + I, 'rho_min_' + I):
                 if p in r['free']:
                     e = r['err'][p]
-                    parts.append('%s %s +- %s (truth %g, pull %s)' % (p, _f(r[p], '%.4g'), _f(e, '%.2g'), tr[p],
-                                                                     _f(_pull(r[p], e, tr[p]), '%+.2f')))
+                    parts.append('%s %s +- %s (truth %.4g, pull %s)' % (p, _f(r[p], '%.4g'), _f(e, '%.2g'), tr[p],
+                                                                       _f(_pull(r[p], e, tr[p]), '%+.2f')))
                 else:
                     parts.append('%s %s (held)' % (p, _f(r[p], '%.4g')))
             L.append('  %-15s %s' % (name if I == 'H' else '', '; '.join(parts)))
     s1 = F['stage1']
     L.append('  %-15s %s' % ('stage 1', '; '.join(
-        'eps_%s %s +- %s (truth %g, realized %.5f), %d iterations%s' % (
-            I, _f(s1[I]['eps'], '%.4g'), _f(s1[I]['err_eps'], '%.2g'), tr['eps_' + I], d['glitch_' + I].mean(),
-            s1[I]['n_iter'], '' if s1[I]['converged'] else ' NOT CONVERGED') for I in 'HL')))
+        'eps_%s %s +- %s (truth %.4g), %d iterations%s' % (
+            I, _f(s1[I]['eps'], '%.4g'), _f(s1[I]['err_eps'], '%.2g'), tr['eps_' + I], s1[I]['n_iter'],
+            '' if s1[I]['converged'] else ' NOT CONVERGED') for I in 'HL')))
     if cfg['glitch_kind'] != 'template':
         L.append('  (glitches outside the model: gamma and rho_min have no true value in the fitted family)')
 
     J = F['joint']
-    lnB_true = ln_B(d, edges, tr['eps_H'], tr['eps_L'], planted_law(edges, cfg), planted_law(edges, cfg))
-    lnB_fit = ln_B(d, edges, J['eps_H'], J['eps_L'], fitted_law(edges, J, 'H'), fitted_law(edges, J, 'L'))
-    U = unit_mean(d, lnB_true, lnB_fit)
-    L.append('\nunit mean over the segments with no merger signal (Sec. 1): mean +- standard error (n)')
+    law = planted_law(edges, cfg, rho_cut)
+    lnB_true = ln_B(k, edges, tr['eps_H'], tr['eps_L'], law, law)
+    lnB_fit = ln_B(k, edges, J['eps_H'], J['eps_L'], fitted_law(edges, J, 'H', law_max),
+                   fitted_law(edges, J, 'L', law_max))
+    L.append('\nlargest among the kept segments:')
+    for name, v in (('ln Lambda_bar', k['ln_lambda_bar']), ('ln B, planted noise model', lnB_true),
+                    ('ln B, joint fit', lnB_fit)):
+        i = int(np.argmax(v))
+        L.append('  %-26s %10.3f   %s' % (name, v[i], describe(k, i)))
+    U = unit_mean(k, lnB_true, lnB_fit)
+    L.append('\nunit mean over the kept segments with no merger signal (Sec. 1): mean +- standard error (n); the '
+             'planted noise model has the realized eps among them and the planted law up to %.4g' % min(cfg['rho_max'],
+                                                                                                         rho_cut))
     for sample, rows in U.items():
-        for name, (mu, se, k) in rows.items():
-            L.append('  %-14s %-28s %s +- %s  (%d, %s sigma)' % (sample, name, _f(mu, '%+.3e'), _f(se, '%.2e'), k,
+        for name, (mu, se, c) in rows.items():
+            L.append('  %-14s %-28s %s +- %s  (%d, %s sigma)' % (sample, name, _f(mu, '%+.3e'), _f(se, '%.2e'), c,
                                                               _f(mu / se if se else np.nan, '%+.1f')))
     if 'ln_lambda_bar_plain' in d:
         diff = np.abs(d['ln_lambda_bar'] - d['ln_lambda_bar_plain'])
         L.append('  ln Lambda_bar with and without the glitch terms (control 4): largest difference %.3g' % diff.max())
-    L.append('  w_inf, population weight on cells without ln Lambda: largest %.3g, mean %.3g'
-             % (d['w_inf'].max(), d['w_inf'].mean()))
+    L.append('  w_inf, population weight on cells without ln Lambda: largest %.3g, mean %.3g; %s'
+             % (d['w_inf'].max(), d['w_inf'].mean(), cells_text(cfg, cells)))
 
     prior = lambda g: 1.0 / g
-    curves = dict(gauss=mixture.time_curve(d['ln_lambda_bar'], NBAR_GRID, prior, log=True),
+    curves = dict(gauss=mixture.time_curve(k['ln_lambda_bar'], NBAR_GRID, prior, log=True),
                   mixture=mixture.time_curve(lnB_fit, NBAR_GRID, prior, log=True))
-    L.append('\ntime curve, ln evidence ratio against no mergers (prior uniform in ln nbar on [%g, %g]):'
-             % PRIOR)
+    L.append('\ntime curve over the kept segments, ln evidence ratio against no mergers (prior uniform in ln nbar on '
+             '[%g, %g]):' % PRIOR)
     for key, name in (('gauss', 'Gaussian likelihood'), ('mixture', 'mixture, noise model of the joint fit')):
         c = curves[key]
-        L.append('  %-40s end %+.3f, max %+.3f at segment %d of %d' % (name, c[-1], c.max(), np.argmax(c) + 1, n))
+        L.append('  %-40s end %+.3f, max %+.3f at segment %d of %d' % (name, c[-1], c.max(), np.argmax(c) + 1, nk))
 
     e = J['err'].get('nbar', np.nan)
     crit = [('mixture nbar within %g sigma of the truth' % PULL, bool(abs(J['nbar'] - tr['nbar']) < PULL * e),
@@ -275,22 +358,25 @@ def report(directory, rho_min_fit=False):
                      'nbar %s < %g x %s' % (_f(J['nbar']), PULL, _f(e))))
         crit.append(('control: time curve below ln 100', bool(curves['mixture'].max() < VILLE),
                      'max %+.3f, ln 100 = %.3f' % (curves['mixture'].max(), VILLE)))
-    crit.append(('population covered: w_inf < %g' % W_INF_MAX, bool(d['w_inf'].max() < W_INF_MAX),
+    crit.append(('population covered: w_inf < %g' % w_inf_max, bool(d['w_inf'].max() < w_inf_max),
                  'largest w_inf %.3g' % d['w_inf'].max()))
     L.append('')
     for name, ok, text in crit:
         L.append('%s  %s: %s' % ('PASS' if ok else 'FAIL', name, text))
     ok = all(c[1] for c in crit)
-    return dict(lines=L, cfg=cfg, truth=tr, counts=counts, fits=F, unit=U, curves=curves, criteria=crit, ok=ok,
-                lnB_true=lnB_true, lnB_fit=lnB_fit, data=d, edges=edges)
+    return dict(lines=L, cfg=cfg, truth=tr, counts=counts, keep=keep, rho_cut=rho_cut, bins=sel, fits=F, unit=U,
+                curves=curves, criteria=crit, ok=ok, lnB_true=lnB_true, lnB_fit=lnB_fit, data=d, kept=k, edges=edges)
 
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('results', help='directory of the plant_*.npz files of one campaign')
     p.add_argument('--rho-min-fit', action='store_true', help='fit rho_min of each detector too')
+    p.add_argument('--veto-w', type=float, default=VETO_W,
+                   help='set aside a segment whose wmax_H or wmax_L exceeds this (inf: none)')
+    p.add_argument('--w-inf-max', type=float, default=W_INF_MAX, help='criterion on the largest w_inf')
     a = p.parse_args(argv)
-    r = report(a.results, a.rho_min_fit)
+    r = report(a.results, a.rho_min_fit, a.veto_w, a.w_inf_max)
     print('\n'.join(r['lines']), flush=True)
     return 0 if r['ok'] else 1
 

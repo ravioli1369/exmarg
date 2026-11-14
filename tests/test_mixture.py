@@ -243,6 +243,31 @@ def test_amplitude_weights_match_quadrature():
         mixture.amplitude_weights(EDGES, 3.0, 31.0)
 
 
+def law_cut(edges, gamma, rho_min, rho_max):
+    """bin probabilities of dN/drho ~ rho^-gamma on [rho_min, rho_max], by quadrature"""
+    lo, hi = np.maximum(edges[:-1], rho_min), np.minimum(edges[1:], rho_max)
+    p = np.array([quad(lambda r: r ** -gamma, a, b)[0] if b > a else 0.0 for a, b in zip(lo, hi)])
+    return p / p.sum()
+
+
+def test_amplitude_weights_rho_max():
+    """pi_k with an upper end rho_max against quadrature of rho^-gamma on [rho_min, rho_max] (rho_max inside a bin, on
+    an edge, inside the bin of rho_min, at and beyond the last edge; gamma across 1 and negative): agree to 1e-12, no
+    weight outside [rho_min, rho_max], the ln_ form is the log, and rho_max at or beyond the last edge is the law
+    without it; rho_max not above rho_min, or not above the first edge, raises"""
+    for g, r0, r1 in ((3.0, 6.0, 11.0), (3.0, 6.0, 12.0), (6.0, 2.0, 2.3), (1.0, 3.3, 17.5), (1.0 + 1e-10, 2.2, 7.7),
+                      (0.0, 2.0, 9.0), (-2.0, 4.5, 25.0), (2.5, 6.0, 30.0), (2.5, 6.0, 1e3)):
+        pk = mixture.amplitude_weights(EDGES, g, r0, r1)
+        assert np.max(np.abs(pk - law_cut(EDGES, g, r0, r1))) < 1e-12, (g, r0, r1, pk)
+        assert abs(pk.sum() - 1) < 1e-13 and np.all(pk[EDGES[:-1] >= r1] == 0) and np.all(pk[EDGES[1:] <= r0] == 0)
+        assert np.allclose(np.exp(mixture.ln_amplitude_weights(EDGES, g, r0, r1)), pk, rtol=1e-13, atol=0)
+        if r1 >= EDGES[-1]:
+            assert np.array_equal(pk, mixture.amplitude_weights(EDGES, g, r0))
+    for r0, r1 in ((6.0, 6.0), (6.0, 5.0), (1.0, 2.0)):
+        with pytest.raises(ValueError):
+            mixture.amplitude_weights(EDGES, 3.0, r0, r1)
+
+
 def test_log_and_linear_forms_agree():
     """ln_ variants equal the logs of the linear ones to 1e-12, a trailing grid broadcasts, eps = 0 gives Lambda_S,
     and time_curve equals the integral over the prior done segment by segment"""
@@ -633,6 +658,25 @@ def test_fixed_bins_match_power_law():
             pi_k_L=mixture.amplitude_weights(EDGES, 4.0, 6.0))
     msg = 'power law: nbar %.9g, ln L %.9g; bins: nbar %.9g, ln L %.9g' % (a['nbar'], a['lnl'], b['nbar'], b['lnl'])
     assert abs(a['nbar'] / b['nbar'] - 1) < 1e-9 and abs(a['lnl'] - b['lnl']) < 1e-9 * abs(a['lnl']), msg
+
+
+def test_fit_rho_max():
+    """fit with rho_max = 12 (gamma_H 3, gamma_L 4 held, loud plant) returns the nbar and ln L of the fit given the bins
+    of amplitude_weights(..., 12) to 1e-9, and not those without rho_max (the loud law reaches 30); with rho_min free
+    its box stops at 10, the last edge below rho_max, and the fit runs"""
+    ev, _ = plant('loud')
+    st = start('loud', gamma_L=4.0)
+    a = fit(ev, fixed=ONLY_NBAR, start=st, rho_max=12.0)
+    b = fit(ev, fixed=('eps_H', 'eps_L'), start=st, pi_k_H=mixture.amplitude_weights(EDGES, 3.0, 6.0, 12.0),
+            pi_k_L=mixture.amplitude_weights(EDGES, 4.0, 6.0, 12.0))
+    c = fit(ev, fixed=ONLY_NBAR, start=st)
+    msg = 'rho_max 12: nbar %.9g, ln L %.9g; bins: nbar %.9g, ln L %.9g; no rho_max: nbar %.9g, ln L %.9g' % (
+        a['nbar'], a['lnl'], b['nbar'], b['lnl'], c['nbar'], c['lnl'])
+    assert abs(a['nbar'] / b['nbar'] - 1) < 1e-9 and abs(a['lnl'] - b['lnl']) < 1e-9 * abs(a['lnl']), msg
+    assert abs(a['lnl'] - c['lnl']) > 1.0, msg
+    r = fit(ev, fixed=('nbar', 'eps_H', 'eps_L', 'gamma_H', 'gamma_L'), start=dict(st, rho_min_H=9.5, rho_min_L=9.5),
+            rho_max=12.0)
+    assert 2.0 <= r['rho_min_H'] <= 10.0 and 2.0 <= r['rho_min_L'] <= 10.0, (r['rho_min_H'], r['rho_min_L'])
 
 
 def test_two_stage_loud():

@@ -3,8 +3,8 @@ the population likelihood of segments with glitches (docs/glitch_likelihood.md, 
 arrays.
 
 Each detector I is Gaussian noise with probability 1 - eps_I, and Gaussian noise plus one glitch with probability
-eps_I.  The glitch amplitude has the law dN/drho ~ rho^-gamma_I above rho_min_I, carried by the bins of rho_edges
-with the weights pi_k; E_I[m, k] is the evidence of a glitch of bin k in template m:
+eps_I.  The glitch amplitude has the law dN/drho ~ rho^-gamma_I on [rho_min_I, rho_max], carried by the bins of
+rho_edges with the weights pi_k; E_I[m, k] is the evidence of a glitch of bin k in template m:
 
     G_I = sum_m pi_m sum_k pi_k E_I[m, k]                     glitch evidence
     c_I = 1 - eps_I + eps_I G_I                               non-Gaussian over Gaussian noise density
@@ -45,13 +45,14 @@ def _trail(a, ndim):
     return a.reshape(a.shape + (1,) * (ndim - a.ndim))
 
 
-def ln_amplitude_weights(rho_edges, gamma, rho_min):
+def ln_amplitude_weights(rho_edges, gamma, rho_min, rho_max=None):
     """ln pi_k (n_rho,), see amplitude_weights"""
     e = np.asarray(rho_edges, float)
-    a, b = np.maximum(e[:-1], rho_min), e[1:]
+    a, b = np.maximum(e[:-1], rho_min), e[1:] if rho_max is None else np.minimum(e[1:], rho_max)
     ok = b > a
     if not ok.any() or a[ok][0] <= 0.0:
-        raise ValueError('rho_min = %g leaves no bin of positive amplitude in [%g, %g]' % (rho_min, e[0], e[-1]))
+        raise ValueError('rho_min = %g, rho_max = %s leave no bin of positive amplitude in [%g, %g]'
+                         % (rho_min, rho_max, e[0], e[-1]))
     la = np.log(np.where(ok, a, 1.0))
     d = np.log(np.where(ok, b, np.e)) - la
     x = (1.0 - gamma) * d                                   # int_a^b rho^-gamma = a^(1-gamma) d exprel(x)
@@ -59,10 +60,11 @@ def ln_amplitude_weights(rho_edges, gamma, rho_min):
     return lnw - logsumexp(lnw)
 
 
-def amplitude_weights(rho_edges, gamma, rho_min):
-    """pi_k (n_rho,): the probability of the bin [rho_edges[k], rho_edges[k+1]] for dN/drho ~ rho^-gamma above
-    rho_min and zero below, normalized over the bins (rho_edges (n_rho + 1,) ascending)"""
-    return np.exp(ln_amplitude_weights(rho_edges, gamma, rho_min))
+def amplitude_weights(rho_edges, gamma, rho_min, rho_max=None):
+    """pi_k (n_rho,): the probability of the bin [rho_edges[k], rho_edges[k+1]] for dN/drho ~ rho^-gamma on
+    [rho_min, rho_max] and zero outside, normalized over the bins (rho_edges (n_rho + 1,) ascending; rho_max None: the
+    last edge)"""
+    return np.exp(ln_amplitude_weights(rho_edges, gamma, rho_min, rho_max))
 
 
 def _template_average(E, pi_m, log):
@@ -197,13 +199,13 @@ def _ln_dot(scaled, pi_k):
 class _Model:
     """ln L(theta) on fixed per-segment arrays; per-bin arrays are rescaled per segment for a fast pi_k product"""
 
-    def __init__(self, lam, lam_gH, lam_gL, lam_gHL, E_H, E_L, rho_edges, pi_m, log, sg, pi_k):
+    def __init__(self, lam, lam_gH, lam_gL, lam_gHL, E_H, E_L, rho_edges, pi_m, log, sg, pi_k, rho_max=None):
         conv = (lambda a: np.asarray(a, float)) if log else _log
         avg = (lambda a: _template_average(a, pi_m, True)) if log else \
             (lambda a: _log(_template_average(a, pi_m, False)))
         self.lnS = conv(lam)
         self.lnHL = None if lam_gHL is None else conv(lam_gHL)
-        self.edges, self.sg, self.pi_k = np.asarray(rho_edges, float), sg, pi_k
+        self.edges, self.sg, self.pi_k, self.rho_max = np.asarray(rho_edges, float), sg, pi_k, rho_max
         self.A = {I: _scaled(avg(E)) for I, E in (('H', E_H), ('L', E_L))}
         self.lng, self.Y = {}, {}
         for I, a in (('H', lam_gH), ('L', lam_gL)):
@@ -216,7 +218,7 @@ class _Model:
         for I in 'HL':
             pk = self.pi_k[I]
             if pk is None:
-                pk = amplitude_weights(self.edges, th['gamma_' + I], th['rho_min_' + I])
+                pk = amplitude_weights(self.edges, th['gamma_' + I], th['rho_min_' + I], self.rho_max)
             lnG[I] = _ln_dot(self.A[I], pk)
             lng[I] = self.lng[I] if self.Y[I] is None else _ln_dot(self.Y[I], pk) - lnG[I]
         lnB, cH, cL = _ln_mixture(self.lnS, lng['H'], lng['L'], lnG['H'], lnG['L'], th['eps_H'], th['eps_L'],
@@ -244,7 +246,7 @@ def _hessian(f, x, lo, hi, h, diagonal=False):
 
 
 def fit(lam, lam_gH, lam_gL, E_H, E_L, rho_edges, start=None, fixed=('rho_min_H', 'rho_min_L'), bounds=None,
-        pi_m=None, log=False, sg=True, lam_gHL=None, pi_k_H=None, pi_k_L=None):
+        pi_m=None, log=False, sg=True, lam_gHL=None, pi_k_H=None, pi_k_L=None, rho_max=None):
     """the maximum of ln L over PARAMETERS = (nbar, eps_H, eps_L, gamma_H, gamma_L, rho_min_H, rho_min_L).
 
     lam                  (n_segment,) Lambda_S averaged over the population
@@ -258,13 +260,15 @@ def fit(lam, lam_gH, lam_gL, E_H, E_L, rho_edges, start=None, fixed=('rho_min_H'
     fixed                names held at their start value; rho_min is fixed by default, ln L has kinks in it at
                          the edges
     bounds               dict name: (lo, hi) (default nbar, eps in [0, 1], gamma in [-10, 20], rho_min between
-                         the first and the next-to-last edge)
+                         the first and the next-to-last edge, and not above the last edge below rho_max)
     pi_m                 (n_template,) distribution of the glitches over the templates (uniform when None)
     log                  the arrays are logarithms
     sg                   False drops the S+g terms (Smith & Thrane 2018)
     lam_gHL              (n_segment,) lambda_HL, with a fiducial law (None: 1, see mixture)
     pi_k_H, pi_k_L       (n_rho,) fixed amplitude weights of a detector (e.g. from fit_noise) in place of the power
                          law, whose gamma and rho_min are then fixed
+    rho_max              upper end of the power law of both detectors, held fixed: no weight above it, the bins
+                         renormalized (None: the last edge), e.g. sqrt(2 w) of a veto on the loudest w
 
     L-BFGS-B in logit(nbar), logit(eps), gamma, ln rho_min; the covariance is the inverse of minus the Hessian in
     the parameters themselves, by central differences (moved inside the bounds for an estimate on one).
@@ -273,14 +277,15 @@ def fit(lam, lam_gH, lam_gL, E_H, E_L, rho_edges, start=None, fixed=('rho_min_H'
     (n_free, n_free), lnl (the maximum), result (scipy OptimizeResult)"""
     pk = dict(H=pi_k_H, L=pi_k_L)
     model = _Model(lam, lam_gH, lam_gL, lam_gHL, E_H, E_L, rho_edges, pi_m, log, sg,
-                   {I: None if v is None else np.asarray(v, float) for I, v in pk.items()})
+                   {I: None if v is None else np.asarray(v, float) for I, v in pk.items()}, rho_max)
     fixed = tuple(fixed) + tuple(p + '_' + I for I in 'HL' if pk[I] is not None for p in ('gamma', 'rho_min'))
     e = model.edges
     th0 = dict(nbar=0.01, eps_H=0.01, eps_L=0.01, gamma_H=3.0, gamma_L=3.0, rho_min_H=e[0], rho_min_L=e[0])
     th0.update(start or {})
     rmin = e[0] if e[0] > 0 else 1e-3 * e[1]
+    top = e[-2] if rho_max is None else min(e[-2], e[e < rho_max].max())
     box = dict(nbar=(0.0, 1.0), eps_H=(0.0, 1.0), eps_L=(0.0, 1.0), gamma_H=(-10.0, 20.0), gamma_L=(-10.0, 20.0),
-               rho_min_H=(rmin, e[-2]), rho_min_L=(rmin, e[-2]))
+               rho_min_H=(rmin, top), rho_min_L=(rmin, top))
     box.update(bounds or {})
     unknown = set(fixed) - set(PARAMETERS)
     if unknown:

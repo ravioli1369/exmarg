@@ -20,9 +20,10 @@ segment k with L of segment k + 1), 'phase-randomize', 'time-reverse'.
 
 The analysis.  pe_redshift(glitch=True, chunk=128) with its default fiducial glitch law and window, on 120 equal-mass
 templates of total mass 20 to 400 (detector frame), m1 in (4, 200) on 150 points, z up to 10 on 150 points (notebook 7),
-the tables loaded with unbiased=True, ymin = D0 / D_L(10) (as pp.run_redshift) so that the store reaches the end of the
-z grid (--ymin to change it; w_inf below records the population weight it leaves out).  Every ln Lambda grid is then
-averaged over the same restricted population (population.ln_lambda_bar).
+the tables loaded with unbiased=True, ymin = D0 / D_L(10) (1 - 1e-6) so that the store reaches the end of the z grid:
+pe_redshift's smallest y is ymin (1 + 5e-10), and at ymin = D0 / D_L(10) the row z = 10 (weight 1.3e-4) was left out;
+its default 0.1267 (z = 8) would leave out 6.7e-3 (--ymin to change it; w_inf below records what is left out).
+Every ln Lambda grid is then averaged over the same restricted population (population.ln_lambda_bar).
 
 Seeds.  Each use of random numbers by segment k has a stream of its own, numpy.random.default_rng(stream(seed, k, use))
 with stream = use 2^60 + seed 2^40 + k, distinct for every (seed, k, use) (seed < 2^20, k < 2^40), below 2^63 and
@@ -45,6 +46,7 @@ settings, the same in every file, and under 'run' the device, host, timings), rh
                                          ln of the population average of the ln_lambda* grids of pe_redshift
     ln_lambda_bar_plain                  the same from pe_redshift without glitch (--plain)
     w_inf                                population weight of the cells where ln_lambda is not finite
+    w_inf_cells (n_cell, 2)              (m1, z) grid indices of those cells, over the batch (not per segment)
     ln_glitch_H, ln_glitch_L (n, n_rho)  ln of the template average, uniform weights, of E_I[m, k]
     wmax_H, wmax_L                       largest w over the templates
     merger, m1, z, y, snr                the merger planted in segment k (m1, z nan, y and snr 0 when absent)
@@ -224,11 +226,13 @@ def simulate_batch(cfg, first, end, sampler):
 
 def reduce(res, pop, mdet_range=MDET):
     """the per-segment arrays kept from a pe_redshift result (glitch=True): ln Lbar of the six ln_lambda grids on the
-    population pop, w_inf, ln of the template average of E_I (n, n_rho) and the largest w"""
+    population pop, w_inf and w_inf_cells, ln of the template average of E_I (n, n_rho) and the largest w"""
     m1, z = res['m1'], res['z']
     out = {key + '_bar': np.atleast_1d(popavg.ln_lambda_bar(res[key], m1, z, mdet_range, pop)) for key in KEYS}
     w = popavg.population_weights(m1, z, mdet_range, pop)
-    out['w_inf'] = np.array([w[~np.isfinite(L)].sum() for L in np.asarray(res['ln_lambda'])])
+    bad = ~np.isfinite(np.asarray(res['ln_lambda'])) & (w > 0)[None]
+    out['w_inf'] = np.array([w[b].sum() for b in bad])
+    out['w_inf_cells'] = np.argwhere(bad.any(axis=0)).astype(np.int32)
     for I in 'HL':
         lnE = np.asarray(res['ln_glitch_' + I], float)
         out['ln_glitch_' + I] = logsumexp(lnE, axis=1) - np.log(lnE.shape[1])
@@ -260,7 +264,7 @@ def batches(start, n, batch):
 
 def campaign(args):
     """the settings that fix the data and the analysis: the same in every file of a campaign"""
-    ymin = float(D0 / _dl_of_z(GRID['zmax'])[0]) if args.ymin is None else float(args.ymin)
+    ymin = float(D0 / _dl_of_z(GRID['zmax'])[0] * (1.0 - 1e-6)) if args.ymin is None else float(args.ymin)
     cfg = dict(version=VERSION, seed=args.seed, nbar=args.nbar, eps_H=args.eps_H, eps_L=args.eps_L,
                glitch_kind=args.glitch_kind, gamma=args.gamma, rho_min=args.rho_min, rho_max=args.rho_max,
                control=args.control, shift=SHIFT, T=T, fmin=FMIN, fmax=FMAX, zmin=args.zmin, mdet_range=MDET,
@@ -357,7 +361,7 @@ def parser():
     p.add_argument('--control', default='none', choices=CONTROLS)
     p.add_argument('--batch', type=int, default=512, help='segments simulated and analysed at once')
     p.add_argument('--chunk', type=int, default=CHUNK, help='segments filtered at once inside pe_redshift')
-    p.add_argument('--ymin', type=float, default=None, help='ymin of pe_redshift (default D0 / D_L(z = 10))')
+    p.add_argument('--ymin', type=float, default=None, help='ymin of pe_redshift (default D0 / D_L(10) (1 - 1e-6))')
     p.add_argument('--zmin', type=float, default=ZMIN, help='smallest z of the population (plant and analysis); '
                    '0.99119, the lower edge of the grid cell at z = 1.025, puts the step on a cell edge')
     p.add_argument('--resident', action='store_true', help='keep every table on the GPU (needs ~48 GB)')

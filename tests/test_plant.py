@@ -154,7 +154,8 @@ def test_streams_independent():
 
 class Stub:
     """pe_redshift in place: arrays of its shapes on plant.GRID, deterministic functions of the data and of the seed it
-    is given, so that wrong data or a wrong seed shows; records its calls"""
+    is given, so that wrong data or a wrong seed shows, -inf outside the bank and on the row z = 10 (as the analysis
+    with ymin = D0 / D_L(10) exactly); records its calls"""
 
     def __init__(self):
         self.calls, self.factories = [], 0
@@ -171,6 +172,7 @@ class Stub:
         a = q['H'] + q['L'] + 1e-3 * ((seed + np.arange(n)) % 101)
         Md = 2.0 * m1[:, None] * (1.0 + z[None, :])
         shape = np.where((Md >= 20) & (Md <= 400), 0.1 * np.log1p(z)[None, :] - m1[:, None] / 500, -np.inf)
+        shape[:, -1] = -np.inf
         res = dict(m1=m1, z=z, rows=np.arange(n), ln_b=a, ln_lambda=a[:, None, None] + shape[None])
         if glitch:
             for j, key in enumerate(plant.KEYS[1:]):
@@ -199,7 +201,8 @@ def test_driver_with_stub(tmp_path, capsys):
     with glitch and once without, with the seed stream(seed, first, 'pe'); every member has its shape and the truth is
     that of simulate_batch; ln_glitch_I is the template average of the stub's ln E; a second run finds every file and
     calls nothing; the same segments in one batch of 9 from 0 give the same per-segment arrays bit for bit; a run of
-    another campaign into the same directory stops; plant_fit reads the directory and prints its criteria"""
+    another campaign into the same directory stops; w_inf is the population weight of the row z = 10 and w_inf_cells
+    its 53 cells, which plant_fit prints with the criteria; a file with another fiducial glitch law is refused"""
     one, two = tmp_path / 'one', tmp_path / 'two'
     stub = drive(one, '--start', '2', '--n', '7', '--batch', '3', '--plain')
     names = sorted(os.path.basename(f) for f in glob.glob(str(one / '*')))
@@ -219,13 +222,16 @@ def test_driver_with_stub(tmp_path, capsys):
         res = Stub().pe(seg, seeds[1], True)
         assert np.allclose(f['ln_glitch_L'], logsumexp(res['ln_glitch_L'], axis=1) - np.log(plant.MASSES.size),
                            rtol=0, atol=1e-12)
-        assert np.all(f['w_inf'] == 0) and np.array_equal(f['ln_lambda_bar_plain'], f['ln_lambda_bar'])
+        m1, z = grid()
+        w = population_weights(m1, z, plant.MDET, plant.population())
+        assert np.allclose(f['w_inf'], w[:, -1].sum(), rtol=1e-12, atol=0)
+        assert np.array_equal(f['w_inf_cells'], np.argwhere(np.isin(np.arange(z.size), [z.size - 1])[None] & (w > 0)))
+        assert f['w_inf_cells'].shape == (53, 2) and np.array_equal(f['ln_lambda_bar_plain'], f['ln_lambda_bar'])
     stamp = {n: os.path.getmtime(one / n) for n in names}
     again = drive(one, '--start', '2', '--n', '7', '--batch', '3', '--plain')
     assert again.calls == [] and again.factories == 0 and stamp == {n: os.path.getmtime(one / n) for n in names}
     drive(two, '--start', '0', '--n', '9', '--batch', '9')
-    _, _, a, _ = plant_fit.load(str(one))
-    _, _, b, _ = plant_fit.load(str(two))
+    a, b = plant_fit.load(str(one))[2], plant_fit.load(str(two))[2]
     assert np.array_equal(a['k'], np.arange(2, 9)) and np.array_equal(b['k'], np.arange(9))
     for key in a:
         if key != 'ln_lambda_bar_plain':
@@ -235,7 +241,8 @@ def test_driver_with_stub(tmp_path, capsys):
     capsys.readouterr()
     code = plant_fit.main([str(two)])
     text = capsys.readouterr().out
-    assert code in (0, 1) and 'population covered' in text and 'time curve' in text, text
+    assert code in (0, 1) and 'population covered: w_inf < 0.0005' in text and 'time curve' in text, text
+    assert '53 cells, z 10.000 to 10.000, m1 4.561 to 17.865, M_det 100.3 to 393.0' in text, text
     with np.load(one / names[2]) as f:                                  # another fiducial law: not the same campaign
         arrays = {key: f[key] for key in f.files}
     np.savez(one / names[2], **dict(arrays, glitch_pi_k=0.5 * arrays['glitch_pi_k']))
@@ -263,7 +270,8 @@ def test_analysis_wiring(monkeypatch):
 
 def test_reduce_coverage():
     """reduce: with ln Lambda = 0 on every cell of the grid but -inf above z = 8 (a store that stops at y(z = 8)),
-    w_inf is the population weight above z = 8 (0.0067 of the restricted population) and Lambda_bar = 1 - w_inf"""
+    w_inf is the population weight above z = 8 (0.0067 of the restricted population), w_inf_cells the cells above z = 8
+    with weight, and Lambda_bar = 1 - w_inf"""
     m1, z = grid()
     pop = plant.population()
     L = np.broadcast_to(np.where(z > 8.0, -np.inf, 0.0), (2, m1.size, z.size))
@@ -277,6 +285,40 @@ def test_reduce_coverage():
     assert 0.005 < above < 0.01 and np.allclose(out['w_inf'], above, rtol=1e-12)
     assert np.allclose(np.exp(out['ln_lambda_bar']), 1 - above, rtol=1e-12)
     assert np.allclose(out['ln_lambda_bar'], ln_lambda_bar(L, m1, z, plant.MDET, pop), rtol=0, atol=0)
+    assert np.array_equal(out['w_inf_cells'], np.argwhere((z[None, :] > 8.0) & (w > 0)))
+
+
+def test_default_ymin_covers_grid():
+    """pe_redshift's node geometry and interpolation to (m1, z) (pe._node_geometry, pe._to_source_frame; no table is
+    read) on a store with the nodes s of data/tables/s_grid.npz and the amplitude axis of the published tables
+    (sqrt(alpha_lo) = 0.4 at every node, from their headers; alpha_hi unbounded here): with plant's default ymin no cell
+    of positive population weight is left without ln Lambda; with ymin = D0 / D_L(10) exactly the row z = 10 is (53
+    cells, 1.3187e-4 of the population with z >= 0.99119, the w_inf of the pilot), and with pe_redshift's default
+    0.1267 every cell above z = 8 is (6.7e-3)"""
+    from exmarg.search import mass_bank, pe
+    from exmarg.search.store import RedshiftStore
+    s = np.load(os.path.join(ROOT, 'data', 'tables', 's_grid.npz'))['s_nodes']
+    st = RedshiftStore(s=s, alpha_lo=np.full(s.size, 0.16), alpha_hi=np.full(s.size, np.inf), beta=None, delta=None,
+                       tau_idx=None, tables=None, n_max=120)
+    seg, _ = plant.simulate_batch(config('--nbar', '0'), 0, 1, plant.Sampler(plant.population()))
+    bank = mass_bank(plant.MASSES, seg, 'cpu')
+    m1, z = grid()
+    w = population_weights(m1, z, plant.MDET, plant.population(0.99119))
+
+    def missing(ymin):
+        valid, _, yN, bnode, _ = pe._node_geometry(bank, st, ymin)
+        lamN = np.where(np.concatenate([valid, (bnode >= 0)[None]]), 0.0, -np.inf)
+        return (w > 0) & ~np.isfinite(pe._to_source_frame(lamN, yN, bank.M, pe.D0 / pe._dl_of_z(z), m1, z, np))
+
+    default = config('--nbar', '0')['ymin']
+    exact = float(pe.D0 / pe._dl_of_z(10.0)[0])
+    row, above8 = missing(exact), missing(0.1267)
+    msg = 'default ymin %.10f: %d cells; D0 / D_L(10) = %.10f: %d cells, weight %.4e; 0.1267: %d cells, weight %.4e' % (
+        default, missing(default).sum(), exact, row.sum(), w[row].sum(), above8.sum(), w[above8].sum())
+    print('\n' + msg)
+    assert default < exact and not missing(default).any(), msg
+    assert row.sum() == 53 and np.array_equal(row[:, -1], w[:, -1] > 0) and abs(w[row].sum() - 1.3187e-4) < 1e-8, msg
+    assert np.array_equal(above8, (w > 0) & (z[None, :] > 8.0)), msg
 
 
 # ----------------------------------------------------------------------------------------------- plant_fit
@@ -292,12 +334,13 @@ def toy_campaign(nbar, *extra):
 
 
 def write_toy(directory, nbar_plant, cfg, splits=((0, 2500), (2500, 9000), (9000, 12000))):
-    """the toy of test_mixture (loud law) in the files of plant.py, mergers at nbar_plant, under the campaign cfg;
-    returns the evidences and the flags"""
+    """the toy of test_mixture (loud law, glitches up to rho 30) in the files of plant.py, mergers at nbar_plant, under
+    the campaign cfg; wmax_I = max_t |z_I|^2 (u = 1) and rho_I the planted SNR (as Toy.data draws it).  returns the
+    evidences, the flags and the per-segment arrays written"""
     toy = Toy()
     pis = law(EDGES, GAMMA, RHO_MIN)
-    z, fl = toy.data(toy.draws(TOY['n'], TOY['seed']), nbar_plant, dict(H=TOY['eps_H'], L=TOY['eps_L']),
-                     dict(H=pis, L=pis))
+    draws = toy.draws(TOY['n'], TOY['seed'])
+    z, fl = toy.data(draws, nbar_plant, dict(H=TOY['eps_H'], L=TOY['eps_L']), dict(H=pis, L=pis))
     ev = toy.evidences(z, [dict(H=pis, L=pis)])
     n = TOY['n']
     per = dict(ln_lambda_bar=ev['S'], ln_lambda_gH_bar=ev['gH'][0], ln_lambda_gL_bar=ev['gL'][0],
@@ -307,14 +350,19 @@ def write_toy(directory, nbar_plant, cfg, splits=((0, 2500), (2500, 9000), (9000
                coherent=fl['m'] & (cfg['control'] == 'none'), m1=np.full(n, np.nan), z=np.full(n, np.nan),
                y=np.zeros(n), snr=np.zeros(n))
     for I in 'HL':
-        per.update({'glitch_' + I: fl['g' + I], 'kind_' + I: np.where(fl['g' + I], 'template', ''),
-                    'rho_' + I: np.full(n, np.nan), 't0_' + I: np.full(n, np.nan)})
+        g = draws['g'][I]
+        k = np.searchsorted(np.cumsum(pis) / pis.sum(), g['uk'], side='right')
+        rho = np.where(fl['g' + I], EDGES[np.minimum(k, EDGES.size - 2)] + g['ur'] * np.diff(EDGES)[np.minimum(
+            k, EDGES.size - 2)], np.nan)
+        per.update({'glitch_' + I: fl['g' + I], 'kind_' + I: np.where(fl['g' + I], 'template', ''), 'rho_' + I: rho,
+                    't0_' + I: np.full(n, np.nan)})
     os.makedirs(directory, exist_ok=True)
     for a, b in splits:
         arrays = {key: v[a:b] for key, v in per.items()}
         plant.write_batch(os.path.join(directory, 'plant_%010d_%010d.npz' % (a, b)), cfg,
-                          dict(first=a, end=b, t_sim=1e-3, t_pe=0.1, t_plain=None), dict(arrays, rho_edges=EDGES))
-    return ev, fl
+                          dict(first=a, end=b, t_sim=1e-3, t_pe=0.1, t_plain=None),
+                          dict(arrays, rho_edges=EDGES, w_inf_cells=np.zeros((0, 2), np.int32)))
+    return ev, fl, per
 
 
 @pytest.fixture(scope='module')
@@ -329,88 +377,147 @@ def toy_dirs(tmp_path_factory):
     return out
 
 
-def direct(ev, sg=True, free=('nbar', 'eps_H', 'eps_L', 'gamma_H', 'gamma_L'), start=None, pi_k=(None, None)):
+def kept(ev, keep):
+    """the toy evidences of the segments keep, by the names of direct"""
+    return dict(S=ev['S'][keep], gH=ev['gH'][0][keep], gL=ev['gL'][0][keep], HL=ev['HL'][0][keep], EH=ev['EH'][keep],
+                EL=ev['EL'][keep])
+
+
+def direct(e, sg=True, free=('nbar', 'eps_H', 'eps_L', 'gamma_H', 'gamma_L'), start=None, pi_k=(None, None),
+           rho_max=None):
     st = dict(nbar=0.01, eps_H=0.01, eps_L=0.01, gamma_H=3.0, gamma_L=3.0, rho_min_H=RHO_MIN, rho_min_L=RHO_MIN)
     st.update(start or {})
-    return mixture.fit(ev['S'], ev['gH'][0], ev['gL'][0], ev['EH'], ev['EL'], EDGES, start=st, log=True, sg=sg,
-                       fixed=tuple(p for p in mixture.PARAMETERS if p not in free), lam_gHL=ev['HL'][0],
-                       pi_k_H=pi_k[0], pi_k_L=pi_k[1])
+    return mixture.fit(e['S'], e['gH'], e['gL'], e['EH'], e['EL'], EDGES, start=st, log=True, sg=sg,
+                       fixed=tuple(p for p in mixture.PARAMETERS if p not in free), lam_gHL=e['HL'],
+                       pi_k_H=pi_k[0], pi_k_L=pi_k[1], rho_max=rho_max)
+
+
+def direct_fits(e, sel, rho_max):
+    """the five estimates and stage 1 of plant_fit, by direct calls on the evidences e"""
+    s1 = {I: mixture.fit_noise(e['E' + I][:, sel], log=True) for I in 'HL'}
+    pk = []
+    for I in 'HL':
+        pk.append(np.zeros(EDGES.size - 1))
+        pk[-1][sel] = s1[I]['pi_k']
+    s2 = dict(eps_H=s1['H']['eps'], eps_L=s1['L']['eps'])
+    return s1, dict(gauss=direct(e, free=('nbar',), start=dict(eps_H=0.0, eps_L=0.0)),
+                    smith_thrane=direct(e, sg=False, rho_max=rho_max), joint=direct(e, rho_max=rho_max),
+                    two_stage=direct(e, free=('nbar',), start=s2, pi_k=pk),
+                    two_stage_eps=direct(e, free=('nbar', 'eps_H', 'eps_L'), start=s2, pi_k=pk))
+
+
+def same_fits(F, s1, ref):
+    close = lambda x, y: abs(x - y) <= 1e-12 * max(abs(y), 1e-300)
+    assert F['joint']['held'] == [] and F['smith_thrane']['held'] == []
+    for key, d in ref.items():
+        for p in d['free']:
+            assert close(F[key][p], d[p]) and close(F[key]['err'][p], d['err'][p]), (key, p, F[key][p], d[p])
+        assert close(F[key]['lnl'], d['lnl']), key
+    for I in 'HL':
+        assert close(F['stage1'][I]['eps'], s1[I]['eps']) and F['stage1'][I]['converged']
 
 
 def test_plant_fit_bookkeeping(toy_dirs, capsys):
-    """plant_fit on the toy written as three result files: the counts are those of the toy's flags; nbar and its error
-    from the Gaussian, Smith and Thrane, joint and two-stage fits, eps and gamma of the joint fit, the unit means and
-    the ends and maxima of the time curves equal direct calls of mixture.fit, fit_noise, ln_mixture and time_curve on
-    the toy evidences (to 1e-12), and the numbers printed are those; each criterion is the comparison it states, and the
-    exit status is 0 exactly when every criterion passes"""
-    path, ev, fl = toy_dirs['plant']
+    """plant_fit on the toy written as three result files.  The counts are those of the toy's flags; the veto (wmax_H or
+    wmax_L above 72) sets aside the segments it states, and its printed numbers (by truth, by detector, the glitches
+    within 1 of rho_cut = 12 and across it) are those of the planted rho and wmax; stage 1 gets the 4 bins of [6, 12).
+    On the kept segments nbar and its error from the Gaussian, Smith and Thrane, joint and two-stage fits, eps and gamma
+    of the joint fit (law up to 12), the unit means, the largest ln Lambda_bar and ln B, and the time curves equal
+    direct calls of mixture.fit, fit_noise, ln_mixture and time_curve on the toy evidences (to 1e-12), the truth of eps
+    is the realized fraction among the kept, and the numbers printed are those; each criterion is the comparison it
+    states and the exit status is 0 exactly when every one passes.  With --veto-w inf nothing is set aside and the
+    joint fit is the direct one on every segment with the law up to the last edge"""
+    path, ev, fl, per = toy_dirs['plant']
     r = plant_fit.report(path)
     n = TOY['n']
     got = {name: v for name, _, v in r['counts']}
     assert got['segments'] == n and got['mergers planted'] == fl['m'].sum() and got['glitches in H'] == fl['gH'].sum()
     assert got['glitches in L'] == fl['gL'].sum() and got['merger signal and glitch in H'] == (fl['m'] & fl['gH']).sum()
     assert got['merger signal and glitch in L'] == (fl['m'] & fl['gL']).sum()
-    F = r['fits']
-    s1 = {I: mixture.fit_noise(ev['E' + I], log=True) for I in 'HL'}
-    s2, pk = dict(eps_H=s1['H']['eps'], eps_L=s1['L']['eps']), (s1['H']['pi_k'], s1['L']['pi_k'])
-    ref = dict(gauss=direct(ev, free=('nbar',), start=dict(eps_H=0.0, eps_L=0.0)), smith_thrane=direct(ev, sg=False),
-               joint=direct(ev), two_stage=direct(ev, free=('nbar',), start=s2, pi_k=pk),
-               two_stage_eps=direct(ev, free=('nbar', 'eps_H', 'eps_L'), start=s2, pi_k=pk))
-    assert F['joint']['held'] == [] and F['smith_thrane']['held'] == []
-    close = lambda x, y: abs(x - y) <= 1e-12 * max(abs(y), 1e-300)
-    for key, d in ref.items():
-        for p in d['free']:
-            assert close(F[key][p], d[p]) and close(F[key]['err'][p], d['err'][p]), (key, p, F[key][p], d[p])
-        assert close(F[key]['lnl'], d['lnl'])
-    for I in 'HL':
-        assert close(F['stage1'][I]['eps'], s1[I]['eps'])
+    loud = {I: per['wmax_' + I] > 72 for I in 'HL'}
+    keep = ~(loud['H'] | loud['L'])
+    out = ~keep
+    sel = (EDGES[1:] > RHO_MIN) & (EDGES[:-1] < 12.0)
+    assert np.array_equal(r['keep'], keep) and np.array_equal(r['bins'], sel) and sel.sum() == 4 and r['rho_cut'] == 12
     text = '\n'.join(r['lines'])
+    gH, gL, m = fl['gH'], fl['gL'], fl['m']
+    assert ('set aside %d of %d segments; by truth (a segment can count twice): glitch in H %d, glitch in L %d, merger '
+            '%d, neither glitch nor merger %d' % (out.sum(), n, (out & gH).sum(), (out & gL).sum(), (out & m).sum(),
+                                                  (out & ~gH & ~gL & ~m).sum())) in text
+    assert 40 < out.sum() < 400 and (out & ~gH & ~gL).sum() == 0
+    for I, g in (('H', gH), ('L', gL)):
+        rho = per['rho_' + I]
+        near = g & (np.abs(rho - 12) < 1)
+        assert ('%s: planted glitches within 1 of rho_cut %d (set aside %d); rho above the cut but kept %d, below it '
+                'but set aside %d' % (I, near.sum(), (near & loud[I]).sum(), (g & (rho > 12) & ~loud[I]).sum(),
+                                  (g & (rho <= 12) & loud[I]).sum())) in text, I
+    e = kept(ev, keep)
+    s1, ref = direct_fits(e, sel, 12.0)
+    F = r['fits']
+    same_fits(F, s1, ref)
+    eps = {I: fl['g' + I][keep].mean() for I in 'HL'}
+    assert r['truth']['eps_H'] == eps['H'] and r['truth']['eps_L'] == eps['L']
     for key, d in ref.items():
         assert '%.5g +- %.5g' % (d['nbar'], d['err']['nbar']) in text, key
     J = ref['joint']
     for I in 'HL':
-        for p in ('eps_' + I, 'gamma_' + I):
-            assert '%s %.4g +- %.2g' % (p, J[p], J['err'][p]) in text, p
+        assert 'eps_%s %.4g +- %.2g (truth %.4g' % (I, J['eps_' + I], J['err']['eps_' + I], eps[I]) in text, I
+        assert 'gamma_%s %.4g +- %.2g (truth 3' % (I, J['gamma_' + I], J['err']['gamma_' + I]) in text, I
     lnG = lambda E, pi: mixture.ln_glitch_evidence(E, pi)
-    pis = law(EDGES, GAMMA, RHO_MIN)
-    B_true = mixture.ln_mixture(ev['S'], ev['gH'][0], ev['gL'][0], lnG(ev['EH'], pis), lnG(ev['EL'], pis),
-                                TOY['eps_H'], TOY['eps_L'], ln_lam_gHL=ev['HL'][0])
-    lawJ = {I: mixture.amplitude_weights(EDGES, J['gamma_' + I], RHO_MIN) for I in 'HL'}
-    B_fit = mixture.ln_mixture(ev['S'], ev['gH'][0], ev['gL'][0], lnG(ev['EH'], lawJ['H']), lnG(ev['EL'], lawJ['L']),
-                               J['eps_H'], J['eps_L'], ln_lam_gHL=ev['HL'][0])
+    pis = mixture.amplitude_weights(EDGES, GAMMA, RHO_MIN, 12.0)
+    B_true = mixture.ln_mixture(e['S'], e['gH'], e['gL'], lnG(e['EH'], pis), lnG(e['EL'], pis), eps['H'], eps['L'],
+                                ln_lam_gHL=e['HL'])
+    lawJ = {I: mixture.amplitude_weights(EDGES, J['gamma_' + I], RHO_MIN, 12.0) for I in 'HL'}
+    B_fit = mixture.ln_mixture(e['S'], e['gH'], e['gL'], lnG(e['EH'], lawJ['H']), lnG(e['EL'], lawJ['L']),
+                               J['eps_H'], J['eps_L'], ln_lam_gHL=e['HL'])
     assert np.allclose(r['lnB_true'], B_true, rtol=0, atol=1e-10)
     assert np.allclose(r['lnB_fit'], B_fit, rtol=0, atol=1e-10)
-    quiet = ~fl['m']
-    glitched = fl['gH'] | fl['gL']
-    for sample, sel in (('all', quiet), ('with a glitch', quiet & glitched), ('without', quiet & ~glitched)):
-        for name, v in (('Gaussian Lambda_bar - 1', ev['S']), ('B - 1, planted noise model', B_true),
+    kk = np.arange(n)[keep]
+    for name, v in (('ln Lambda_bar', e['S']), ('ln B, planted noise model', B_true), ('ln B, joint fit', B_fit)):
+        i = int(np.argmax(v))
+        assert re_line(text, name).startswith('%10.3f   k %d:' % (v[i], kk[i])), (name, re_line(text, name))
+    quiet = ~fl['m'][keep]
+    glitched = (fl['gH'] | fl['gL'])[keep]
+    for sample, sel_ in (('all', quiet), ('with a glitch', quiet & glitched), ('without', quiet & ~glitched)):
+        for name, v in (('Gaussian Lambda_bar - 1', e['S']), ('B - 1, planted noise model', B_true),
                         ('B - 1, joint fit', B_fit)):
-            x = np.exp(v[sel]) - 1
-            mu, se, k = r['unit'][sample][name]
-            assert k == sel.sum() and np.isclose(mu, x.mean(), rtol=1e-9) and np.isclose(se, x.std(ddof=1) / np.sqrt(k),
-                                                                                          rtol=1e-9), (sample, name)
-            assert '%+.3e +- %.2e  (%d,' % (x.mean(), x.std(ddof=1) / np.sqrt(k), k) in text, (sample, name)
+            x = np.exp(v[sel_]) - 1
+            mu, se, c = r['unit'][sample][name]
+            assert c == sel_.sum() and np.isclose(mu, x.mean(), rtol=1e-9), (sample, name)
+            assert np.isclose(se, x.std(ddof=1) / np.sqrt(c), rtol=1e-9), (sample, name)
+            assert '%+.3e +- %.2e  (%d,' % (x.mean(), x.std(ddof=1) / np.sqrt(c), c) in text, (sample, name)
     grid_, prior = np.geomspace(1e-4, 0.5, 600), lambda g: 1 / g
-    for key, v in (('gauss', ev['S']), ('mixture', B_fit)):
+    for key, v in (('gauss', e['S']), ('mixture', B_fit)):
         c = mixture.time_curve(v, grid_, prior, log=True)
         assert np.allclose(r['curves'][key], c, rtol=0, atol=1e-9)
-        assert 'end %+.3f, max %+.3f' % (c[-1], c.max()) in text, key
+        assert 'end %+.3f, max %+.3f at segment %d of %d' % (c[-1], c.max(), np.argmax(c) + 1, keep.sum()) in text, key
     crit = {name: (ok, msg) for name, ok, msg in r['criteria']}
-    e = J['err']['nbar']
-    assert crit['mixture nbar within 2.5 sigma of the truth'][0] == (abs(J['nbar'] - TOY['nbar']) < 2.5 * e)
-    assert not any(name.startswith('control') for name in crit) and crit['population covered: w_inf < 0.0001'][0]
+    err = J['err']['nbar']
+    assert crit['mixture nbar within 2.5 sigma of the truth'][0] == (abs(J['nbar'] - TOY['nbar']) < 2.5 * err)
+    assert not any(name.startswith('control') for name in crit) and crit['population covered: w_inf < 0.0005'][0]
+    assert 'no cell' in text
     print('\n' + text)
     capsys.readouterr()
     assert plant_fit.main([path]) == (0 if all(ok for ok, _ in crit.values()) else 1)
     assert capsys.readouterr().out.strip() == text.strip()
+    r = plant_fit.report(path, veto_w=np.inf)
+    s1, ref = direct_fits(kept(ev, np.ones(n, bool)), EDGES[1:] > RHO_MIN, None)
+    assert r['keep'].all() and np.array_equal(r['bins'], EDGES[1:] > RHO_MIN)
+    same_fits(r['fits'], s1, ref)
+
+
+def re_line(text, name):
+    """what follows the name on its line of 'largest among the kept segments'"""
+    line = [l for l in text.splitlines() if l.startswith('  ' + name + ' ')][0]
+    return line[2 + 26 + 1:]
 
 
 def test_plant_fit_failure_and_control(toy_dirs, capsys):
     """the same toy declared at nbar 0.2 fails the nbar criterion (pull printed) and plant_fit exits with 1; declared a
     time-slide control (truth 0, no coherent merger, the merger signals still in it), it fails 'nbar consistent with 0'
     and states the maximum of the mixture time curve against ln 100, both computed as stated, and its unit mean runs
-    over the segments without a merger signal, not over those without a coherent merger"""
-    path, ev, fl = toy_dirs['wrong truth']
+    over the kept segments without a merger signal, not over those without a coherent merger"""
+    path, ev, fl, per = toy_dirs['wrong truth']
     r = plant_fit.report(path)
     crit = {name: (ok, msg) for name, ok, msg in r['criteria']}
     J = r['fits']['joint']
@@ -418,7 +525,7 @@ def test_plant_fit_failure_and_control(toy_dirs, capsys):
     assert not crit['mixture nbar within 2.5 sigma of the truth'][0] and abs(pull) > 2.5
     assert 'pull %+.2f' % pull in crit['mixture nbar within 2.5 sigma of the truth'][1]
     assert plant_fit.main([path]) == 1
-    path, ev, fl = toy_dirs['control']
+    path, ev, fl, per = toy_dirs['control']
     r = plant_fit.report(path)
     crit = {name: (ok, msg) for name, ok, msg in r['criteria']}
     J = r['fits']['joint']
@@ -428,6 +535,7 @@ def test_plant_fit_failure_and_control(toy_dirs, capsys):
     curve = r['curves']['mixture']
     ok, msg = crit['control: time curve below ln 100']
     assert ok == (curve.max() < np.log(100)) and 'max %+.3f' % curve.max() in msg, msg
-    assert not r['data']['coherent'].any() and r['unit']['all']['B - 1, joint fit'][2] == (~fl['m']).sum()
+    keep = (per['wmax_H'] <= 72) & (per['wmax_L'] <= 72)
+    assert not r['data']['coherent'].any() and r['unit']['all']['B - 1, joint fit'][2] == (~fl['m'] & keep).sum()
     capsys.readouterr()
     assert plant_fit.main([path]) == 1
