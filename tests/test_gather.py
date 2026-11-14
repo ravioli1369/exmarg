@@ -77,15 +77,16 @@ def _lse(a):
 
 
 def reference(traj, tables, mass_ids, lna, tab_ids, times=None, lkH=None, lkL=None):
-    """(3, NS, nsel): ln( sum_tau sum_t exp(lnS + w_v) ) - ln n_time with w_0 = 0, w_1 = lkH(t + tau),
-    w_2 = lkL(t) (log weights floored at -80), over every t or over the selected t with their log weights"""
+    """(4, NS, nsel): ln( sum_tau sum_t exp(lnS + w_v) ) - ln n_time with w_0 = 0, w_1 = lkH(t + tau),
+    w_2 = lkL(t), w_3 = lkH(t + tau) + lkL(t) (log weights floored at -80), over every t or over the selected t
+    with their log weights"""
     n_time = traj["lqH"].shape[1]
     zero = np.zeros(n_time)
     wH = zero if lkH is None else np.maximum(np.asarray(lkH, np.float64), -80.0)
     wL = zero if lkL is None else np.maximum(np.asarray(lkL, np.float64), -80.0)
     beta, delta = np.asarray(tables["beta"], float), np.asarray(tables["delta"], float)
     ns = np.shape(tab_ids)[1]
-    out = np.empty((3, ns, len(mass_ids)))
+    out = np.empty((4, ns, len(mass_ids)))
     for j, mid in enumerate(mass_ids):
         t = np.arange(n_time) if times is None else np.asarray(times[0][mid])
         lw = np.zeros(t.size) if times is None else np.asarray(times[1][mid], np.float64)
@@ -93,13 +94,13 @@ def reference(traj, tables, mass_ids, lna, tab_ids, times=None, lkH=None, lkL=No
         for n in range(ns):
             Th = np.asarray(tables["T"][tab_ids[j, n]], np.float64)
             Tfull = np.concatenate([Th, Th[:, NPHI // 2 - 1:0:-1]], axis=1)     # even in the phase: full circle
-            terms = [[], [], []]
+            terms = [[], [], [], []]
             for r, tau in enumerate(tables["tau"]):
                 i1 = (t + tau) % n_time
                 s = _lnS(Tfull[r], lna[j, n], q["lqH"][i1], q["phH"][i1], q["lqL"][t], q["phL"][t], beta, delta) + lw
-                for v, w in enumerate((zero[t], wH[i1], wL[t])):
+                for v, w in enumerate((zero[t], wH[i1], wL[t], wH[i1] + wL[t])):
                     terms[v].append(s + w)
-            for v in range(3):
+            for v in range(4):
                 out[v, n, j] = _lse(np.concatenate(terms[v])) - np.log(n_time)
     return out
 
@@ -123,7 +124,7 @@ def test_no_weights(case):
 def test_variant0_is_unweighted(case):
     a, lkH, lkL = case
     got = gather_cpu(**a, time_weights=(lkH, lkL))
-    assert got.shape == (3, 2, 3)
+    assert got.shape == (4, 2, 3)
     np.testing.assert_array_equal(got[0], gather_cpu(**a))
 
 
@@ -131,8 +132,8 @@ def test_zero_weights(case):
     a, _, _ = case
     z = np.zeros(a["traj"]["lqH"].shape[1], np.float32)
     got = gather_cpu(**a, time_weights=(z, z))
-    np.testing.assert_array_equal(got[1], got[0])
-    np.testing.assert_array_equal(got[2], got[0])
+    for v in (1, 2, 3):
+        np.testing.assert_array_equal(got[v], got[0])
 
 
 def test_lkH_only(case):
@@ -140,6 +141,7 @@ def test_lkH_only(case):
     z = np.zeros_like(lkH)
     got = gather_cpu(**a, time_weights=(lkH, z))
     np.testing.assert_array_equal(got[2], got[0])
+    np.testing.assert_array_equal(got[3], got[1])
     _close(got, reference(**a, lkH=lkH))
     assert np.all(got[1] < got[0] - 0.05)                # the weights are < 1 and matter
 
@@ -149,13 +151,16 @@ def test_lkL_only(case):
     z = np.zeros_like(lkL)
     got = gather_cpu(**a, time_weights=(z, lkL))
     np.testing.assert_array_equal(got[1], got[0])
+    np.testing.assert_array_equal(got[3], got[2])
     _close(got, reference(**a, lkL=lkL))
     assert np.all(got[2] < got[0] - 0.05)
 
 
 def test_both(case):
     a, lkH, lkL = case
-    _close(gather_cpu(**a, time_weights=(lkH, lkL)), reference(**a, lkH=lkH, lkL=lkL))
+    got = gather_cpu(**a, time_weights=(lkH, lkL))
+    _close(got, reference(**a, lkH=lkH, lkL=lkL))
+    assert np.all(got[3] < np.minimum(got[1], got[2]) - 0.05)    # variant 3 carries both weights
 
 
 def test_selected_times(case):
@@ -171,10 +176,15 @@ def test_selected_times(case):
 def test_extreme_weights(case):
     a, lkH, lkL = case
     n_time = lkH.size
-    # every H weight zero (-inf, clipped at -80): variant 1 is variant 0 - 80
+    # every H weight zero (-inf, clipped at -80): variant 1 is variant 0 - 80 and variant 3 is variant 2 - 80
     got = gather_cpu(**a, time_weights=(np.full(n_time, -np.inf, np.float32), lkL))
     assert np.all(np.isfinite(got))
     np.testing.assert_allclose(got[1], got[0] - 80.0, rtol=0, atol=1e-9)
+    np.testing.assert_allclose(got[3], got[2] - 80.0, rtol=0, atol=1e-9)
+    # both zero everywhere: variant 3 is variant 0 - 160
+    inf = np.full(n_time, -np.inf, np.float32)
+    got = gather_cpu(**a, time_weights=(inf, inf))
+    np.testing.assert_allclose(got[3], got[0] - 160.0, rtol=0, atol=1e-9)
     # zero weight on half the times and below -80 on a few more, with the loud stretch (t = 38..45) knocked out in L
     wH, wL = lkH.copy(), lkL.copy()
     wH[::2] = -np.inf

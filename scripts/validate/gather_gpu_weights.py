@@ -8,8 +8,9 @@ them at a realistic size.  Needs a GPU and cupy:
 The tables are synthetic (smooth random content) of the given shape; the trajectories are random.  Checked, for
 the four combinations of {every arrival time, select_times} x {no weights, weights}: a small case (n_time 256,
 one partial chunk of the shared-memory sort) and the realistic shape on a few templates (n_time 32768, two
-chunks).  Every ln Lambda of the GPU must be within --tol of the CPU's (float32 sums against float64).  The
-selected times are drawn on the host and copied to the device, so both visit the same times.
+chunks).  Every ln Lambda of the GPU, in each of the four sums with weights (none, lkH, lkL, lkH + lkL), must be
+within --tol of the CPU's (float32 sums against float64).  The selected times are drawn on the host and copied to
+the device, so both visit the same times.
 
 Exit status 1 if a check fails.
 """
@@ -85,8 +86,9 @@ def compare(label, traj, host_tables, dev_tables, ids, lna, tab_ids, lk, tol, bl
         for w, dw in ((None, None), (lk, dlk)):
             c = gather.gather_cpu(traj, host_tables, ids, lna[ids], tab_ids[ids], tm, time_weights=w)
             g = gather.gather_gpu(dtraj, dev_tables, ids, lna[ids], tab_ids[ids], block, dtm, time_weights=dw)
-            if g.shape != c.shape:
-                print('%-26s shapes differ: gpu %s cpu %s  FAIL' % (label, g.shape, c.shape))
+            want = (4, lna.shape[1], len(ids)) if w is not None else (lna.shape[1], len(ids))
+            if g.shape != want or c.shape != want:
+                print('%-26s shapes: gpu %s cpu %s, want %s  FAIL' % (label, g.shape, c.shape, want))
                 ok = False
                 continue
             d = np.abs(g - c).reshape(-1, *c.shape[-2:])
@@ -149,7 +151,7 @@ def main():
     import cupy as cp
     dev = cp.cuda.Device()
     print('device %d, MaxSharedMemoryPerBlockOptin %d B' % (dev.id, dev.attributes['MaxSharedMemoryPerBlockOptin']))
-    for nv in (1, 3):
+    for nv in (1, 4):
         st = gather._static(args.ns, nv)
         ch = gather._chunk(NPHI, st)
         print('  NV=%d: chunk %d, dynamic shared %d B + static %d B' % (nv, ch, 7 * ch + 4 * NPHI + 256, st))

@@ -24,8 +24,9 @@ bias at a fraction of the cost.
 
 With time_weights = (lkH, lkL), log weights of the H arrival time t + tau
 and of the L arrival time t (glitch_likelihood.md Sec. 4), the same pass
-also sums exp(lnS + lkH(t + tau)) and exp(lnS + lkL(t)): the table is read
-once per arrival time and only the accumulation is tripled.
+also sums exp(lnS + lkH(t + tau)), exp(lnS + lkL(t)) and
+exp(lnS + lkH(t + tau) + lkL(t)): the table is read once per arrival time
+and only the accumulation is done four times.
 """
 
 import numpy as np
@@ -48,7 +49,7 @@ def _gather_cpu(lqH, phH, lqL, phL, mass_ids, tab_ids, tau_idx, tables, offbs, r
                 lkH, lkL, out_m, out_s):
     """running (max, sum) of exp(lnS) over the arrival times (all, or sel[template] with log weights lw), for each
     (slot, lag, template), in out[n]; with lkH, lkL (None: compiled out) also of exp(lnS + lkH[t + tau]) in
-    out[NS + n] and of exp(lnS + lkL[t]) in out[2 NS + n]"""
+    out[NS + n], of exp(lnS + lkL[t]) in out[2 NS + n] and of exp(lnS + lkH[t + tau] + lkL[t]) in out[3 NS + n]"""
     n_time = lqH.shape[1]
     ntau = tau_idx.size
     nsel, ns = tab_ids.shape
@@ -63,7 +64,7 @@ def _gather_cpu(lqH, phH, lqL, phL, mass_ids, tab_ids, tau_idx, tables, offbs, r
         for n in range(ns):
             Tn = tables[tab_ids[j, n]]
             m = -1e300; s = 0.0
-            mH = -1e300; sH = 0.0; mL = -1e300; sL = 0.0
+            mH = -1e300; sH = 0.0; mL = -1e300; sL = 0.0; mHL = -1e300; sHL = 0.0
             for k in range(n_walk):
                 t = sel[mid, k] if use_sel else k
                 i1 = t + tau0
@@ -113,6 +114,7 @@ def _gather_cpu(lqH, phH, lqL, phL, mass_ids, tab_ids, tau_idx, tables, offbs, r
                 if lkH is not None:
                     mH, sH = _push(mH, sH, acc + lkH[i1])
                     mL, sL = _push(mL, sL, acc + lkL[t])
+                    mHL, sHL = _push(mHL, sHL, acc + lkH[i1] + lkL[t])
             out_m[n, r, j] = m
             out_s[n, r, j] = s
             if lkH is not None:
@@ -120,6 +122,8 @@ def _gather_cpu(lqH, phH, lqL, phL, mass_ids, tab_ids, tau_idx, tables, offbs, r
                 out_s[ns + n, r, j] = sH
                 out_m[2 * ns + n, r, j] = mL
                 out_s[2 * ns + n, r, j] = sL
+                out_m[3 * ns + n, r, j] = mHL
+                out_s[3 * ns + n, r, j] = sHL
 
 
 def _lse_lags(om, os_, n_time, xp):
@@ -147,7 +151,7 @@ def _weights(time_weights, n_time, xp):
 
 
 def _variants(lam, nv, ns):
-    """(nv NS, nsel) -> (NS, nsel), or (3, NS, nsel) with the time weights"""
+    """(nv NS, nsel) -> (NS, nsel), or (4, NS, nsel) with the time weights"""
     return lam if nv == 1 else lam.reshape(nv, ns, -1)
 
 
@@ -166,8 +170,9 @@ def gather_cpu(traj, tables, mass_ids, lna, tab_ids, times=None, time_weights=No
               arrival time t + tau and of the L arrival time t, the same for
               every template, clipped at LK_MIN
 
-    returns (NS, nsel) float64; with time_weights (3, NS, nsel), the sums of
-    exp lnS, exp(lnS + lkH(t + tau)) and exp(lnS + lkL(t))."""
+    returns (NS, nsel) float64; with time_weights (4, NS, nsel), the sums of
+    exp lnS, exp(lnS + lkH(t + tau)), exp(lnS + lkL(t)) and
+    exp(lnS + lkH(t + tau) + lkL(t))."""
     beta, delta = tables["beta"], tables["delta"]
     ids = np.ascontiguousarray(mass_ids, np.int64)
     tab = np.ascontiguousarray(tab_ids, np.int64)
@@ -175,7 +180,7 @@ def gather_cpu(traj, tables, mass_ids, lna, tab_ids, times=None, time_weights=No
     ntau = int(np.asarray(tables["tau"]).size)
     n_time = traj["lqH"].shape[1]
     lkH, lkL = _weights(time_weights, n_time, np)
-    nv = 1 if lkH is None else 3
+    nv = 1 if lkH is None else 4
     om = np.empty((nv * ns, ntau, ids.size)); os_ = np.empty((nv * ns, ntau, ids.size))
     T = numba.typed.List([np.ascontiguousarray(Ti, np.float32) for Ti in tables["T"]])
     ddelta = float(delta[1] - delta[0])
@@ -196,13 +201,13 @@ _SRC = r"""
 #define NT __NT__
 #define CH __CH__
 #define NS __NS__
-#define NV __NV__                 // sums per (slot, lag): 1, or 3 with the time weights lkH, lkL
+#define NV __NV__                 // sums per (slot, lag): 1, or 4 with the time weights lkH, lkL
 #define NSV (NS * NV)             // running (max, sum) pairs per thread, u = v NS + n
 #define NPHIF (__NPHI__/2 + 1)
 #define SEL __SEL__
 #define KS __KS__
-#if NV != 1 && NV != 3
-#error "NV is 1 or 3"
+#if NV != 1 && NV != 4
+#error "NV is 1 or 4"
 #endif
 #if SEL
 #define TIME_OF(i) (sel[(long long)mid * KS + (i)])
@@ -241,8 +246,8 @@ void gather(const float* __restrict__ lqH, const float* __restrict__ phH,
             const int ntau,
             const int* __restrict__ sel,          // (n_template, KS) arrival times visited (SEL = 1)
             const float* __restrict__ lw,         // (n_template, KS) their log weights
-            const float* __restrict__ lkH,        // (NT) log weight of each H arrival time (NV = 3)
-            const float* __restrict__ lkL,        // (NT) log weight of each L arrival time (NV = 3)
+            const float* __restrict__ lkH,        // (NT) log weight of each H arrival time (NV = 4)
+            const float* __restrict__ lkL,        // (NT) log weight of each L arrival time (NV = 4)
             double* __restrict__ out_m, double* __restrict__ out_s)   // (NSV, ntau, nsel)
 {
     extern __shared__ unsigned char smem[];
@@ -295,7 +300,7 @@ void gather(const float* __restrict__ lqH, const float* __restrict__ phH,
             int i1 = t + tau0; if (i1 >= NT) i1 -= NT;
             const float aH = lqH[base + i1], aL = lqL[base + t];
 #if NV > 1
-            const float wH = lkH[i1], wL = lkL[t];
+            const float wH = lkH[i1], wL = lkL[t], wHL = wH + wL;
 #endif
             const int qq = (int)ordr[p];
             int c0 = (int)cbin[qq];
@@ -331,6 +336,7 @@ void gather(const float* __restrict__ lqH, const float* __restrict__ phH,
 #if NV > 1
                 lse_push(m[NS + n], ssum[NS + n], accd + wH);
                 lse_push(m[2 * NS + n], ssum[2 * NS + n], accd + wL);
+                lse_push(m[3 * NS + n], ssum[3 * NS + n], accd + wHL);
 #endif
             }
         }
@@ -396,7 +402,7 @@ def _chunk(nphi, static=0):
 
 def _compile(nb, nd, nphi, n_time, ns, ch, blk, ks=0, nv=1):
     """compile (and cache) the GPU gather for one table geometry, slot count, number of selected times (0: all)
-    and number of sums (1, or 3 with time weights)"""
+    and number of sums (1, or 4 with time weights)"""
     import cupy as cp
     key = (nb, nd, nphi, n_time, ns, ch, blk, ks, nv)
     if key not in _CACHE:
@@ -423,7 +429,7 @@ def gather_gpu(traj, tables, mass_ids, lna, tab_ids, block=256, times=None, time
     times     None (every arrival time) or select_times(...): (sel, lw) on the device
     time_weights  None or (lkH, lkL) on the device, as for gather_cpu
 
-    returns (NS, nsel) float64 on the host, or (3, NS, nsel) with time_weights."""
+    returns (NS, nsel) float64 on the host, or (4, NS, nsel) with time_weights."""
     import cupy as cp
     ntau, nphi, nb, nd = tables["shape"]
     beta, delta = tables["beta"], tables["delta"]
@@ -431,7 +437,7 @@ def gather_gpu(traj, tables, mass_ids, lna, tab_ids, block=256, times=None, time
     ns = int(np.asarray(lna).shape[1])
     ks = 0 if times is None else int(times[0].shape[1])
     lkH, lkL = _weights(time_weights, n_time, cp)
-    nv = 1 if lkH is None else 3
+    nv = 1 if lkH is None else 4
     fn, shm = _compile(nb, nd, nphi, n_time, ns, _chunk(nphi, _static(ns, nv)), block, ks, nv)
     sel, lw = times if times is not None else (cp.zeros(1, cp.int32), cp.zeros(1, cp.float32))
     if lkH is None:
