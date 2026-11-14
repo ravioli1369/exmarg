@@ -6,6 +6,14 @@ redshift store   bd_*.npz, one file per signal power node s = u y^2, members
                  T (tau, phi+, beta, Delta) float32, beta, delta,
                  tau_idx, alpha (amplitude axis), s_node; the distance
                  is a parameter, its prior is applied by the analysis
+
+The tables hold lnS at the points of a grid and are read by linear
+interpolation.  On a grid of spacing h a function of curvature T'' is then
+overestimated by h^2 T'' f (1 - f) / 2 at the fraction f of a cell, h^2 T'' / 12
+on average, and lnS is convex in beta and Delta (a log-sum-exp of the
+orders): under noise the likelihood ratio read from the tables has mean
+1 + 7e-4 s instead of 1.  unbias() subtracts that average, the second
+differences of the table over 12, and leaves an error of zero mean over a cell.
 """
 
 import glob
@@ -52,9 +60,28 @@ def map_npz_member(path, name):
     return np.asarray(np.memmap(path, dtype=dtype, mode="r", offset=offset, shape=shape, order="F" if fortran else "C"))
 
 
-def _read_table(path, pinned):
+def unbias(T):
+    """T minus its second differences along phi, beta and Delta over 12 (float32, a new array): the table whose
+    linear interpolation has no mean error.  phi runs over [0, pi] and the table is even about both ends; along beta
+    and Delta the end points are kept."""
+    out = np.empty(T.shape, np.float32)
+    for i in range(T.shape[0]):
+        t = np.asarray(T[i], np.float64)
+        c = np.zeros_like(t)
+        c[1:-1] += t[2:] - 2.0 * t[1:-1] + t[:-2]
+        c[0] += 2.0 * (t[1] - t[0])
+        c[-1] += 2.0 * (t[-2] - t[-1])
+        c[:, 1:-1] += t[:, 2:] - 2.0 * t[:, 1:-1] + t[:, :-2]
+        c[:, :, 1:-1] += t[:, :, 2:] - 2.0 * t[:, :, 1:-1] + t[:, :, :-2]
+        out[i] = t - c / 12.0
+    return out
+
+
+def _read_table(path, pinned, unbiased=False):
     """the T member of one store file, in page-locked memory when pinned (pageable if that fails)"""
     T = read_npz_member(path, "T.npy")
+    if unbiased:
+        T = unbias(T)
     if not pinned:
         return T
     import cupy as cp
@@ -67,11 +94,13 @@ def _read_table(path, pinned):
     return P
 
 
-def _read_tables(files, pinned, readers, mmap=False):
+def _read_tables(files, pinned, readers, mmap=False, unbiased=False):
     if mmap:
+        if unbiased:
+            raise ValueError("unbiased tables are computed in memory: use mmap=False")
         return [map_npz_member(f, "T.npy") for f in files]
     with ThreadPoolExecutor(max_workers=readers) as ex:
-        return list(ex.map(lambda f: _read_table(f, pinned), files))
+        return list(ex.map(lambda f: _read_table(f, pinned, unbiased), files))
 
 
 @dataclass
@@ -87,10 +116,11 @@ class RedshiftStore:
     n_max: int
 
 
-def load_redshift_store(store_dir, pinned=False, readers=6, mmap=False):
+def load_redshift_store(store_dir, pinned=False, readers=6, mmap=False, unbiased=False):
     """every node of the redshift store in host memory (about 0.75 GB per node);
     pinned=True puts them in page-locked memory for fast copies to the GPU, mmap=True
-    maps them from disk instead of reading them (CPU)"""
+    maps them from disk instead of reading them (CPU), unbiased=True removes the mean
+    error of the linear interpolation (unbias)"""
     files = glob.glob(os.path.join(store_dir, "bd_*.npz"))
     if not files:
         raise FileNotFoundError("no bd_*.npz in %s" % store_dir)
@@ -103,7 +133,7 @@ def load_redshift_store(store_dir, pinned=False, readers=6, mmap=False):
     s, alo, ahi, beta, delta, tau, files = zip(*head)
     return RedshiftStore(s=np.array(s), alpha_lo=np.array(alo), alpha_hi=np.array(ahi),
                          beta=list(beta), delta=list(delta), tau_idx=tau[0],
-                         tables=_read_tables(files, pinned, readers, mmap),
+                         tables=_read_tables(files, pinned, readers, mmap, unbiased),
                          n_max=int(os.path.basename(files[0]).split("_n")[1].split("_")[0]))
 
 

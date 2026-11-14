@@ -5,7 +5,7 @@
 on one simulated segment.  Needs the redshift tables; meant for a GPU.
 
     python scripts/validate/marginal_identity.py tables/redshift gpu 4000 1 [--pairs 6] [--snr-L 4] [--mass 60]
-                                                 [--smax 1] [--chunk 8]
+                                                 [--smax 1] [--chunk 8] [--unbiased]
 
 A merger of detector-frame total mass --mass (equal masses, no spin) is simulated with exmarg.pp.simulate at the
 distance where its optimal SNR in L is --snr-L (weak by default).  d_L is kept fixed and the data of H are replaced
@@ -57,6 +57,7 @@ def main():
     ap.add_argument('--mass', type=float, default=60.0)
     ap.add_argument('--smax', type=float, default=1.0)
     ap.add_argument('--chunk', type=int, default=8)
+    ap.add_argument('--unbiased', action='store_true', help='tables without the mean interpolation error')
     a = ap.parse_args()
 
     seg1, y, snr_net = injection(a.mass, a.snr_L, a.seed)
@@ -65,7 +66,7 @@ def main():
     d_H = np.sqrt(sig2 / 2.0) * (rng.standard_normal((a.n, sig2.size)) + 1j * rng.standard_normal((a.n, sig2.size)))
     segments = dict(seg1, d_H=d_H, d_L=np.repeat(seg1['d_L'], a.n, axis=0))
     seg = search.read_segments(segments)
-    store = search.load_redshift_store(a.store, pinned=a.device == 'gpu')
+    store = search.load_redshift_store(a.store, pinned=a.device == 'gpu', unbiased=a.unbiased)
     bank = search.mass_bank(a.mass * np.array([0.8, 1.0, 1.25]), segments, a.device)
     print('injection: M_det %.1f, y = %.4f, optimal SNR %.2f in L and %.2f in H + L (H replaced by noise); '
           'templates M %s, u %s; %d realizations, n_time %d'
