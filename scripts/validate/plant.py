@@ -275,6 +275,8 @@ def campaign(args):
                control=args.control, shift=SHIFT, T=T, fmin=FMIN, fmax=FMAX, zmin=args.zmin, mdet_range=MDET,
                bank=(float(MASSES[0]), float(MASSES[-1]), MASSES.size), grid=GRID, ymin=ymin, n_loud=1024,
                n_random=1024, glitch_settings='pe default')
+    if getattr(args, 'published_tables', False):
+        cfg['tables'] = 'published'
     return json.loads(json.dumps(cfg))
 
 
@@ -371,6 +373,8 @@ def parser():
                    '0.99119, the lower edge of the grid cell at z = 1.025, puts the step on a cell edge')
     p.add_argument('--resident', action='store_true', help='keep every table on the GPU (needs ~48 GB)')
     p.add_argument('--plain', action='store_true', help='also run pe_redshift without glitch, to record its cost')
+    p.add_argument('--published-tables', action='store_true',
+                   help='read the tables as published, without unbias (a comparison; recorded in the campaign)')
     p.add_argument('--out', required=True, help='directory of the result files')
     return p
 
@@ -391,7 +395,7 @@ def main(argv=None, factory=None):
         def factory(seg):
             from exmarg.search import load_redshift_store
             t = time.time()
-            store = load_redshift_store(a.store, pinned=(a.device == 'gpu'), unbiased=True)
+            store = load_redshift_store(a.store, pinned=(a.device == 'gpu'), unbiased=not a.published_tables)
             print('%s  store loaded, %d nodes (%.0f s)' % (stamp(), store.s.size, time.time() - t), flush=True)
             return make_analysis(store, a.device, a.resident, a.chunk, cfg['ymin'])(seg)
     print('%s  campaign %s; segments %d to %d in batches of %d into %s'
