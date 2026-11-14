@@ -21,17 +21,34 @@ select_times it runs over the loudest arrival times of each template, where
 almost all of a signal's contribution lies, plus a uniform random draw from
 the rest weighted to stand for all of them, so the sum is estimated without
 bias at a fraction of the cost.
+
+With time_weights = (lkH, lkL), log weights of the H arrival time t + tau
+and of the L arrival time t (glitch_likelihood.md Sec. 4), the same pass
+also sums exp(lnS + lkH(t + tau)) and exp(lnS + lkL(t)): the table is read
+once per arrival time and only the accumulation is tripled.
 """
 
 import numpy as np
 import numba
 
 NPHI = 96                 # phase bins of the full circle; the tables hold NPHI/2 + 1
+LK_MIN = -80.0            # floor of the log time weights: exp(-80) ~ 2e-35 stands for zero without -inf in the sums
+
+
+@numba.njit(inline="always")
+def _push(m, s, a):
+    """add exp(a) to the running (max, sum) pair (m, s)"""
+    if a > m:
+        return a, s * np.exp(m - a) + 1.0
+    return m, s + np.exp(a - m)
 
 
 @numba.njit(parallel=True, cache=True)
-def _gather_cpu(lqH, phH, lqL, phL, mass_ids, tab_ids, tau_idx, tables, offbs, rdb, offd, rdd, sel, lw, use_sel, out_m, out_s):
-    """running (max, sum) of exp(lnS) over the arrival times (all, or sel[template] with log weights lw), for each (slot, lag, template)"""
+def _gather_cpu(lqH, phH, lqL, phL, mass_ids, tab_ids, tau_idx, tables, offbs, rdb, offd, rdd, sel, lw, use_sel,
+                lkH, lkL, out_m, out_s):
+    """running (max, sum) of exp(lnS) over the arrival times (all, or sel[template] with log weights lw), for each
+    (slot, lag, template), in out[n]; with lkH, lkL (None: compiled out) also of exp(lnS + lkH[t + tau]) in
+    out[NS + n] and of exp(lnS + lkL[t]) in out[2 NS + n]"""
     n_time = lqH.shape[1]
     ntau = tau_idx.size
     nsel, ns = tab_ids.shape
@@ -46,6 +63,7 @@ def _gather_cpu(lqH, phH, lqL, phL, mass_ids, tab_ids, tau_idx, tables, offbs, r
         for n in range(ns):
             Tn = tables[tab_ids[j, n]]
             m = -1e300; s = 0.0
+            mH = -1e300; sH = 0.0; mL = -1e300; sL = 0.0
             for k in range(n_walk):
                 t = sel[mid, k] if use_sel else k
                 i1 = t + tau0
@@ -91,13 +109,17 @@ def _gather_cpu(lqH, phH, lqL, phL, mass_ids, tab_ids, tau_idx, tables, offbs, r
                     acc += fci * v
                 if use_sel:
                     acc += lw[mid, k]
-                if acc > m:
-                    s = s * np.exp(m - acc) + 1.0
-                    m = acc
-                else:
-                    s += np.exp(acc - m)
+                m, s = _push(m, s, acc)
+                if lkH is not None:
+                    mH, sH = _push(mH, sH, acc + lkH[i1])
+                    mL, sL = _push(mL, sL, acc + lkL[t])
             out_m[n, r, j] = m
             out_s[n, r, j] = s
+            if lkH is not None:
+                out_m[ns + n, r, j] = mH
+                out_s[ns + n, r, j] = sH
+                out_m[2 * ns + n, r, j] = mL
+                out_s[2 * ns + n, r, j] = sL
 
 
 def _lse_lags(om, os_, n_time, xp):
@@ -111,7 +133,25 @@ def _offsets(lna, beta):
     return (np.ascontiguousarray(lna, np.float64) - float(beta[0])) / float(beta[1] - beta[0])
 
 
-def gather_cpu(traj, tables, mass_ids, lna, tab_ids, times=None):
+def _weights(time_weights, n_time, xp):
+    """(lkH, lkL) as float32 (n_time,) arrays of xp clipped at LK_MIN, or (None, None)"""
+    if time_weights is None:
+        return None, None
+    lk = []
+    for w in time_weights:
+        w = xp.asarray(w, xp.float32)
+        if w.shape != (n_time,):
+            raise ValueError("time weights of shape %s, not (%d,)" % (w.shape, n_time))
+        lk.append(xp.ascontiguousarray(xp.maximum(w, xp.float32(LK_MIN))))
+    return tuple(lk)
+
+
+def _variants(lam, nv, ns):
+    """(nv NS, nsel) -> (NS, nsel), or (3, NS, nsel) with the time weights"""
+    return lam if nv == 1 else lam.reshape(nv, ns, -1)
+
+
+def gather_cpu(traj, tables, mass_ids, lna, tab_ids, times=None, time_weights=None):
     """ln Lambda of (template, table) pairs on the CPU.
 
     traj      dict of float32 arrays lqH, phH, lqL, phL, each (n_template,
@@ -122,22 +162,30 @@ def gather_cpu(traj, tables, mass_ids, lna, tab_ids, times=None):
     lna       (nsel, NS) ln a = ln(s/u) of each (template, slot)
     tab_ids   (nsel, NS) index in tables['T'] of the table each slot reads
     times     None (every arrival time) or select_times(...): (sel, lw)
+    time_weights  None or (lkH, lkL), each (n_time,): log weights of the H
+              arrival time t + tau and of the L arrival time t, the same for
+              every template, clipped at LK_MIN
 
-    returns (NS, nsel) float64."""
+    returns (NS, nsel) float64; with time_weights (3, NS, nsel), the sums of
+    exp lnS, exp(lnS + lkH(t + tau)) and exp(lnS + lkL(t))."""
     beta, delta = tables["beta"], tables["delta"]
     ids = np.ascontiguousarray(mass_ids, np.int64)
     tab = np.ascontiguousarray(tab_ids, np.int64)
     ns = tab.shape[1]
     ntau = int(np.asarray(tables["tau"]).size)
-    om = np.empty((ns, ntau, ids.size)); os_ = np.empty((ns, ntau, ids.size))
+    n_time = traj["lqH"].shape[1]
+    lkH, lkL = _weights(time_weights, n_time, np)
+    nv = 1 if lkH is None else 3
+    om = np.empty((nv * ns, ntau, ids.size)); os_ = np.empty((nv * ns, ntau, ids.size))
     T = numba.typed.List([np.ascontiguousarray(Ti, np.float32) for Ti in tables["T"]])
     ddelta = float(delta[1] - delta[0])
     sel, lw = times if times is not None else (np.zeros((1, 1), np.int32), np.zeros((1, 1), np.float32))
     _gather_cpu(traj["lqH"], traj["phH"], traj["lqL"], traj["phL"], ids, tab,
                 np.ascontiguousarray(tables["tau"], np.int64).ravel(), T, _offsets(lna, beta),
                 2.0 / float(beta[1] - beta[0]), -float(delta[0]) / ddelta, 1.0 / ddelta,
-                np.ascontiguousarray(sel, np.int32), np.ascontiguousarray(lw, np.float32), times is not None, om, os_)
-    return _lse_lags(om, os_, traj["lqH"].shape[1], np)
+                np.ascontiguousarray(sel, np.int32), np.ascontiguousarray(lw, np.float32), times is not None,
+                lkH, lkL, om, os_)
+    return _variants(_lse_lags(om, os_, n_time, np), nv, ns)
 
 
 _SRC = r"""
@@ -148,9 +196,14 @@ _SRC = r"""
 #define NT __NT__
 #define CH __CH__
 #define NS __NS__
+#define NV __NV__                 // sums per (slot, lag): 1, or 3 with the time weights lkH, lkL
+#define NSV (NS * NV)             // running (max, sum) pairs per thread, u = v NS + n
 #define NPHIF (__NPHI__/2 + 1)
 #define SEL __SEL__
 #define KS __KS__
+#if NV != 1 && NV != 3
+#error "NV is 1 or 3"
+#endif
 #if SEL
 #define TIME_OF(i) (sel[(long long)mid * KS + (i)])
 #define WEIGHT_OF(i) (lw[(long long)mid * KS + (i)])
@@ -160,6 +213,18 @@ _SRC = r"""
 #define WEIGHT_OF(i) 0.0f
 #define NWALK NT
 #endif
+
+// add exp(a) to the running (max, sum) pair (m, s)
+__device__ __forceinline__ void lse_push(float& m, float& s, const float a)
+{
+    if (a > m) {
+        float sc = expf(m - a);
+        s = s * sc + 1.0f;
+        m = a;
+    } else {
+        s += expf(a - m);
+    }
+}
 
 extern "C" __global__
 void gather(const float* __restrict__ lqH, const float* __restrict__ phH,
@@ -176,7 +241,9 @@ void gather(const float* __restrict__ lqH, const float* __restrict__ phH,
             const int ntau,
             const int* __restrict__ sel,          // (n_template, KS) arrival times visited (SEL = 1)
             const float* __restrict__ lw,         // (n_template, KS) their log weights
-            double* __restrict__ out_m, double* __restrict__ out_s)
+            const float* __restrict__ lkH,        // (NT) log weight of each H arrival time (NV = 3)
+            const float* __restrict__ lkL,        // (NT) log weight of each L arrival time (NV = 3)
+            double* __restrict__ out_m, double* __restrict__ out_s)   // (NSV, ntau, nsel)
 {
     extern __shared__ unsigned char smem[];
     unsigned short* ordr = (unsigned short*)smem;
@@ -193,9 +260,9 @@ void gather(const float* __restrict__ lqH, const float* __restrict__ phH,
     float offb[NS];
     #pragma unroll
     for (int n = 0; n < NS; ++n) offb[n] = offbs[j * NS + n];
-    float m[NS], ssum[NS];
+    float m[NSV], ssum[NSV];
     #pragma unroll
-    for (int n = 0; n < NS; ++n) { m[n] = -1.0e30f; ssum[n] = 0.0f; }
+    for (int u = 0; u < NSV; ++u) { m[u] = -1.0e30f; ssum[u] = 0.0f; }
 
     for (int cs = 0; cs < NWALK; cs += CH) {
         // counting sort of this chunk of arrival times by phase bin
@@ -227,6 +294,9 @@ void gather(const float* __restrict__ lqH, const float* __restrict__ phH,
             const float wt = WEIGHT_OF(off);
             int i1 = t + tau0; if (i1 >= NT) i1 -= NT;
             const float aH = lqH[base + i1], aL = lqL[base + t];
+#if NV > 1
+            const float wH = lkH[i1], wL = lkL[t];
+#endif
             const int qq = (int)ordr[p];
             int c0 = (int)cbin[qq];
             float fc = fcs[qq];
@@ -257,24 +327,22 @@ void gather(const float* __restrict__ lqH, const float* __restrict__ phH,
                     acc += fci * v;
                 }
                 float accd = acc + wt;
-                if (accd > m[n]) {
-                    float sc = expf(m[n] - accd);
-                    ssum[n] = ssum[n] * sc + 1.0f;
-                    m[n] = accd;
-                } else {
-                    ssum[n] += expf(accd - m[n]);
-                }
+                lse_push(m[n], ssum[n], accd);
+#if NV > 1
+                lse_push(m[NS + n], ssum[NS + n], accd + wH);
+                lse_push(m[2 * NS + n], ssum[2 * NS + n], accd + wL);
+#endif
             }
         }
         __syncthreads();
     }
     // block reduction of the running (max, sum) pairs: warp shuffles, then one warp
-    __shared__ float wm[32 * NS], ws[32 * NS];
+    __shared__ float wm[32 * NSV], ws[32 * NSV];
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int nwarp = BLK >> 5;
     #pragma unroll
-    for (int n = 0; n < NS; ++n) {
-        float mv = m[n], sv = ssum[n];
+    for (int u = 0; u < NSV; ++u) {
+        float mv = m[u], sv = ssum[u];
         #pragma unroll
         for (int off = 16; off > 0; off >>= 1) {
             float mo = __shfl_down_sync(0xffffffffu, mv, off);
@@ -282,14 +350,14 @@ void gather(const float* __restrict__ lqH, const float* __restrict__ phH,
             if (mo > mv) { float f = expf(mv - mo); sv = so + sv * f; mv = mo; }
             else         { float f = expf(mo - mv); sv = sv + so * f; }
         }
-        if (lane == 0) { wm[warp * NS + n] = mv; ws[warp * NS + n] = sv; }
+        if (lane == 0) { wm[warp * NSV + u] = mv; ws[warp * NSV + u] = sv; }
     }
     __syncthreads();
     if (warp == 0) {
         #pragma unroll
-        for (int n = 0; n < NS; ++n) {
-            float mv = (lane < nwarp) ? wm[lane * NS + n] : -1.0e30f;
-            float sv = (lane < nwarp) ? ws[lane * NS + n] : 0.0f;
+        for (int u = 0; u < NSV; ++u) {
+            float mv = (lane < nwarp) ? wm[lane * NSV + u] : -1.0e30f;
+            float sv = (lane < nwarp) ? ws[lane * NSV + u] : 0.0f;
             #pragma unroll
             for (int off = 16; off > 0; off >>= 1) {
                 float mo = __shfl_down_sync(0xffffffffu, mv, off);
@@ -298,7 +366,7 @@ void gather(const float* __restrict__ lqH, const float* __restrict__ phH,
                 else         { float f = expf(mo - mv); sv = sv + so * f; }
             }
             if (lane == 0) {
-                const long long o = ((long long)n * ntau + r) * gridDim.x + j;
+                const long long o = ((long long)u * ntau + r) * gridDim.x + j;
                 out_m[o] = (double)mv; out_s[o] = (double)sv;
             }
         }
@@ -310,34 +378,41 @@ void gather(const float* __restrict__ lqH, const float* __restrict__ phH,
 _CACHE = {}
 
 
-def _chunk(nphi):
-    """arrival times sorted per pass: the largest power of two whose shared memory fits the device"""
+def _static(ns, nv):
+    """static shared memory of the kernel: wm, ws, 32 NS NV floats each"""
+    return 2 * 4 * 32 * ns * nv
+
+
+def _chunk(nphi, static=0):
+    """arrival times sorted per pass: the largest power of two whose shared memory, next to the kernel's
+    static bytes, fits the device"""
     import cupy as cp
     limit = cp.cuda.Device().attributes["MaxSharedMemoryPerBlockOptin"]
     ch = 16384
-    while 7 * ch + 4 * nphi + 256 > limit:
+    while 7 * ch + 4 * nphi + 256 + static > limit:
         ch //= 2
     return ch
 
 
-def _compile(nb, nd, nphi, n_time, ns, ch, blk, ks=0):
-    """compile (and cache) the GPU gather for one table geometry, slot count and number of selected times (0: all)"""
+def _compile(nb, nd, nphi, n_time, ns, ch, blk, ks=0, nv=1):
+    """compile (and cache) the GPU gather for one table geometry, slot count, number of selected times (0: all)
+    and number of sums (1, or 3 with time weights)"""
     import cupy as cp
-    key = (nb, nd, nphi, n_time, ns, ch, blk, ks)
+    key = (nb, nd, nphi, n_time, ns, ch, blk, ks, nv)
     if key not in _CACHE:
         src = _SRC
-        for k, v in (("__NB__", nb), ("__ND__", nd), ("__NPHI__", nphi), ("__BLK__", blk),
-                     ("__NT__", n_time), ("__CH__", ch), ("__NS__", ns), ("__SEL__", int(ks > 0)), ("__KS__", max(ks, 1))):
+        for k, v in (("__NB__", nb), ("__ND__", nd), ("__NPHI__", nphi), ("__BLK__", blk), ("__NT__", n_time),
+                     ("__CH__", ch), ("__NS__", ns), ("__NV__", nv), ("__SEL__", int(ks > 0)), ("__KS__", max(ks, 1))):
             src = src.replace(k, str(v))
-        shm = 7 * ch + 4 * nphi + 256             # ordr, cnt, cbin, fcs
+        shm = 7 * ch + 4 * nphi + 256             # ordr, cnt, cbin, fcs (dynamic)
         fn = cp.RawKernel(src, "gather")
-        if shm > 48 * 1024:
+        if shm + _static(ns, nv) > 48 * 1024:     # above 48 kB dynamic + static needs the opt-in
             fn.max_dynamic_shared_size_bytes = shm
         _CACHE[key] = (fn, shm)
     return _CACHE[key]
 
 
-def gather_gpu(traj, tables, mass_ids, lna, tab_ids, block=256, times=None):
+def gather_gpu(traj, tables, mass_ids, lna, tab_ids, block=256, times=None, time_weights=None):
     """ln Lambda of (template, table) pairs on the GPU, one launch.
 
     traj      dict of device float32 arrays lqH, phH, lqL, phL
@@ -346,29 +421,34 @@ def gather_gpu(traj, tables, mass_ids, lna, tab_ids, block=256, times=None):
     mass_ids, lna, tab_ids  as for gather_cpu (tab_ids index the stack)
     block     threads per block
     times     None (every arrival time) or select_times(...): (sel, lw) on the device
+    time_weights  None or (lkH, lkL) on the device, as for gather_cpu
 
-    returns (NS, nsel) float64 on the host."""
+    returns (NS, nsel) float64 on the host, or (3, NS, nsel) with time_weights."""
     import cupy as cp
     ntau, nphi, nb, nd = tables["shape"]
     beta, delta = tables["beta"], tables["delta"]
     n_time = int(traj["lqH"].shape[1])
     ns = int(np.asarray(lna).shape[1])
     ks = 0 if times is None else int(times[0].shape[1])
-    fn, shm = _compile(nb, nd, nphi, n_time, ns, _chunk(nphi), block, ks)
+    lkH, lkL = _weights(time_weights, n_time, cp)
+    nv = 1 if lkH is None else 3
+    fn, shm = _compile(nb, nd, nphi, n_time, ns, _chunk(nphi, _static(ns, nv)), block, ks, nv)
     sel, lw = times if times is not None else (cp.zeros(1, cp.int32), cp.zeros(1, cp.float32))
+    if lkH is None:
+        lkH = lkL = cp.zeros(1, cp.float32)       # not read (NV = 1)
     ddelta = float(delta[1] - delta[0])
     dm = cp.asarray(np.ascontiguousarray(mass_ids, np.int32))
     nmass = int(dm.size)
-    om = cp.empty((ns, ntau, nmass), cp.float64)
-    os_ = cp.empty((ns, ntau, nmass), cp.float64)
+    om = cp.empty((nv * ns, ntau, nmass), cp.float64)
+    os_ = cp.empty((nv * ns, ntau, nmass), cp.float64)
     args = (traj["lqH"], traj["phH"], traj["lqL"], traj["phL"], dm,
             cp.asarray(np.ascontiguousarray(tab_ids, np.int32).ravel()),
             tables["tau"], tables["T"], cp.asarray(_offsets(lna, beta).astype(np.float32).ravel()),
             np.float32(2.0 / float(beta[1] - beta[0])), np.float32(-float(delta[0]) / ddelta),
             np.float32(1.0 / ddelta), np.int64(tables["tstride"]), np.int32(ntau),
-            cp.ascontiguousarray(sel, cp.int32), cp.ascontiguousarray(lw, cp.float32), om, os_)
+            cp.ascontiguousarray(sel, cp.int32), cp.ascontiguousarray(lw, cp.float32), lkH, lkL, om, os_)
     fn((nmass, ntau), (block,), args, shared_mem=shm)
-    return cp.asnumpy(_lse_lags(om, os_, n_time, cp))
+    return _variants(cp.asnumpy(_lse_lags(om, os_, n_time, cp)), nv, ns)
 
 
 def select_times(traj, tau_idx, n_loud, n_random, seed, xp=np, block=256):
