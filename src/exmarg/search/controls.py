@@ -1,10 +1,11 @@
 """
 control data sets of an analysis: the same segments with the astrophysical correlation between the detectors removed,
-so that a search run on them must find no background.
+or with the mergers made unlike any template (time reversal), so that a search run on them must find no background.
 
     slid = time_slide(segments, 0.0488)      # L against H by a whole number of matched-filter samples, circularly
     slid = segment_slide(segments, 1)        # H of segment i with L of segment i + 1
     pr = phase_randomize(segments, seed=3)   # the PR data of the paper
+    rev = time_reverse(segments)             # d -> conj(d): each detector's series reversed in time
 
 Each function returns a new segments dict (same keys) and leaves its input unmodified.
 """
@@ -73,4 +74,17 @@ def phase_randomize(segments, seed):
     rot = np.exp(2j * np.pi * np.random.default_rng(seed).uniform(size=d_H.shape))
     out = dict(segments)
     out['d_H'], out['d_L'] = d_H * rot, d_L * rot
+    return out
+
+
+def time_reverse(segments):
+    """the time-reversed data, control 9 of docs/glitch_likelihood.md: d_I,nu -> conj(d_I,nu) in both detectors.  For
+    the one-sided spectrum of a real series x(t), conj(d) is the spectrum of x(-t), circularly inside the segment: a
+    transient at t moves to T - t (mod T) in each detector, so the two detectors stay aligned and the delay between the
+    sites changes sign.  The power of every bin is kept and Gaussian noise keeps its distribution; a chirp becomes an
+    anti-chirp, which the templates no longer match, while a glitch symmetric in time keeps its shape (Kou et al. 2025).
+
+    segments  dict with d_H, d_L (n_segment, n_freq) complex"""
+    out = dict(segments)
+    out['d_H'], out['d_L'] = np.conj(segments['d_H']), np.conj(segments['d_L'])
     return out

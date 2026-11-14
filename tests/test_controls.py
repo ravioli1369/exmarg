@@ -1,11 +1,11 @@
-"""control data sets: time slides, segment slides and phase randomization"""
+"""control data sets: time slides, segment slides, phase randomization and time reversal"""
 import numpy as np
 import pytest
 
 from exmarg.detectors import S
 from exmarg.profiles import profile
 from exmarg.search import mass_bank
-from exmarg.search.controls import phase_randomize, segment_slide, time_slide, time_step
+from exmarg.search.controls import phase_randomize, segment_slide, time_reverse, time_slide, time_step
 
 T, FMIN, FMAX, M = 4.0, 25.0, 256.0, 40.0
 
@@ -157,3 +157,59 @@ def test_phase_randomize_destroys_the_peak():
         after = peaks(phase_randomize(seg, seed))
         for I in 'HL':
             assert after[I][1] < bound, (seed, I, after[I][1], bound)
+
+
+def series(seg, I):
+    """the band-limited real series of detector I of every segment on the n_time = 8 nu_max samples of the matched
+    filter, x(t_j) = (2 / T) Re sum_nu d_nu exp(2 pi i nu j / n_time): (n_segment, n_time)"""
+    nu = np.asarray(seg['nu'])
+    n = 8 * int(nu.max())
+    full = np.zeros((seg['d_' + I].shape[0], n), complex)
+    full[:, nu] = seg['d_' + I]
+    return 2.0 / seg['T'] * n * np.real(np.fft.ifft(full, axis=1))
+
+
+def test_time_reverse_mirrors_each_detector():
+    """conj(d) is the spectrum of the series reversed in time: on the samples of the matched filter the series of each
+    detector becomes x(-t mod T), to 1e-13 of its largest value; a pulse at sample i in H and i + 40 in L moves to
+    n - i and n - i - 40 (the detectors stay aligned, the delay changes sign).  Reversing twice gives the data back bit
+    for bit, the power of every bin is kept, the cross spectrum d_H conj(d_L) is conjugated, the input is not modified
+    and the keys are kept"""
+    rng = np.random.default_rng(2)
+    nu, f, sig2 = grid()
+    d = {I: rng.standard_normal((6, nu.size)) + 1j * rng.standard_normal((6, nu.size)) for I in 'HL'}
+    seg = dict(d_H=d['H'], d_L=d['L'], f=f, nu=nu, sig2=sig2, T=T, fmin=FMIN, fmax=FMAX)
+    keep = {key: np.array(v) for key, v in seg.items()}
+    rev = time_reverse(seg)
+    n = 8 * int(nu.max())
+    j = np.arange(n)
+    for I in 'HL':
+        x, xr = series(seg, I), series(rev, I)
+        assert np.max(np.abs(xr - x[:, (-j) % n])) < 1e-13 * np.abs(x).max()
+        assert np.array_equal(np.abs(rev['d_' + I]), np.abs(seg['d_' + I]))
+        assert np.array_equal(time_reverse(rev)['d_' + I], seg['d_' + I])
+        assert rev['d_' + I] is not seg['d_' + I]
+    assert np.array_equal(rev['d_H'] * np.conj(rev['d_L']), np.conj(seg['d_H'] * np.conj(seg['d_L'])))
+    assert set(rev) == set(seg)
+    for key in keep:
+        assert np.array_equal(seg[key], keep[key])
+    width, i0 = 2e-3, 1500                                              # a Gaussian pulse, real spectrum
+    pulse = np.sqrt(2 * np.pi) * width * np.exp(-2 * (np.pi * width * f) ** 2)
+    dt = T / n
+    seg = dict(seg, d_H=(pulse * np.exp(-2j * np.pi * f * i0 * dt))[None],
+               d_L=(pulse * np.exp(-2j * np.pi * f * (i0 + 40) * dt))[None])
+    rev = time_reverse(seg)
+    at = {I: (int(np.argmax(series(seg, I)[0])), int(np.argmax(series(rev, I)[0]))) for I in 'HL'}
+    assert at['H'] == (i0, n - i0) and at['L'] == (i0 + 40, n - i0 - 40), at
+
+
+def test_time_reverse_breaks_the_chirp():
+    """the template in H at sample 1500 and in L at 6000, SNR 15 in each, without noise: after time reversal the peak of
+    the matched filter falls to 0.10 of rho^2 / 2 in each detector (the anti-chirp of M = 40 on this grid; bound 0.2),
+    and the two peaks are as far apart as before with the sign of the delay changed"""
+    seg = signal_segments(1500, 6000)
+    before, after = peaks(seg), peaks(time_reverse(seg))
+    n = before['H'][2]
+    for I in 'HL':
+        assert after[I][1] < 0.2 * before[I][1], (I, after[I][1] / before[I][1])
+    assert (after['L'][0] - after['H'][0]) % n == (before['H'][0] - before['L'][0]) % n, (before, after)
