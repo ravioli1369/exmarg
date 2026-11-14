@@ -13,11 +13,15 @@ time, and ln B, its prior average.  The sum over arrival times of
 gather.py runs, by default, over the n_loud loudest times of each template
 plus n_random times drawn from the rest (gather.select_times); n_loud = 0
 sums over every arrival time.
+
+with single=True both also return the single-detector evidences of
+single.py (docs/glitch_likelihood.md, Sec. 5): ln Lambda_S^H, ln Lambda_S^L
+on the nodes of ln Lambda, reduced the same way, and the glitch evidences.
 """
 
 import numpy as np
 
-from . import gather as _gather, store as _store
+from . import gather as _gather, single as _single, store as _store
 from .bank import array_module
 from .segments import D0, read_segments
 from ..priors import distance_density
@@ -165,13 +169,57 @@ def _release(bank):
         _store.free()
 
 
-def _node_values(bank, seg, ev, store, geometry, groups, block, resident, n_loud, n_random, seed):
+def _single_setup(bank, seg, store, geometry):
+    """what single=True needs once per call: the columns of single.py (amplitude bins, then the store nodes s) and
+    the signal power s = a u of the boundary point of every template"""
+    if not np.array_equal(seg["sig2_H"], seg["sig2_L"]):
+        raise ValueError("single=True needs sig2_H == sig2_L, as the tables (u_H = u_L, "
+                         "docs/glitch_likelihood.md Sec. 6)")
+    bnode, blna = geometry[3], geometry[4]
+    lnT = np.concatenate([_single.glitch_columns(), _single.merger_columns(store.s)], axis=1)
+    return dict(lnT=array_module(bank.device).asarray(lnT), ln_u=np.log(bank.u),
+                s_b=np.where(bnode >= 0, np.exp(blna) * bank.u, 0.0), n_rho=_single.RHO_EDGES.size - 1)
+
+
+def _single_values(traj, sd, xp):
+    """per detector: ln E (n_template, n_rho + n_node), ln Lambda_S^I at the boundary point (n_template,), wmax"""
+    out = {}
+    for I in "HL":
+        lq = traj["lq" + I]
+        out[I] = (_single._host(_single.ln_evidence(lq, sd["ln_u"], sd["lnT"], xp=xp)),
+                  _single._host(_single.ln_merger_at(lq, sd["ln_u"], sd["s_b"], xp=xp)),
+                  _single._host(_single._wmax(lq, sd["ln_u"], xp)))
+    return out
+
+
+def _single_nodes(one, lamN, geometry, n_rho):
+    """the single-detector values on the node geometry of lamN (same valid pairs, same boundary row, -inf where
+    lamN is), the glitch evidences and the largest w, stacked over the segments"""
+    valid, bnode = geometry[0], geometry[3]
+    nn = valid.shape[0]
+    out = {}
+    for I in "HL":
+        lam = np.full(lamN.shape, -np.inf)
+        for j, o in enumerate(one):
+            lnE, b, _ = o[I]
+            lam[j, :nn] = np.where(valid, lnE[:, n_rho:].T, -np.inf)
+            lam[j, nn] = np.where(bnode >= 0, b, -np.inf)
+        lam[~np.isfinite(lamN)] = -np.inf
+        out["lamN_" + I] = lam
+        out["ln_glitch_" + I] = np.stack([o[I][0][:, :n_rho] for o in one])
+        out["wmax_" + I] = np.stack([o[I][2] for o in one])
+    return out
+
+
+def _node_values(bank, seg, ev, store, geometry, groups, block, resident, n_loud, n_random, seed, single=None):
     """ln Lambda of every template at every node of the redshift store, for the segments ev:
-    (len(ev), n_node + 1, n_template), row n_node the boundary point at the smallest amplitude"""
+    (len(ev), n_node + 1, n_template), row n_node the boundary point at the smallest amplitude.
+    with single (_single_setup) also the dict of _single_nodes"""
     valid, lna, _, bnode, blna = geometry
     nn = store.s.size
     traj = [_filter(bank, seg, e) for e in ev]
     xp = array_module(bank.device)
+    one = None if single is None else [_single_values(t, single, xp) for t in traj]
     times = [_gather.select_times(t, store.tau_idx, n_loud, n_random, seed + int(seg["rows"][e]), xp) if n_loud > 0 else None
              for t, e in zip(traj, ev)]
     lamN = np.full((len(ev), nn + 1, bank.M.size), -np.inf)
@@ -197,12 +245,28 @@ def _node_values(bank, seg, ev, store, geometry, groups, block, resident, n_loud
             _release(bank)
     del traj, times
     _release(bank)
-    return lamN
+    if single is None:
+        return lamN
+    return lamN, _single_nodes(one, lamN, geometry, single["n_rho"])
+
+
+def _single_out(single, n_seg, shape, bank):
+    """the arrays single=True adds to the result: ln_lambda_H, ln_lambda_L of the given shape per segment, and
+    ln_glitch_H, ln_glitch_L, wmax_H, wmax_L, rho_edges"""
+    if not single:
+        return {}
+    nm, nr = bank.u.size, _single.RHO_EDGES.size - 1
+    out = {"rho_edges": _single.RHO_EDGES.copy()}
+    for I in "HL":
+        out["ln_lambda_" + I] = np.full((n_seg,) + shape, -np.inf)
+        out["ln_glitch_" + I] = np.full((n_seg, nm, nr), -np.inf)
+        out["wmax_" + I] = np.zeros((n_seg, nm))
+    return out
 
 
 def pe_redshift(segments, bank, store, rows=None, chunk=8, zmax=8.0, nz=1600,
                 m1_range=(3.0, 150.0), nm1=1600, ymin=0.1267, nodes_per_launch=6, block=256,
-                mdet_range=(10.0, 500.0), resident=False, n_loud=1024, n_random=1024, seed=0):
+                mdet_range=(10.0, 500.0), resident=False, n_loud=1024, n_random=1024, seed=0, single=False):
     """ln Lambda(m1_source, z) of each segment.
 
     segments          anything read_segments takes (see there)
@@ -222,13 +286,18 @@ def pe_redshift(segments, bank, store, rows=None, chunk=8, zmax=8.0, nz=1600,
     n_loud, n_random  arrival times visited per template (gather.select_times);
                       n_loud = 0 visits all of them
     seed              seed of the random draw (plus the segment index)
+    single            also the single-detector evidences (needs sig2_H == sig2_L)
 
     ln B averages Lambda over the prior uniform in M_det = 2 m1 (1+z) on
     mdet_range and proportional to D_L^2 in luminosity distance, i.e.
     p(m1, z) ~ (1+z) D_L^2 dD_L/dz, on the (m1, z) cells.
 
     returns dict: m1 (nm1,), z (nz,), ln_lambda (n_segment, nm1, nz),
-    ln_b (n_segment,), rows."""
+    ln_b (n_segment,), rows; with single also ln_lambda_H, ln_lambda_L
+    (n_segment, nm1, nz) ln Lambda_S^I through the nodes and the reduction of
+    ln_lambda, ln_glitch_H, ln_glitch_L (n_segment, n_template, n_rho) ln E_I
+    of the amplitude bins rho_edges (n_rho + 1,), wmax_H, wmax_L
+    (n_segment, n_template) the largest w of each template."""
     if np.any(np.diff(bank.M) <= 0) or np.any(bank.q != 1.0) or np.any(bank.chi != 0.0):
         raise ValueError("pe_redshift needs an ascending equal-mass zero-spin bank")
     xp = array_module(bank.device)
@@ -241,11 +310,19 @@ def pe_redshift(segments, bank, store, rows=None, chunk=8, zmax=8.0, nz=1600,
     groups = [list(range(g, min(g + nodes_per_launch, nn))) for g in range(0, nn, nodes_per_launch)]
 
     out = np.full((seg["rows"].size, m1.size, z.size), -np.inf)
+    sd = _single_setup(bank, seg, store, geometry) if single else None
+    extra = _single_out(single, seg["rows"].size, (m1.size, z.size), bank)
     chunk = _fit_chunk(bank, store, chunk, nodes_per_launch, resident)
     for ev in _chunks(seg, chunk):
-        lamN = _node_values(bank, seg, ev, store, geometry, groups, block, resident, n_loud, n_random, seed)
+        lamN = _node_values(bank, seg, ev, store, geometry, groups, block, resident, n_loud, n_random, seed, sd)
+        if single:
+            lamN, one = lamN
         for j, e in enumerate(ev):
             out[e] = _to_source_frame(lamN[j], geometry[2], bank.M, yq, m1, z, xp)
+            for I in "HL" if single else "":
+                extra["ln_lambda_" + I][e] = _to_source_frame(one["lamN_" + I][j], geometry[2], bank.M, yq, m1, z, xp)
+                extra["ln_glitch_" + I][e] = one["ln_glitch_" + I][j]
+                extra["wmax_" + I][e] = one["wmax_" + I][j]
 
     dl = _dl_of_z(z)
     lnp = np.log(np.maximum((1.0 + z) * dl ** 2 * np.gradient(dl, z), 1e-300))
@@ -254,7 +331,7 @@ def pe_redshift(segments, bank, store, rows=None, chunk=8, zmax=8.0, nz=1600,
     w = np.where(inside, np.exp(lnp)[None, :], 0.0) * np.gradient(m1)[:, None] * np.gradient(z)[None, :]
     w /= w.sum()
     ln_b = np.array([_log_mean(L, w) for L in out])
-    return dict(m1=m1, z=z, ln_lambda=out, ln_b=ln_b, rows=seg["rows"])
+    return dict(m1=m1, z=z, ln_lambda=out, ln_b=ln_b, rows=seg["rows"], **extra)
 
 
 def distance_weights(y, prior, ymin):
@@ -286,8 +363,15 @@ def distance_weights(y, prior, ymin):
         return np.log(w)
 
 
+def _distance_integral(lnW, lam):
+    """ln sum_nodes exp(lnW + lam) per template: (n_template,)"""
+    v = lnW + lam
+    mx = v.max(axis=0)
+    return mx + np.log(np.exp(v - mx[None, :]).sum(axis=0))
+
+
 def pe_intrinsic(segments, bank, store, rows=None, prior="volume", ymin=0.1267, chunk=4,
-                 nodes_per_launch=6, block=256, resident=False, n_loud=1024, n_random=1024, seed=0):
+                 nodes_per_launch=6, block=256, resident=False, n_loud=1024, n_random=1024, seed=0, single=False):
     """ln Lambda of each template of the bank, the distance integrated over its prior.
 
     segments          anything read_segments takes (see there)
@@ -305,6 +389,7 @@ def pe_intrinsic(segments, bank, store, rows=None, prior="volume", ymin=0.1267, 
     n_loud, n_random  arrival times visited per template (gather.select_times);
                       n_loud = 0 visits all of them
     seed              seed of the random draw (plus the segment index)
+    single            also the single-detector evidences (needs sig2_H == sig2_L)
 
     each template reads the store at every node s it reaches, y = sqrt(s/u), and
     Lambda = sum_j w_j Lambda(y_j) with the weights of distance_weights.  ln B
@@ -312,7 +397,9 @@ def pe_intrinsic(segments, bank, store, rows=None, prior="volume", ymin=0.1267, 
     (the product of the spacings of the distinct values of every axis that varies).
 
     returns dict: M, q, chi, u (n_template,), ln_lambda (n_segment, n_template),
-    ln_b (n_segment,), rows."""
+    ln_b (n_segment,), rows; with single also ln_lambda_H, ln_lambda_L
+    (n_segment, n_template) ln Lambda_S^I with the same distance weights, and
+    ln_glitch_H, ln_glitch_L, rho_edges, wmax_H, wmax_L as for pe_redshift."""
     seg = read_segments(segments, rows)
     geometry = _node_geometry(bank, store, ymin)
     yN = geometry[2]
@@ -327,13 +414,19 @@ def pe_intrinsic(segments, bank, store, rows=None, prior="volume", ymin=0.1267, 
         lnW[order, m] = distance_weights(yN[order, m], prior, ymin)
 
     out = np.full((seg["rows"].size, bank.u.size), -np.inf)
+    sd = _single_setup(bank, seg, store, geometry) if single else None
+    extra = _single_out(single, seg["rows"].size, (bank.u.size,), bank)
     chunk = _fit_chunk(bank, store, chunk, nodes_per_launch, resident)
     for ev in _chunks(seg, chunk):
-        lamN = _node_values(bank, seg, ev, store, geometry, groups, block, resident, n_loud, n_random, seed)
+        lamN = _node_values(bank, seg, ev, store, geometry, groups, block, resident, n_loud, n_random, seed, sd)
+        if single:
+            lamN, one = lamN
         for j, e in enumerate(ev):
-            v = lnW + lamN[j]
-            mx = v.max(axis=0)
-            out[e] = mx + np.log(np.exp(v - mx[None, :]).sum(axis=0))
+            out[e] = _distance_integral(lnW, lamN[j])
+            for I in "HL" if single else "":
+                extra["ln_lambda_" + I][e] = _distance_integral(lnW, one["lamN_" + I][j])
+                extra["ln_glitch_" + I][e] = one["ln_glitch_" + I][j]
+                extra["wmax_" + I][e] = one["wmax_" + I][j]
 
     cell = np.ones(bank.u.size)
     for ax in (bank.M, bank.q, bank.chi):
@@ -343,4 +436,4 @@ def pe_intrinsic(segments, bank, store, rows=None, prior="volume", ymin=0.1267, 
     w = cell / cell.sum()
     ln_b = np.array([_log_mean(L, w) for L in out])
     return dict(M=bank.M, q=bank.q, chi=bank.chi, u=bank.u, ln_lambda=out, ln_b=ln_b,
-                rows=seg["rows"])
+                rows=seg["rows"], **extra)
