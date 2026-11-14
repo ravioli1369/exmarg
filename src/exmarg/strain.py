@@ -49,12 +49,24 @@ gives E_0|z|^2 / u = 0.993 and 0.958), and picking the louder from the estimates
 With known spectra (psd=..., the reference of the tests) e_i = W_i / sqrt(v) and s_I = v T S_I / 2.
 
 notches.  Bins where R < 1 get sig2 = notch_factor max(sig2) and d = sqrt(sig2) xi, in both detectors.
+
+loud blocks.  A loud block (a glitch) in an epoch pulls the median of the others up: one block among N + 1 = 33 with
+per-bin power 1 + delta lowers the mean |e|^2 of the other 32 by 0.2 % (delta = 0.1), 0.8 % (0.3), 1.8 % (1), and
+4.5 % when it is far louder; the hand-over curve of the neighbouring epochs moves the same way.  loud_blocks flags,
+per detector and epoch, the blocks whose whitened power in a monitor band exceeds what Gaussian noise reaches with
+probability p (loud_thresholds), the others being normalized by the unflagged blocks only, and repeats until the
+flags stop changing.  Every estimate then uses the unflagged blocks: masked_loo for the epoch, with correction(n) for
+the count n behind each block, and the unflagged blocks of the neighbours for the hand-over curve.  The flags depend
+on the data, block i included, but only through thresholds that Gaussian noise crosses with probability p, so the
+leave-one-out argument above holds up to O(p).  An unflagged block just below the thresholds (p = 1e-6: band excess
+0.49, 0.31, 0.21, 0.15, 0.14 from 20 to 512 Hz with N = 32) still moves the others by up to about 1 %.
 """
 
 import numpy as np
 from scipy import integrate, ndimage, special
 
 MONITOR_EDGES = (20.0, 40.0, 80.0, 160.0, 320.0, 512.0)
+LEAST = 6                     # fewest unflagged blocks an estimate is made from (the median correction needs 5)
 
 
 def _ramp(t):
@@ -140,6 +152,21 @@ def loo_spectrum(P, method="mean"):
     return med / median_bias(m)
 
 
+def masked_loo(P, use, method="mean"):
+    """leave-one-out estimates from the rows in `use` only: row i is spectrum() of the rows j != i with use[j] (all
+    of them for a row not in use).  P (n_block, n_freq), use (n_block,) bool -> (estimates P.shape, counts (n_block,)
+    of the rows behind each); with every row in use exactly loo_spectrum(P)"""
+    P = np.asarray(P, float)
+    use = np.asarray(use, bool)
+    if use.all():
+        return loo_spectrum(P, method), np.full(P.shape[0], P.shape[0] - 1)
+    idx = np.flatnonzero(use)
+    out = np.empty_like(P)
+    out[idx] = loo_spectrum(P[idx], method)
+    out[~use] = spectrum(P[idx], method)[None, :]
+    return out, np.where(use, idx.size - 1, idx.size)
+
+
 def _median_moments(N):
     """E[m], E[1/m], E[1/m^2] of the median m of N independent Exp(1), by quadrature over the order statistics"""
     k = N // 2
@@ -183,6 +210,53 @@ def correction(N, method="mean", scheme="whiten"):
         raise ValueError("the inverse moments of the median need N >= 5")
     m1, mi1, mi2 = _median_moments(N)
     return m1 * mi1 if scheme == "whiten" else m1 * mi2 / mi1
+
+
+def whitened_variance(N, method="mean"):
+    """V = Var|e|^2 of a bin normalized by an estimate from N exponential periodograms and its correction (scheme
+    'whiten'): 2 E[1/(c g)^2] - 1, N / (N - 2) for the mean, by quadrature for the median"""
+    if method == "mean":
+        return N / (N - 2.0)
+    _, mi1, mi2 = _median_moments(N)
+    return 2.0 * mi2 / mi1 ** 2 - 1.0
+
+
+def loud_thresholds(nbins, N, method="mean", p=1e-6):
+    """upper thresholds of the band monitors of a block (mean of |e|^2 over nbins bins, normalized by an estimate
+    from N periodograms), each exceeded with probability p by stationary Gaussian noise: the Gamma law of mean 1 and
+    variance V / nbins (V = whitened_variance).  Exact for a known spectrum (V = 1); on simulated noise through the
+    median of N = 32 the per-band rate is within a factor 2 of p down to p = 1e-5.  nan where nbins is 0"""
+    nb = np.asarray(nbins, float)
+    V = whitened_variance(N, method)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where(nb > 0, special.gammainccinv(nb / V, p) * V / np.where(nb > 0, nb, 1.0), np.nan)
+
+
+def loud_blocks(P, f, keep, method="mean", edges=MONITOR_EDGES, p=1e-6, correct=True, iterations=10, least=6):
+    """the loud blocks of one epoch and detector.  Every block is normalized by the leave-one-out estimate of the
+    blocks not flagged (masked_loo, with the correction for its count), and flagged when its monitor exceeds
+    loud_thresholds (probability p per band on Gaussian noise) in any band; repeated from the new flags until they
+    stop changing (at most `iterations` passes; the flags only grow, as removing a loud block lowers the estimate of
+    the others).  Stops, with the flags reached, when fewer than `least` blocks remain unflagged.
+    P (n_block, n_freq) periodograms, f (n_freq,) Hz, keep (n_freq,) bool -> (loud (n_block,) bool, passes)"""
+    P = np.asarray(P, float)
+    nb = np.array([np.sum(keep & (f >= edges[k]) & ((f <= edges[k + 1]) if k == len(edges) - 2 else
+                                                     (f < edges[k + 1]))) for k in range(len(edges) - 1)])
+    use = np.ones(P.shape[0], bool)
+    cache = {}
+    for it in range(1, iterations + 1):
+        est, count = masked_loo(P, use, method)
+        for n in np.unique(count):
+            if n not in cache:
+                cache[n] = (correction(n, method) if correct else 1.0, loud_thresholds(nb, n, method, p))
+        c = np.array([cache[n][0] for n in count])
+        thr = np.array([cache[n][1] for n in count])
+        mon = monitors(np.sqrt(P / (c[:, None] * est)), f, edges, keep)
+        loud = np.any(np.nan_to_num(mon, nan=-np.inf) > np.nan_to_num(thr, nan=np.inf), axis=1)
+        if np.array_equal(loud, ~use) or (~loud).sum() < least:
+            return loud, it
+        use = ~loud
+    return loud, iterations
 
 
 def smooth_spectrum(x, fs, T, smooth=17, pad=0.0, highpass=None):
@@ -260,7 +334,8 @@ def monitors(e, f, edges=MONITOR_EDGES, keep=None):
 def condition(x_H, x_L, fs, gps0, T=8.0, fmin=20.0, fmax=512.0, N=32, notches=(), method="mean", correct=True,
               reference="neighbours", psd=None, equal_noise=True, seed=0, pad=None, band=(16.0, 600.0),
               roll=(4.0, 100.0), notch_taper=0.25, smooth=17, notch_factor=1e10, dq_H=None, dq_L=None, dq_rate=1.0,
-              events=(), event_margin=1.0, monitor_edges=MONITOR_EDGES):
+              events=(), event_margin=1.0, monitor_edges=MONITOR_EDGES, flag=True, flag_p=1e-6, flag_iterations=10,
+              min_blocks=16):
     """the epochs of one coincident stretch of H and L.
 
     x_H, x_L       (n_sample,) strain over the same times, first sample at GPS gps0, sample rate fs (Hz)
@@ -284,6 +359,13 @@ def condition(x_H, x_L, fs, gps0, T=8.0, fmin=20.0, fmax=512.0, N=32, notches=()
                    of it (bitwise and)
     events         GPS times of catalogued events: a segment is flagged when one lies within event_margin (s) of it
     monitor_edges  band edges (Hz) of the whitened-variance monitors
+    flag           with estimated spectra, find the loud blocks of each epoch and detector (loud_blocks: a band
+                   monitor above its threshold, probability flag_p per band on Gaussian noise, at most
+                   flag_iterations passes) and leave them out of every estimate: the leave-one-out spectrum of the
+                   epoch (with the correction for the count used) and the hand-over curve of its neighbours.  Loud
+                   blocks are still conditioned and written.  Nothing flagged: the same numbers as flag=False
+    min_blocks     an epoch is usable when, in both detectors, at least this many blocks enter the leave-one-out
+                   estimate of an unflagged block and the hand-over curve
 
     After pad seconds the stretch is cut into consecutive epochs of (N + 1) T seconds; the rest is dropped.  With
     reference 'neighbours' and estimated spectra a stretch shorter than two epochs gives [], otherwise one shorter
@@ -297,7 +379,14 @@ def condition(x_H, x_L, fs, gps0, T=8.0, fmin=20.0, fmax=512.0, N=32, notches=()
         event          (n_segment,) bool                    dq_H, dq_L (n_segment,) int (when given)
         gps_epoch, gps_reference (start of the epochs that gave sig2_ref), and the settings: fs, N, method,
         correction, reference, psd ('estimated' or 'known'), equal_noise, seed, pad, band, roll, notches,
-        notch_taper, smooth, notch_factor"""
+        notch_taper, smooth, notch_factor
+    and the loud blocks
+        loud_H, loud_L (n_segment,) bool                    analysable (n_segment,) bool: loud in neither, usable
+        n_used_H, n_used_L  unflagged blocks of the epoch   n_reference_H, n_reference_L  blocks of sig2_ref
+        correction_H, correction_L (n_segment,) the factor applied to each block's estimate
+        flag_passes_H, flag_passes_L, usable, and the settings flag, flag_p, flag_iterations, min_blocks
+    The random draws of an epoch (step 5, then the noise of the notched bins) follow the order unequalized
+    regenerates."""
     if reference not in ("neighbours", "epoch") or (reference == "epoch" and method != "mean"):
         raise ValueError("reference must be 'neighbours', or 'epoch' with method 'mean'")
     own = reference == "epoch" or psd is not None
@@ -333,23 +422,54 @@ def condition(x_H, x_L, fs, gps0, T=8.0, fmin=20.0, fmax=512.0, N=32, notches=()
             W[I, e] = cut(whiten(xe, fs, S0, pad, **filt), fs, T, nu)
             G[I, e] = 0.5 * T * np.where(notched, 1.0, np.asarray(S0(f), float)) / R2
 
+    P, loud, passes = {}, {}, {}
+    for I in "HL":
+        for e in range(K):
+            loud[I, e], passes[I, e] = np.zeros(N + 1, bool), 0
+            if psd is None:
+                P[I, e] = np.abs(W[I, e]) ** 2 * G[I, e]
+                if flag:
+                    loud[I, e], passes[I, e] = loud_blocks(P[I, e], f, ~notched, method, monitor_edges, flag_p,
+                                                           correct, flag_iterations, LEAST)
+    factor = {}
+
+    def correction_of(n):
+        if n not in factor:
+            factor[n] = correction(n, method) if correct else 1.0
+        return factor[n]
+
     out = []
     for e in range(K):
         gps_epoch = gps0 + (p + e * L) / fs
         refs = [] if psd is not None else [e] if own else [k for k in (e - 1, e + 1) if 0 <= k < K]
         rng = np.random.default_rng([int(seed), int(round(gps_epoch * 1000))])
-        white, ref = {}, {}
+        white, ref, cfac, n_used, n_ref, usable = {}, {}, {}, {}, {}, {}
         for I in "HL":
+            use = ~loud[I, e]
+            n_used[I] = int(use.sum())
             if psd is not None:
                 white[I] = W[I, e] / np.sqrt(v)
                 ref[I] = v * G[I, e]
+                cfac[I], n_ref[I], usable[I] = np.ones(N + 1), 0, True
             else:
-                P = np.abs(W[I, e]) ** 2 * G[I, e]
-                white[I] = W[I, e] * np.sqrt(G[I, e] / (c * loo_spectrum(P, method)))
-                if reference == "epoch":
-                    ref[I] = P.sum(axis=0) / N
+                base = use if n_used[I] >= LEAST else np.ones(N + 1, bool)      # too few: all blocks, unusable
+                if base.all():
+                    white[I] = W[I, e] * np.sqrt(G[I, e] / (c * loo_spectrum(P[I, e], method)))
+                    cfac[I] = np.full(N + 1, c)
                 else:
-                    ref[I] = spectrum(np.concatenate([np.abs(W[I, k]) ** 2 * G[I, k] for k in refs]), method)
+                    est, count = masked_loo(P[I, e], base, method)
+                    cfac[I] = np.array([correction_of(k) for k in count])
+                    white[I] = W[I, e] * np.sqrt(G[I, e] / (cfac[I][:, None] * est))
+                if reference == "epoch":
+                    ref[I] = P[I, e][base].sum(axis=0) / (base.sum() - 1)
+                    n_ref[I] = int(base.sum()) - 1
+                else:
+                    blocks = np.concatenate([P[I, k][~loud[I, k]] for k in refs])
+                    if blocks.shape[0] < LEAST:
+                        blocks = np.concatenate([P[I, k] for k in refs])
+                    ref[I] = spectrum(blocks, method)
+                    n_ref[I] = int(sum((~loud[I, k]).sum() for k in refs))
+                usable[I] = n_used[I] >= LEAST and n_used[I] - 1 >= min_blocks and n_ref[I] >= min_blocks
             ref[I] = np.where(notched, 0.0, ref[I])
         d = {I: np.sqrt(ref[I]) * white[I] for I in "HL"}
         if equal_noise:
@@ -388,7 +508,33 @@ def condition(x_H, x_L, fs, gps0, T=8.0, fmin=20.0, fmax=512.0, N=32, notches=()
                   pad=float(pad), band=np.asarray(band, float), roll=np.asarray(roll, float),
                   notches=np.asarray(notches, float).reshape(-1, 2), notch_taper=float(notch_taper),
                   smooth=int(smooth), notch_factor=float(notch_factor))
+        ep.update(loud_H=loud["H", e].copy(), loud_L=loud["L", e].copy(), n_used_H=n_used["H"], n_used_L=n_used["L"],
+                  n_reference_H=n_ref["H"], n_reference_L=n_ref["L"], correction_H=cfac["H"], correction_L=cfac["L"],
+                  flag_passes_H=int(passes["H", e]), flag_passes_L=int(passes["L", e]),
+                  usable=bool(usable["H"] and usable["L"]), flag=bool(flag and psd is None), flag_p=float(flag_p),
+                  flag_iterations=int(flag_iterations), min_blocks=int(min_blocks))
+        ep["analysable"] = ~ep["loud_H"] & ~ep["loud_L"] & ep["usable"]
         out.append(ep)
+    return out
+
+
+def unequalized(epoch):
+    """the data of each detector before step 5, {I: (n_segment, n_freq) complex128}, 0 in the notched bins: the
+    noise of equalize regenerated and subtracted.  The draws of an epoch come from default_rng([seed, round(1000
+    gps_epoch)]) in this order, which condition and this function must keep: equalize (standard_normal((2,
+    n_segment, n_freq)) for H, then for L), then the noise of the notched bins (H, then L).  Exact to the complex64
+    rounding of d (6e-8 relative to sqrt(sig2 / sig2_ref_I))"""
+    keep = ~np.asarray(epoch["notched"], bool)
+    if not epoch["equal_noise"]:
+        return {I: np.where(keep, np.asarray(epoch["d_" + I]).astype(complex), 0.0) for I in "HL"}
+    rng = np.random.default_rng([int(epoch["seed"]), int(round(epoch["gps_epoch"] * 1000))])
+    sig2 = np.maximum(epoch["sig2_ref_H"], epoch["sig2_ref_L"])
+    out = {}
+    for I in "HL":
+        g = rng.standard_normal((2,) + np.shape(epoch["d_" + I]))
+        d = np.asarray(epoch["d_" + I]).astype(complex) - np.sqrt(0.5 * (sig2 - epoch["sig2_ref_" + I])) * (
+            g[0] + 1j * g[1])
+        out[I] = np.where(keep, d, 0.0)
     return out
 
 

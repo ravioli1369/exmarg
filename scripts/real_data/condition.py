@@ -24,7 +24,13 @@ Each epoch file holds the dict of strain.condition (dq_H, dq_L: the DQ bits set 
     dq_names, inj_names   bit names of the masks           inj_H, inj_L  injection bits set over all of a segment
     stretch               GPS start and end of its stretch  notch_file    the file of the notches ('' if none)
 manifest.txt: one line per epoch: file, GPS start, number of segments, the DQ bits set over the whole epoch in H1 and
-L1, and the number of segments flagged with an event.  stretches.txt: GPS start, seconds and epochs of each stretch.
+L1, the number of segments flagged with an event, the loud segments and the unflagged blocks of each detector
+(strain.condition flags loud blocks and leaves them out of every estimate; --no-flag, --flag-p, --min-blocks),
+whether the epoch is usable, and u_H1 / u_L1 before step 5 for an equal-mass template of 60 Msun (also u_ratio_60 in
+the epoch file).  stretches.txt: GPS start, seconds and epochs of each stretch.
+
+On a host whose memory is fragmented by other jobs, set NUMPY_MADVISE_HUGEPAGE=0: numpy asks for huge pages for its
+large arrays, and their page faults then stall in memory compaction (five times slower on a shared machine).
 
 .npz/.npy input: one detector per file, an .npz with strain (n,), sample_rate, gps_start and optionally dq
 (n_second,) int bits at 1 Hz, or an .npy strain array with --fs and --gps.  Good seconds have finite strain and every
@@ -226,6 +232,24 @@ def _segment_and(bits, gps, gps0, T):
     return np.array([np.bitwise_and.reduce(bits[i:j]) for i, j in zip(a, b)], np.int64)
 
 
+_A2 = {}
+
+
+def u_ratio(ep, M=60.0):
+    """u_H / u_L before step 5 for an equal-mass, nonspinning template of total mass M: the ratio of the sums of
+    a^2 / sig2_ref_I over the bins that are not notched (exmarg.profiles.profile)"""
+    key = (float(ep['T']), float(ep['fmin']), float(ep['fmax']), int(np.size(ep['nu'])), M)
+    if key not in _A2:
+        from exmarg.profiles import profile
+        nu, _, a, _ = profile(M / 2.0, M / 2.0, 0.0, 0.0, ep['T'], ep['fmin'], ep['fmax'], 1.0)
+        a2 = np.zeros(np.size(ep['nu']))
+        a2[np.searchsorted(ep['nu'], nu)] = a ** 2
+        _A2[key] = a2
+    keep = ~np.asarray(ep['notched'], bool)
+    a2 = _A2[key][keep]
+    return float((a2 / ep['sig2_ref_H'][keep]).sum() / (a2 / ep['sig2_ref_L'][keep]).sum())
+
+
 def write(out_dir, ep):
     """write an epoch to out_dir/epoch_<gps>.npz through a temporary file; returns the file name"""
     name = epoch_name(ep['gps_epoch'])
@@ -253,7 +277,7 @@ def _condition_block(job):
         ep.update(inj_H=_segment_and(tl['inj_H1'][a:a + m], ep['gps'], job['gps'], ep['T']),
                   inj_L=_segment_and(tl['inj_L1'][a:a + m], ep['gps'], job['gps'], ep['T']),
                   dq_names=np.array(tl['dq_names']), inj_names=np.array(tl['inj_names']),
-                  stretch=np.array(job['stretch'], float), notch_file=c['notch_file'])
+                  stretch=np.array(job['stretch'], float), notch_file=c['notch_file'], u_ratio_60=u_ratio(ep))
         write(c['out_dir'], ep)
         written += 1
     return dict(written=written, events=sum(int(ep['event'].sum()) for ep in eps[job['keep'][0]:job['keep'][1]]),
@@ -284,8 +308,14 @@ def write_manifest(out_dir, header):
             continue
         with np.load(path) as z:
             dq = [int(np.bitwise_and.reduce(z['dq_' + I])) if 'dq_' + I in z.files else -1 for I in 'HL']
+            flags = [int(z['loud_' + I].sum()) if 'loud_' + I in z.files else -1 for I in 'HL']
+            used = [int(z['n_used_' + I]) if 'n_used_' + I in z.files else -1 for I in 'HL']
+            ratio = float(z['u_ratio_60']) if 'u_ratio_60' in z.files else u_ratio(
+                {k: (z[k].item() if z[k].ndim == 0 else z[k]) for k in ('T', 'fmin', 'fmax', 'nu', 'notched',
+                                                                        'sig2_ref_H', 'sig2_ref_L')})
             rows.append((os.path.basename(path), float(z['gps_epoch']), int(z['gps'].size), dq[0], dq[1],
-                         int(z['event'].sum())))
+                         int(z['event'].sum()), flags[0], flags[1], used[0], used[1],
+                         int(bool(z['usable'])) if 'usable' in z.files else -1, ratio))
             if names is None and 'dq_names' in z.files:
                 names = [str(v) for v in z['dq_names']]
     rows.sort(key=lambda r: r[1])
@@ -294,9 +324,11 @@ def write_manifest(out_dir, header):
             fh.write('# %s\n' % line)
         if names:
             fh.write('# dq bit k set: %s passes\n' % ', '.join('%d %s' % kv for kv in enumerate(names)))
-        fh.write('# file gps_epoch n_segment dq_H1 dq_L1 n_event\n')
+        fh.write('# loud: segments flagged loud (strain.loud_blocks); used: unflagged blocks of the epoch; usable: 1 '
+                 'or 0 (-1: not recorded); uH_uL_60: u_H1 / u_L1 before step 5, equal-mass template of 60 Msun\n')
+        fh.write('# file gps_epoch n_segment dq_H1 dq_L1 n_event loud_H1 loud_L1 used_H1 used_L1 usable uH_uL_60\n')
         for r in rows:
-            fh.write('%s %d %d %d %d %d\n' % r)
+            fh.write('%s %d %d %d %d %d %d %d %d %d %d %.4f\n' % r)
     os.replace(os.path.join(out_dir, 'manifest.txt.tmp'), os.path.join(out_dir, 'manifest.txt'))
     return len(rows), sum(r[2] for r in rows), sum(r[5] for r in rows)
 
@@ -314,7 +346,8 @@ def settings(a):
     """keyword arguments of strain.condition from the command line"""
     return dict(T=a.T, fmin=a.fmin, fmax=a.fmax, N=a.N, notches=read_notches(a.notches_file) + notch_list(a.notches),
                 method=a.method, reference=a.reference, equal_noise=not a.unequal, seed=a.seed, pad=a.pad,
-                band=tuple(a.band), roll=tuple(a.roll), smooth=a.smooth, event_margin=a.event_margin)
+                band=tuple(a.band), roll=tuple(a.roll), smooth=a.smooth, event_margin=a.event_margin,
+                flag=not a.no_flag, flag_p=a.flag_p, flag_iterations=a.flag_iterations, min_blocks=a.min_blocks)
 
 
 def header(a, kw, source, events_source):
@@ -398,7 +431,8 @@ def run_arrays(a):
                                dq_L=None if x['L']['dq'] is None else x['L']['dq'][s0:s1], **kw)
         for ep in eps:
             if not os.path.exists(os.path.join(a.out_dir, epoch_name(ep['gps_epoch']))):
-                ep.update(stretch=np.array([t0 + s0, t0 + s1], float), notch_file=a.notches_file or '')
+                ep.update(stretch=np.array([t0 + s0, t0 + s1], float), notch_file=a.notches_file or '',
+                          u_ratio_60=u_ratio(ep))
                 write(a.out_dir, ep)
         total += len(eps)
         print('stretch GPS %d + %d s: %d epochs, %d s of segments, %d events flagged'
@@ -437,6 +471,12 @@ def main(argv=None):
     p.add_argument('--roll', type=float, nargs=2, default=(4.0, 100.0))
     p.add_argument('--smooth', type=int, default=17)
     p.add_argument('--unequal', action='store_true', help='skip step 5: keep sig2_H and sig2_L')
+    p.add_argument('--no-flag', action='store_true', help='keep loud blocks in the estimates (strain.loud_blocks)')
+    p.add_argument('--flag-p', type=float, default=1e-6, help='false-flag probability per band of a block on Gaussian '
+                                                               'noise')
+    p.add_argument('--flag-iterations', type=int, default=10)
+    p.add_argument('--min-blocks', type=int, default=16, help='an epoch is usable when its estimates rest on at least '
+                                                               'this many unflagged blocks')
     p.add_argument('--workers', type=int, default=min(16, os.cpu_count() or 1), help='GWOSC input: processes')
     p.add_argument('--block', type=int, default=24, help='GWOSC input: epochs per block (0: whole stretches)')
     a = p.parse_args(argv)

@@ -3,8 +3,9 @@
 Two detectors, two consecutive files of 300 s at 128 Hz (white noise).  H1 fails CBC_CAT2 at second 20 (finite strain,
 a veto second) and BURST_CAT2 at second 450 (not required: only recorded); L1 has no data at seconds 420 to 430 (NaN,
 DATA unset) and fails NO_STOCH_HW_INJ at second 560.  The stretches are then [21, 420), which crosses the file
-boundary at 300, and [430, 560); [0, 20) and [561, 600) are shorter than two epochs.  Epochs of N + 1 = 6 segments of
-4 s with 4 s of pad: 16 and 5 epochs, against 11 + 4 + 5 if the stretch were cut at the file boundary.
+boundary at 300, and [430, 560); [0, 20) and [561, 600) are shorter than two epochs.  Epochs of N + 1 = 8 segments of
+4 s with 4 s of pad: 12 and 3 epochs, against 8 + 3 + 3 if the stretch were cut at the file boundary.  H1 is 30 times
+larger at seconds 150 and 151, inside the last segment of epoch 3 of the first stretch: that segment is flagged loud.
 """
 import importlib.util
 import json
@@ -28,11 +29,12 @@ DQ = ['DATA', 'CBC_CAT1', 'CBC_CAT2', 'CBC_CAT3', 'BURST_CAT1', 'BURST_CAT2', 'B
 INJ = ['NO_CBC_HW_INJ', 'NO_BURST_HW_INJ', 'NO_DETCHAR_HW_INJ', 'NO_CW_HW_INJ', 'NO_STOCH_HW_INJ']
 G, FS, DUR = 1000000000, 128, 300
 VETO_H, BURST_H, GAP_L, INJ_L = 20, 450, (420, 430), 560
-T, N, PAD = 4.0, 5, 4.0
+T, N, PAD = 4.0, 7, 4.0
+LOUD_H = 150                                                   # seconds 150 and 151 of H1, amplitude times 30
 STRETCHES = ((21, 420), (430, 560))
 EVENT = G + 21 + PAD + 3 * (N + 1) * T + 2 * T + 1.5           # 1.5 s into segment 2 of epoch 3 of the first stretch
-ARGS = ['--T', '4', '--N', '5', '--pad', '4', '--fmin', '20', '--fmax', '40', '--band', '16', '48', '--roll', '4', '8',
-        '--method', 'median', '--seed', '7', '--notches', '29.5:30.5']
+ARGS = ['--T', '4', '--N', '7', '--min-blocks', '3', '--pad', '4', '--fmin', '20', '--fmax', '40', '--band', '16', '48',
+        '--roll', '4', '8', '--method', 'median', '--seed', '7', '--notches', '29.5:30.5']
 
 
 def write_file(path, det, gps, rng):
@@ -43,6 +45,7 @@ def write_file(path, det, gps, rng):
     inj = np.full(DUR, sum(v for k, v in ibit.items() if k != 'NO_CW_HW_INJ'))
     sec = np.arange(gps, gps + DUR) - G
     if det == 'H1':
+        x.reshape(DUR, FS)[(sec >= LOUD_H) & (sec < LOUD_H + 2)] *= 30.0
         dq[sec == VETO_H] &= ~bit['CBC_CAT2']
         dq[sec == BURST_H] &= ~bit['BURST_CAT2']
     else:
@@ -99,14 +102,15 @@ def test_stretches_joined_across_the_file_boundary(folder):
     assert tl['good_H1'][GAP_L[0]] and not tl['good_L1'][GAP_L[0]] and not tl['good_H1'][VETO_H]
     stretches, jobs = cond.plan(tl['good'], G, FS, T, N, PAD, block=0)
     assert [(s[0] - G, s[0] - G + s[1]) for s in stretches] == list(STRETCHES)
-    assert [s[2] for s in stretches] == [16, 5]                    # cut at 300 s: 11 + 4 in the first
-    assert len(cond.plan(tl['good'], G, FS, T, N, PAD, block=3)[1]) == 6 + 2
+    assert [s[2] for s in stretches] == [12, 3]                    # cut at 300 s: 8 + 3 in the first
+    assert len(cond.plan(tl['good'], G, FS, T, N, PAD, block=3)[1]) == 4 + 1
 
 
 def test_segments_and_bookkeeping(blocks):
     _, eps = blocks
     good = good_seconds()
-    starts = [G + s0 + PAD + e * (N + 1) * T for s0, s1 in STRETCHES for e in range((s1 - s0 - 8) // 24)]
+    K = [int((s1 - s0 - 2 * PAD) // ((N + 1) * T)) for s0, s1 in STRETCHES]
+    starts = [G + s0 + PAD + e * (N + 1) * T for (s0, s1), k in zip(STRETCHES, K) for e in range(k)]
     assert sorted(ep['gps_epoch'] for ep in eps.values()) == starts
     assert any(ep['gps_epoch'] < G + DUR < ep['gps_epoch'] + (N + 1) * T for ep in eps.values())
     for name, ep in eps.items():
@@ -121,7 +125,11 @@ def test_segments_and_bookkeeping(blocks):
         assert np.array_equal(ep['event'], flagged)
         assert ep['method'] == 'median' and ep['seed'] == 7 and ep['N'] == N and ep['d_H'].shape == (N + 1, 81)
         assert np.array_equal(ep['notches'], [[29.5, 30.5]]) and ep['notched'].sum() > 0
+        loud = (ep['gps'] <= G + LOUD_H) & (G + LOUD_H + 2 <= ep['gps'] + T)
+        assert np.array_equal(ep['loud_H'], loud) and not ep['loud_L'].any() and ep['usable']
+        assert ep['n_used_H'] == N + 1 - loud.sum() and 0.5 < ep['u_ratio_60'] < 2.0
     assert sum(int(ep['event'].sum()) for ep in eps.values()) == 2
+    assert sum(int(ep['loud_H'].sum()) for ep in eps.values()) == 1
 
 
 def test_blocks_give_the_whole_stretch_and_resume(folder, blocks, tmp_path):
@@ -129,7 +137,8 @@ def test_blocks_give_the_whole_stretch_and_resume(folder, blocks, tmp_path):
     whole = run(folder, tmp_path / 'whole', '--workers', '1', '--block', '0')
     assert list(whole) == list(eps)
     for name in eps:
-        for key in ('d_H', 'd_L', 'sig2', 'sig2_ref_H', 'sig2_ref_L', 'monitor_H', 'gps_reference'):
+        for key in ('d_H', 'd_L', 'sig2', 'sig2_ref_H', 'sig2_ref_L', 'monitor_H', 'gps_reference', 'loud_H',
+                    'correction_H', 'n_reference_H', 'u_ratio_60'):
             assert np.array_equal(whole[name][key], eps[name][key], equal_nan=True), (name, key)
     mtime = {p.name: p.stat().st_mtime_ns for p in out.glob('epoch_*.npz')}
     again = run(folder, out, '--workers', '1', '--block', '3')
@@ -137,6 +146,8 @@ def test_blocks_give_the_whole_stretch_and_resume(folder, blocks, tmp_path):
     rows = [r.split() for r in open(out / 'manifest.txt') if not r.startswith('#')]
     assert [r[0] for r in rows] == list(eps) and all(r[2] == str(N + 1) for r in rows)
     assert sum(int(r[5]) for r in rows) == 2 and {r[4] for r in rows} == {'127'}
+    assert sum(int(r[6]) for r in rows) == 1 and {r[7] for r in rows} == {'0'} and {r[10] for r in rows} == {'1'}
+    assert [float(r[11]) for r in rows] == [round(eps[r[0]]['u_ratio_60'], 4) for r in rows]
     assert [r.split()[:2] for r in open(out / 'stretches.txt') if not r.startswith('#')] == [
         [str(G + a), str(b - a)] for a, b in STRETCHES]
 

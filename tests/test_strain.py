@@ -357,3 +357,201 @@ def test_epoch_file_round_trip(run, tmp_path):
     back = strain.read_epoch(path)
     assert back["method"] == "mean" and back["N"] == N and back["notches"].shape == (len(sim.NOTCHES), 2)
     assert not back["event"].any() and back["gps"][0] == ep["gps_epoch"]
+
+
+# loud blocks (strain.loud_blocks): the same noise with blocks of H made 30, 900 and 1e6 times louder
+
+
+PLANTS = ((0, 7, 30.0), (1, 12, 900.0), (2, 20, 1e6))       # (epoch, block, power factor), detector H
+
+
+def plant(x, blocks, factor, seed):
+    """x with each (epoch, block) made `factor` times louder: an independent realization of the line-free noise of H
+    (high-passed below 20 Hz), scaled by sqrt(factor - 1), added under a window that is 1 over the block but its first
+    and last second (sin^2 ramps), so that the whitening filter carries little of it into the next blocks"""
+    m = int(T * FS)
+    fk = np.fft.rfftfreq(m, 1.0 / FS)
+    lines = sum(h * np.exp(-0.5 * ((fk - f0) / sim.WIDTH) ** 2) for f0, h in sim.LINES["H"])
+    S = PSD[0](fk) / (1.0 + lines) * np.sin(0.5 * np.pi * np.clip((fk - 18.0) / 2.0, 0.0, 1.0)) ** 2
+    S[0] = S[-1] = 0.0
+    h = int(FS)
+    w = np.ones(m)
+    w[:h] = np.sin(0.5 * np.pi * (np.arange(h) + 0.5) / h) ** 2
+    w[-h:] = w[:h][::-1]
+    y = x.copy()
+    rng = np.random.default_rng(seed)
+    for e, b in blocks:
+        g = rng.standard_normal((2, fk.size))
+        z = np.fft.irfft(np.sqrt(m * FS * S / 4.0) * (g[0] + 1j * g[1]), m)
+        j0 = int(PAD * FS) + (e * (N + 1) + b) * m
+        y[j0:j0 + m] += np.sqrt(factor - 1.0) * w * z
+    return y
+
+
+@pytest.fixture(scope="module")
+def loud(noise):
+    """conditioned with and without flags: the three plants, and an epoch with 20 loud blocks next to one with 10"""
+    x = noise["H"]
+    for k, (e, b, factor) in enumerate(PLANTS):
+        x = plant(x, [(e, b)], factor, [11, k])
+    many = plant(noise["H"], [(1, b) for b in range(20)] + [(2, b) for b in range(3, 33, 3)], 30.0, 12)
+    hidden = plant(plant(noise["H"], [(1, 5), (1, 15), (1, 25)], 900.0, 13), [(1, 10)], 1.25, 14)
+    kw = dict(T=T, N=N, notches=sim.NOTCHES, pad=PAD, seed=3, method="median")
+    return {"flag": strain.condition(x, noise["L"], FS, GPS0, **kw),
+            "no flag": strain.condition(x, noise["L"], FS, GPS0, flag=False, **kw),
+            "many": strain.condition(many, noise["L"], FS, GPS0, **kw),
+            "hidden": strain.condition(hidden, noise["L"], FS, GPS0, **kw)}
+
+
+def unflagged(eps, I, rows=None):
+    """whitened data before step 5 of the analysable segments (or of `rows`, per epoch), and the kept bins"""
+    keep = ~eps[0]["notched"]
+    out = []
+    for k, e in enumerate(eps):
+        r = e["analysable"] if rows is None else rows[k]
+        out.append(strain.unequalized(e)[I][r] / np.sqrt(np.where(keep, e["sig2_ref_" + I], 1.0)))
+    return np.concatenate(out), keep
+
+
+def test_loud_blocks_are_flagged(loud):
+    """the planted blocks and nothing else, except the two blocks next to the 1e6 one: the whitening filter carries
+    1e-4 of its power into them (80 to 160 times the noise), so they are loud too"""
+    eps, plain = loud["flag"], loud["no flag"]
+    flagged = {(e, int(b)) for e, ep in enumerate(eps) for b in np.flatnonzero(ep["loud_H"])}
+    planted = {(e, b) for e, b, _ in PLANTS}
+    leak = {(2, 19), (2, 21)}
+    print("\nflagged %s; monitors without flags of the blocks next to the 1e6 one: %s" % (
+        sorted(flagged), [round(float(plain[e]["monitor_H"][b].max()), 1) for e, b in sorted(leak)]))
+    assert flagged == planted | leak
+    assert all(plain[e]["monitor_H"][b].max() > 10.0 for e, b in leak)
+    assert not any(ep["loud_L"].any() for ep in eps) and all(ep["usable"] for ep in eps)
+    assert [ep["n_used_H"] for ep in eps] == [32, 32, 30, 33]
+    assert [ep["n_reference_H"] for ep in eps] == [32, 62, 65, 30]
+    assert all(np.array_equal(ep["analysable"], ~ep["loud_H"]) for ep in eps)
+
+
+def test_other_segments_have_unit_power_next_to_loud_blocks(loud):
+    """|e|^2 of the analysable segments, per band, is 1 within the sampling error; without flags the segments that
+    share an epoch with a loud block are low (0.96 for 30, 0.95 for 900 or 1e6 times the power)"""
+    eps, plain = loud["flag"], loud["no flag"]
+    for I in "HL":
+        z, keep = unflagged(eps, I)
+        p = np.abs(z) ** 2
+        table = {k: (p[:, m].mean(), np.sqrt(V / p[:, m].size)) for k, m in band_masks(eps[0]["f"], ~keep).items()}
+        report("analysable segments, %s" % I, table)
+        for band, (m, s) in table.items():
+            assert abs(m - 1.0) < NSIG * s, (I, band, m, s)
+    rows = [np.isin(np.arange(N + 1), [b for pe, b, _ in PLANTS if pe == e] + ([19, 21] if e == 2 else []),
+                    invert=True) for e in range(K)]
+    z, keep = unflagged(plain, "H", rows)
+    per_epoch = [np.mean(np.abs(z[k * 30:(k + 1) * 30][:, keep]) ** 2) for k in range(3)]
+    print("without flags, the other segments of the epochs with a loud block: %s" % np.round(per_epoch, 4))
+    p = np.abs(z[:, keep]) ** 2
+    assert p.mean() < 1.0 - NSIG * np.sqrt(V / p.size)
+
+
+def test_matched_filter_noise_power_next_to_loud_blocks(loud):
+    """E_0|z|^2 / u over the analysable segments after step 5 is 1 within its error (it was 0.96 without flags)"""
+    for name in ("flag", "no flag"):
+        eps = loud[name]
+        out = {}
+        for k, e in enumerate(eps):
+            bank = mass_bank(np.array([20.0, 60.0, 200.0]), e, "cpu")
+            w = np.abs(bank.W.astype(complex)) ** 2 / e["sig2"]
+            neff = w.sum(1) ** 2 / (w ** 2).sum(1)
+            rows = np.flatnonzero(loud["flag"][k]["analysable"])
+            for i in rows:
+                tr = bank.trajectories({I: e["d_" + I][i] for I in "HL"}, {I: e["sig2"] for I in "HL"})
+                for I in "HL":
+                    out.setdefault(I, []).append(np.mean(np.exp(2.0 * tr["lq" + I].astype(float)), axis=1) / bank.u)
+        for I in "HL":
+            r = np.array(out[I])
+            s = np.sqrt(V / neff / r.shape[0])
+            print("\n%s, %s: E|z|^2 / u for M = 20, 60, 200: %s +- %s" % (name, I, np.round(r.mean(0), 4),
+                                                                       np.round(s, 4)))
+            if name == "flag":
+                assert np.all(np.abs(r.mean(0) - 1.0) < NSIG * s)
+            elif I == "H":
+                assert np.all(r.mean(0) < 1.0 - NSIG * s)
+
+
+def test_hand_over_curve_leaves_out_loud_blocks(loud):
+    """sig2_ref of every epoch is the true spectrum of H within the error of a median of its n_reference blocks
+    (variance about pi / (4 ln2^2 n) = 1.6 / n per bin), on bins where the cut leaves it unchanged; with the loud
+    blocks in it, the epochs next to them are high"""
+    f, keep = loud["flag"][0]["f"], ~loud["flag"][0]["notched"]
+    near = np.zeros(f.size, bool)
+    for s in range(-16, 17):
+        near |= np.roll(~keep, s)
+    far = keep & ~near & (f > 22.0)
+    for name in ("flag", "no flag"):
+        ratios = []
+        for e, ep in enumerate(loud[name]):
+            r = (ep["sig2_ref_H"] / (T * PSD[0](f) / 2))[far].mean()
+            s = np.sqrt(1.6 / (ep["n_reference_H"] * far.sum()))
+            ratios.append((r, s))
+        print("\n%s: sig2_ref_H / true spectrum per epoch: %s" % (name, ", ".join("%.4f +- %.4f" % t for t in ratios)))
+        if name == "flag":
+            assert all(abs(r - 1.0) < NSIG * s for r, s in ratios)
+        else:
+            assert ratios[1][0] - 1.0 > NSIG * ratios[1][1] and ratios[3][0] - 1.0 > NSIG * ratios[3][1]
+
+
+def test_epoch_with_too_few_unflagged_blocks_is_unusable(loud):
+    """20 loud blocks of 33: unusable (13 left, fewer than min_blocks + 1); 10 loud blocks: usable, and its 23
+    unflagged blocks, normalized with the correction for 22, have unit power (with the factor for 32 they are 2.7 %
+    low)"""
+    eps = loud["many"]
+    print("\nloud blocks per epoch %s, usable %s" % ([int(e["loud_H"].sum()) for e in eps], [e["usable"] for e in eps]))
+    assert [int(e["loud_H"].sum()) for e in eps] == [0, 20, 10, 0]
+    assert not eps[1]["usable"] and not eps[1]["analysable"].any() and eps[1]["n_used_H"] == 13
+    assert eps[2]["usable"] and eps[2]["n_used_H"] == 23
+    assert np.allclose(eps[2]["correction_H"][~eps[2]["loud_H"]], strain.correction(22, "median"))
+    z, keep = unflagged([eps[2]], "H")
+    p = np.abs(z[:, keep]) ** 2
+    s = np.sqrt(V / p.size)
+    print("epoch with 10 loud blocks, the other 23: power %.4f +- %.4f" % (p.mean(), s))
+    assert abs(p.mean() - 1.0) < NSIG * s
+
+
+def test_iteration_finds_a_block_hidden_by_louder_ones(loud):
+    """three blocks 900 times louder pull the estimate up by about 13 %, which hides a block 1.25 times louder (band
+    excess 0.25, above the thresholds of 160-512 Hz, 0.15 and 0.14) from the first pass; the second pass finds it"""
+    ep = loud["hidden"][1]
+    print("\nflagged %s in %d passes" % (list(np.flatnonzero(ep["loud_H"])), ep["flag_passes_H"]))
+    assert list(np.flatnonzero(ep["loud_H"])) == [5, 10, 15, 25] and ep["flag_passes_H"] >= 2
+    assert not any(e["loud_H"].any() for k, e in enumerate(loud["hidden"]) if k != 1)
+
+
+def test_no_loud_blocks_in_gaussian_noise(run):
+    """no flags in the stationary noise of the runs above (264 blocks each), nor among 16,500 blocks of simulated
+    exponential periodograms on the bins of the analysis (one block in 1e4 would give 1.6 expected flags); and with
+    nothing flagged, the numbers are those of flag=False"""
+    for name in ("mean", "median", "mean eq", "median eq", "mean own"):
+        assert not any(e["loud_H"].any() or e["loud_L"].any() for e in run(name)), name
+    ep = run("median eq")[0]
+    rng = np.random.default_rng(13)
+    n = 0
+    for _ in range(500):
+        P = rng.exponential(size=(N + 1, ep["f"].size))
+        n += int(strain.loud_blocks(P, ep["f"], ~ep["notched"], "median")[0].sum())
+    print("\nfalse flags among %d simulated blocks: %d" % (500 * (N + 1), n))
+    assert n == 0
+    x = {I: sim.noise(I, int(round((2 * (N + 1) * T + 2 * PAD) * FS)), [7, k]) for k, I in enumerate("HL")}
+    kw = dict(T=T, N=N, notches=sim.NOTCHES, pad=PAD, seed=3, method="median")
+    a = strain.condition(x["H"], x["L"], FS, GPS0, **kw)
+    b = strain.condition(x["H"], x["L"], FS, GPS0, flag=False, **kw)
+    for ea, eb in zip(a, b):
+        for key in ("d_H", "d_L", "sig2", "sig2_ref_H", "sig2_ref_L", "monitor_H", "monitor_L"):
+            assert np.array_equal(ea[key], eb[key]), key
+
+
+def test_unequalized_regenerates_the_data_before_step_5(run):
+    """strain.unequalized of an equalized run gives the data of the same run without step 5 (same seed)"""
+    eq, plain = run("median eq"), run("median")
+    keep = ~eq[0]["notched"]
+    for a, b in zip(eq, plain):
+        pre = strain.unequalized(a)
+        for I in "HL":
+            err = np.abs(pre[I][:, keep] - b["d_" + I][:, keep].astype(complex)) / np.sqrt(a["sig2_ref_" + I][keep])
+            assert err.max() < 1e-5, (I, err.max())
