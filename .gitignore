@@ -63,6 +63,7 @@ data/year/
 !scripts/validate/*.py
 !scripts/real_data/
 !scripts/real_data/*.py
+!scripts/real_data/notches_O3b.txt
 !tests/
 !tests/conftest.py
 !tests/test_tables.py

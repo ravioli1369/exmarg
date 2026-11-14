@@ -1,0 +1,72 @@
+# notches for exmarg.strain.condition, H1 and L1 (one list for both): lo hi (Hz)
+# written by: python scripts/real_data/diagnose.py lines ... --ratio 100 (2026-11-14)
+# data: GWOSC files O3b/{H1,L1}, GPS 1266933760 to 1267544064;
+#   8 chunks of 3600 s of coincident good time (GWOSC DATA, CBC_CAT1-3, no hardware injection) from GPS
+#   1266972149 1267046911 1267122985 1267200305 1267276988 1267354670 1267431417 1267508461
+# spectrum: median of the 64 s Hann periodograms of each chunk; r = ratio to a running median of the log
+#   spectrum over 4 Hz; R = median of r over the chunks, Rmax = largest r
+# feature: bins in 16-522 Hz with R > 3, or r > 3 in at least 2 chunks
+# notched: features with Rmax >= 100 (the line exceeds the noise of its 8 s bin by about 19 times or more
+#   at its worst); a notch covers the bins with Rmax >= 2 around the feature, widened on each side by
+#   max(0.25 Hz taper + 1/T = 0.375 Hz, the offset beyond which the line leaks less than 0.01 of the
+#   floor through the 280 s epoch window of strain.whiten); notches closer than 1 Hz are merged
+# cost: 167 of the bins of 20-512 Hz at 1/8 Hz (4.24 %); template power u lost, total mass 20/60/200:
+#   H1           0.38 / 0.33 / 0.06 %
+#   L1           0.57 / 0.55 / 0.26 %
+#   common       0.32 / 0.29 / 0.06 %
+#   common_floor 0.46 / 0.40 / 0.08 %
+#   with Rmax >= 10 instead: 16 notches, 278 bins (7.06 %), u lost (common curve) 8.25 / 7.18 / 10.83 %
+#   with Rmax >= 30 instead: 11 notches, 201 bins (5.11 %), u lost (common curve) 2.88 / 2.48 / 4.30 %
+# note: Rmax >= 100 notches the lines that dominate their bin (over ~20 times the noise of an 8 s bin) and the
+#   violin modes (Rmax up to 3e7, strongly non-stationary). The weaker lines listed below are stationary over the
+#   week (R close to Rmax) and are left to the per-bin spectrum estimate. On a pilot of 4851 segments (GPS
+#   1267160820 to 1267200000), notching them too (Rmax >= 10) removed their own bins from the per-bin power test
+#   (H1 bins beyond 4 sigma in quiet segments: 22 -> 4; those bins have power 0.73-0.93, the bias of a median
+#   estimate on a nearly deterministic line) and left the matched-filter statistics unchanged (quiet segments:
+#   mean w 0.991 either way, P(w > 12.5) within errors), for 7 to 11 % more lost template power.
+# features left in (R = week median ratio, Rmax = largest; T2100200 identification):
+#   H1   18.359-  18.391 Hz  R   50.1  Rmax    55.0  8/8 chunks  ASC dither line; Unknown comb
+#   H1   26.047-  26.062 Hz  R    4.8  Rmax     8.7  7/8 chunks  Beam splitter roll mode; Unknown comb
+#   H1   27.484-  27.516 Hz  R    8.3  Rmax    11.1  8/8 chunks  SR2 bounce mode; Triple suspension bounce mode possib
+#   H1   27.703-  27.719 Hz  R    3.1  Rmax     4.7  5/8 chunks  SR3 bounce mode; Unknown comb
+#   H1   28.203-  28.328 Hz  R   17.6  Rmax    33.7  8/8 chunks  PR3 bounce mode; Unknown comb
+#   H1   29.812-  29.891 Hz  R    9.3  Rmax    11.8  8/8 chunks  Unknown comb
+#   H1   31.406-  31.422 Hz  R    3.5  Rmax     4.8  7/8 chunks  Unknown comb
+#   H1   31.984-  32.016 Hz  R   13.9  Rmax    22.2  8/8 chunks  Unknown comb
+#   H1   32.266-  32.375 Hz  R   20.5  Rmax    23.2  8/8 chunks  Unknown comb
+#   H1   35.688-  35.766 Hz  R   24.5  Rmax    49.4  8/8 chunks  Environmental disturbance also seen in O1/O2; Unknown
+#   H1   36.641-  36.656 Hz  R    4.5  Rmax     5.9  8/8 chunks  Calibration line; Unknown comb
+#   H1   40.406-  40.469 Hz  R   11.9  Rmax    13.5  8/8 chunks  Unknown comb
+#   H1   40.922-  40.938 Hz  R    6.2  Rmax     8.4  8/8 chunks  PR2 roll mode; SR2/MC2 roll mode; SRM roll mode; Unkn
+#   H1   42.844-  42.875 Hz  R   12.9  Rmax    16.6  8/8 chunks  Unknown comb
+#   H1   44.484-  44.500 Hz  R    9.0  Rmax    10.4  8/8 chunks  Unknown comb
+#   H1   47.984-  48.016 Hz  R   11.7  Rmax    14.0  8/8 chunks  Unknown comb
+#   H1   52.578-  52.594 Hz  R    6.3  Rmax     6.8  8/8 chunks  Calibration line non-linearity; Unknown comb
+#   H1   56.625-  56.641 Hz  R    5.3  Rmax     6.3  8/8 chunks  Unknown comb
+#   H1   59.500-  59.516 Hz  R    7.9  Rmax    10.6  8/8 chunks  Unknown comb
+#   H1   59.672-  60.312 Hz  R    9.9  Rmax    24.8  8/8 chunks  Power mains; Unknown comb
+#   H1   63.984-  64.016 Hz  R   34.1  Rmax    38.0  8/8 chunks  Unknown comb
+#   H1   64.266-  64.297 Hz  R    6.4  Rmax     9.2  8/8 chunks  Unknown comb
+#   H1   64.719-  64.719 Hz  R    3.9  Rmax     5.3  8/8 chunks  Unknown comb
+#   H1   68.766-  68.766 Hz  R    3.2  Rmax     4.1  6/8 chunks  Unknown comb
+#   H1   75.016-  75.047 Hz  R   86.6  Rmax    89.6  8/8 chunks  Unknown comb
+#   H1   80.000-  80.000 Hz  R    5.8  Rmax     6.6  8/8 chunks  Unknown comb
+#   H1   83.312-  83.312 Hz  R    2.4  Rmax     6.4  2/8 chunks  Unknown comb
+#   H1   96.000-  96.000 Hz  R    4.1  Rmax     6.0  8/8 chunks  Unknown comb
+#   H1   99.969-  99.984 Hz  R   18.8  Rmax    21.3  8/8 chunks  Unknown comb
+#   H1  150.047- 150.062 Hz  R    6.5  Rmax     7.5  8/8 chunks  Unknown comb
+#   H1  279.422- 279.422 Hz  R    1.2  Rmax     3.4  2/8 chunks  not in T2100200
+#   H1  333.312- 333.328 Hz  R    5.2  Rmax     9.6  7/8 chunks  Unknown comb
+#   L1   16.594-  16.594 Hz  R    2.7  Rmax     3.8  2/8 chunks  not in T2100200
+#   L1   40.859-  40.906 Hz  R   58.7  Rmax    84.1  8/8 chunks  PR2/SR3 roll mode; SRM roll mode
+#   L1   44.531-  44.547 Hz  R    8.0  Rmax    15.1  8/8 chunks  Unknown comb
+#   L1   45.234-  45.250 Hz  R    1.6  Rmax     9.8  3/8 chunks  not in T2100200
+#   L1   59.969-  60.031 Hz  R   11.7  Rmax    28.5  8/8 chunks  Power mains; Unknown comb
+# lo hi  # strongest feature covered (detector, peak Hz, R, Rmax, chunks above --detect) | T2100200 identification
+17.3750 18.2500  # H1 17.797 (R 125, Rmax 155, 8/8) | Beam splitter bounce mode; Unknown comb
+19.3750 22.8125  # H1 21.906 (R 1283, Rmax 1.82e+03, 8/8) + 2 more | ASC dither line; Unknown comb
+299.0000 300.3125  # H1 299.703 (R 709, Rmax 1.42e+03, 8/8) | Beam splitter violin mode region; Unknown comb
+301.7500 303.8125  # H1 303.297 (R 770, Rmax 1.2e+03, 8/8) + 1 more | Beam splitter violin violin mode 1st harmonic
+305.6250 307.9375  # L1 306.219 (R 803, Rmax 1.43e+03, 8/8) + 1 more | Beam splitter violin mode 1st harmonic region
+314.4375 315.6250  # L1 315.047 (R 537, Rmax 797, 8/8) | Beam splitter violin mode 1st harmonic region
+500.6875 517.1875  # H1 510.719 (R 1440776, Rmax 2.75e+07, 8/8) + 21 more | Violin mode 1st harmonic; not in T2100200
