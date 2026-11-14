@@ -27,6 +27,7 @@ data/year/
 !src/exmarg/profiles.py
 !src/exmarg/tables.py
 !src/exmarg/glitches.py
+!src/exmarg/strain.py
 !src/exmarg/search/
 !src/exmarg/search/*.py
 !src/exmarg/data/
