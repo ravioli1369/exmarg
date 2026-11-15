@@ -4,6 +4,7 @@
                                          [--published O3H1lines.csv O3L1lines.csv] [--save spectra.npz] [--workers 16]
     python scripts/real_data/diagnose.py lines --load spectra.npz <notches.txt> [the same options]
     python scripts/real_data/diagnose.py segments <segments_dir> [--subset 4000] [--seed 1] [--workers 16]
+                                         [--slide 1.75 | --recorded]
 
 lines.  From --chunks chunks of --seconds of coincident good time spread evenly over the GWOSC folder
 (condition.timeline), the median of the Hann periodograms of --block s (high-passed at 12 Hz first) of each chunk and
@@ -33,6 +34,9 @@ every mean over all segments):
     templates of total mass 20, 60, 200: w = |z|^2 / u at every time (mean, survival against exp(-w)), the fraction
     of segments whose largest w exceeds 12.5, 18, 32, 50 (single-detector SNR sqrt(2 w) = 5, 6, 8, 10) and how many
     of those fail BURST_CAT2, and how often the loudest times of H1 and L1 fall within 15 ms of each other.
+  - the two statistics of the recorded pair, the correlation of H1 with L1 and that coincidence, are computed with L1
+    shifted against H1 by --slide seconds (circular in the segment, as controls.time_slide; at least 0.5 s from a
+    multiple of T), which no real coincidence survives; only --recorded computes them on the recorded pair.
 The data are analysed before step 5: the noise of equalize is regenerated from the seed and GPS time of each epoch
 and subtracted (checked against the stored monitors), so that each detector is seen on its own curve; the matched
 filter is also run on the equalized data.  Every number has a reference from stationary Gaussian noise passed
@@ -67,6 +71,8 @@ MASSES = (20.0, 60.0, 200.0)
 W_THRESHOLDS = (8.0, 12.5, 18.0, 32.0, 50.0)
 BANDS = ((20.0, 22.0), (22.0, 40.0), (40.0, 80.0), (80.0, 160.0), (160.0, 320.0), (320.0, 512.0))
 COINCIDENCE = 0.015
+DEFAULT_SLIDE = 1.75              # s, L against H in the two statistics of the pair (without --recorded)
+MIN_SLIDE = 0.5
 TD_WINDOW = 0.25                  # s, windows of the time-domain power of a segment
 _G = {}
 
@@ -334,7 +340,9 @@ def _sums(e, masks):
             out[name, 's1', I], out[name, 's2', I] = p.sum(axis=0), (p * p).sum(axis=0)
             out[name, 'nb', I], out[name, 'n', I] = (x[:, :-1] * np.conj(x[:, 1:])).sum(axis=0), int(m[I].sum())
         both = m['H'] & m['L']
-        out[name, 'hl', 'HL'] = (e['H'][both] * np.conj(e['L'][both])).sum(axis=0)
+        # L slid against H as controls.time_slide does (circular in the segment): the bins times exp(-2 pi i f shift)
+        eL = e['L'][both] * np.exp(-2j * np.pi * _G['f'] * _G.get('shift', 0.0))[None, :]
+        out[name, 'hl', 'HL'] = (e['H'][both] * np.conj(eL)).sum(axis=0)
         out[name, 'n', 'HL'] = int(both.sum())
     return out
 
@@ -379,6 +387,31 @@ def _epoch_stats(path):
         out['u', name] = (a2[:, keep] / s[keep]).sum(axis=1)
     out.update(gps=ep['gps'], event=ep['event'], gps_epoch=ep['gps_epoch'])
     return out
+
+
+def slide_samples(shift, T, n_time):
+    """the matched-filter samples (n_time per segment of T s) of a circular slide of L by `shift` seconds"""
+    return int(round(shift / T * n_time))
+
+
+def coincident(jH, jL, n_time, T, shift=0.0, window=COINCIDENCE):
+    """(n,) bool: the loudest times of H and L (sample indices of the n_time of a segment of T s) within `window`
+    seconds of each other, circularly, with L slid by `shift` seconds (its times later by shift, as in
+    controls.time_slide); shift 0: the recorded pair"""
+    dj = (np.asarray(jH) - np.asarray(jL) - slide_samples(shift, T, n_time) + n_time // 2) % n_time - n_time // 2
+    return np.abs(dj) * T / n_time <= window
+
+
+def pair_shift(a, T=None):
+    """the slide of L against H (s) of the two statistics of the pair: 0 with --recorded, else --slide; with T (the
+    segment length) a slide closer than MIN_SLIDE to a multiple of T, which could keep a real coincidence, is a
+    SystemExit"""
+    if a.recorded:
+        return 0.0
+    if T is not None and abs((float(a.slide) + T / 2) % T - T / 2) < MIN_SLIDE:
+        raise SystemExit('--slide %g s: the shift, modulo the segment length %g s, must be at least %g s from 0, or a '
+                         'real coincidence of H1 and L1 survives it' % (a.slide, T, MIN_SLIDE))
+    return float(a.slide)
 
 
 def _simulated_epoch(seed):
@@ -565,6 +598,11 @@ def _split(mon, member, epoch_of, loud_epoch):
             int(b.sum()))
 
 
+def pair_text(shift):
+    return ('recorded pair, L1 not shifted (--recorded)' if shift == 0.0 else
+            'L1 shifted against H1 by %+g s, circular in the segment, as in controls.time_slide' % shift)
+
+
 def run_segments(a):
     t0 = time.time()
     seg_dir = a.inputs[0]
@@ -581,9 +619,10 @@ def run_segments(a):
         z = np.load(a.select)
         select = np.round(z['gps_all'][z['analysable_all']])
     cfg = dict(a2=a2, n_freq=f.size, N=N, method=method, keep=keep, f=f, edges=ep0['monitor_edges'], T=T,
-               burst_bit=burst_bit, select=select)
+               burst_bit=burst_bit, select=select, shift=pair_shift(a, T))
     V = strain.whitened_variance(N, method)
     P = print
+    shift = pair_shift(a, T)
 
     # Gaussian reference through the same estimator; it sets the quiet thresholds of the monitors
     n_sim = max(int(np.ceil(a.simulate / (N + 1))), 1)
@@ -746,11 +785,12 @@ def run_segments(a):
         out.update({'monitor_' + I: mon, 'quiet_' + I: quiet[I], 'dq_' + I: per['dq'][I], 'td_' + I: td,
                     'loud_' + I: per['loud'][I], 'monitor_summary_sim_' + I: ms_sim})
     out['analysable'] = sets_seg['analysable']
+    out['pair_shift'] = shift
     for s in sets:
         n = S[s, 'n', 'HL']
         if n:
-            P('correlation of H1 with L1 (%s): |<e_H e*_L>| = %.5f (standard error %.5f)'
-              % (s, np.abs(S[s, 'hl', 'HL'][keep].sum()) / np.sum(np.sqrt(S[s, 's1', 'H'][keep] *
+            P('correlation of H1 with L1 (%s; %s): |<e_H e*_L>| = %.5f (standard error %.5f)'
+              % (s, pair_text(shift), np.abs(S[s, 'hl', 'HL'][keep].sum()) / np.sum(np.sqrt(S[s, 's1', 'H'][keep] *
                                                                            S[s, 's1', 'L'][keep])),
                  1.0 / np.sqrt(n * keep.sum())))
 
@@ -809,11 +849,11 @@ def run_segments(a):
                 txt.append('w > %g (SNR %.0f): %.4f +- %.4f [%.4f], %.0f %% BURST_CAT2' % (
                     t, np.sqrt(2 * t), p, np.sqrt(p * (1 - p) / max(wm.size, 1)), np.mean(ws > t), 100 * fail))
             P('   %s (%d): %s' % (name, wm.size, ';  '.join(txt)))
-    P('coincidence of the loudest times of H1 and L1 within %g ms (chance %.4f for independent times), and segments '
-      'loud in both (w > 12.5) against independence (all subset segments):' % (1e3 * COINCIDENCE, 2 * COINCIDENCE / T))
+    P('coincidence of the loudest times of H1 and L1 within %g ms (chance %.4f for independent times; %s), and '
+      'segments loud in both (w > 12.5) against independence (all subset segments):'
+      % (1e3 * COINCIDENCE, 2 * COINCIDENCE / T, pair_text(shift)))
     for i, M in enumerate(MASSES):
-        dj = (o['H']['jmax'][:, i] - o['L']['jmax'][:, i] + n_time // 2) % n_time - n_time // 2
-        co = np.abs(dj) * T / n_time <= COINCIDENCE
+        co = coincident(o['H']['jmax'][:, i], o['L']['jmax'][:, i], n_time, T, shift)
         txt = []
         for t in (0.0, 8.0, 12.5, 32.0):
             both = (o['H']['wmax'][:, i] > t) & (o['L']['wmax'][:, i] > t)
@@ -837,7 +877,7 @@ def run_segments(a):
     return 0
 
 
-def main(argv=None):
+def parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('mode', choices=('lines', 'segments'))
     p.add_argument('inputs', nargs='+', help='lines: <gwosc_dir> <notches.txt> (or --load and <notches.txt>); '
@@ -877,6 +917,18 @@ def main(argv=None):
     s.add_argument('--subset-simulated', type=int, default=4000, help='Gaussian segments for the matched filter')
     s.add_argument('--quiet', type=float, default=6.0, help='a segment is quiet when every band monitor is below 1 + '
                                                               'this many Gaussian standard deviations')
+    s.add_argument('--slide', type=float, default=DEFAULT_SLIDE, help='the cross-correlation and the coincidence of '
+                   'the loudest times of H1 and L1 are computed with L1 shifted against H1 by this many seconds '
+                   '(circular in the segment; at least %g s from a multiple of T, so that a real coincidence does not '
+                   'survive; default %%(default)g)' % MIN_SLIDE)
+    s.add_argument('--recorded', action='store_true', help='compute those two statistics on the recorded pair, '
+                   'without the shift: this opens the recorded data (a real coincidence of H1 and L1 shows up in '
+                   'them)')
+    return p
+
+
+def main(argv=None):
+    p = parser()
     a = p.parse_args(argv)
     if a.mode == 'lines':
         if len(a.inputs) != (1 if a.load else 2):
