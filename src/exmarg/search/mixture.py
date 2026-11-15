@@ -27,6 +27,10 @@ overflow.
     time_curve   ln of the evidence ratio against no mergers on the first n segments, for every n
 """
 
+import math
+import os
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 from scipy.optimize import minimize
 from scipy.special import exprel, log_ndtr, logsumexp
@@ -429,3 +433,267 @@ def fit_noise(E, pi_m=None, log=False, n_iter=500, tol=1e-9, floor=1e-10):
     var_pi = np.einsum('kj,jl,kl->k', J, cov, J)
     return dict(eps=eps, pi_k=pi, omega=w, err_eps=float(np.sqrt(max(cov.sum(), 0.0))),
                 err_pi=np.sqrt(np.maximum(var_pi, 0.0)), cov=cov, lnl=lnl(w), n_iter=it, converged=converged)
+
+
+class _Windows:
+    """sum_i ln c_i of Sec. 4a on fixed window evidences and its derivatives, in x = (f, Om[0], .., Om[K-1]) with
+    Om[s] = (1 - q_s, q_s a^s): the factor of a window in state s is D = Om[s] . (1, F), F_b = basis[b] . E_w, kept
+    as Om[s] . Y, Y = (1, F) e^-h, h = max(0, ln F) of the row.  Segments in chunks, on threads"""
+
+    def __init__(self, ln_E, basis, identity, chunk):
+        self.n, self.nw, nk = ln_E.shape
+        self.nb = basis.shape[0]
+        if identity:
+            lnF = ln_E.reshape(-1, nk)
+        else:
+            lb = _log(basis)
+            lnF = np.concatenate([logsumexp(ln_E[a:a + 256, :, None, :] + lb, axis=-1).reshape(-1, self.nb)
+                                  for a in range(0, self.n, 256)])
+        self.lnF = lnF
+        self.h = np.maximum(lnF.max(axis=1), 0.0)
+        self.Y = np.empty((lnF.shape[0], self.nb + 1))
+        self.Y[:, 0] = np.exp(-self.h)
+        self.Y[:, 1:] = np.exp(lnF - self.h[:, None])
+        self.hsum = self.h.reshape(self.n, self.nw).sum(axis=1)
+        self.parts = [(a, min(a + chunk, self.n)) for a in range(0, self.n, chunk)]
+
+    def _part(self, ab, f, Om, hess, tiny=1e-150):
+        a, b = ab
+        nw, K, P = self.nw, f.size, self.nb + 1
+        rows = slice(a * nw, b * nw)
+        Y = self.Y[rows]
+        with np.errstate(all='ignore'):
+            D = Y @ Om.T                                                    # (rows, K)
+            lnD = np.log(D)
+        i, k = np.nonzero(D < tiny)
+        if i.size:                                                          # a law without weight where E is large:
+            lnY = np.concatenate([-self.h[rows][i, None], self.lnF[rows][i] - self.h[rows][i, None]], axis=1)
+            lnD[i, k] = logsumexp(lnY + _log(Om[k]), axis=1)                # these rows in the log domain
+            rho = np.exp(np.minimum(lnY - lnD[i, k][:, None], 345.0))      # Y / D
+            D[i, k] = np.inf
+        lnC = lnD.reshape(b - a, nw, K).sum(axis=1) + self.hsum[a:b, None]
+        ln_c = logsumexp(lnC + _log(f), axis=1)
+        Q = np.exp(np.minimum(lnC - ln_c[:, None], 345.0))                  # C_s / c = d ln c_i / d f_s
+        r = Q * f
+        rw = np.repeat(r, nw, axis=0)
+        with np.errstate(all='ignore'):
+            G = Y.T @ (rw / D)                                              # sum r_s Y / D_s, (P, K)
+        if i.size:
+            np.add.at(G.T, k, rw[i, k][:, None] * rho)
+        out = dict(lnl=math.fsum(ln_c), Q=Q.sum(axis=0), R=r.sum(axis=0), G=G)
+        if hess:
+            Gi, M = np.empty((b - a, P, K)), np.empty((K, P, P))           # sum_w Y / D_s; sum r_s Y Y^T / D_s^2
+            for t in range(K):
+                Z = Y / D[:, t:t + 1]
+                if i.size:
+                    Z[i[k == t]] = rho[k == t]
+                Gi[:, :, t] = Z.reshape(b - a, nw, P).sum(axis=1)
+                W = Z * np.sqrt(rw[:, t:t + 1])
+                with np.errstate(all='ignore'):
+                    M[t] = W.T @ W
+            with np.errstate(all='ignore'):
+                out.update(M=M, QQ=Q.T @ Q, QG=np.einsum('is,ips->sp', Q, Gi),
+                           QrG=np.einsum('is,it,ipt->stp', Q, r, Gi), GG=np.einsum('is,ips,iqs->spq', r, Gi, Gi),
+                           rrGG=np.einsum('is,it,ips,iqt->sptq', r, r, Gi, Gi))
+        return out
+
+    def __call__(self, x, K, hess=False):
+        f, Om = x[:K], x[K:].reshape(K, self.nb + 1)
+        with ThreadPoolExecutor(max_workers=os.cpu_count()) as ex:
+            parts = list(ex.map(lambda ab: self._part(ab, f, Om, hess), self.parts))
+        out = {key: sum(p[key] for p in parts) for key in parts[0] if key != 'lnl'}
+        out['lnl'] = math.fsum(p['lnl'] for p in parts)
+        return out
+
+    def gradient(self, ev):
+        """d ln L / dx, and mu (n for f, n_w R_s for Om[s]): EM is x -> x g / mu"""
+        K = ev['R'].size
+        mu = np.concatenate([np.full(K, float(self.n)), np.repeat(self.nw * ev['R'], self.nb + 1)])
+        return np.concatenate([ev['Q'], ev['G'].T.ravel()]), mu
+
+    def hessian(self, ev):
+        """d^2 ln L / dx dx: with Q_s = C_s / c, r_s = f_s Q_s and G_s = sum_w Y / D_s per segment, sum_i of
+        -Q_s Q_t (f f), Q_s (delta_st - r_t) G_t (f Om), and delta_st r_s (G_s G_s^T - sum_w Y Y^T / D_s^2)
+        - r_s r_t G_s G_t^T (Om Om)"""
+        K, P = ev['R'].size, self.nb + 1
+        H = np.zeros((K + K * P, K + K * P))
+        H[:K, :K] = -ev['QQ']
+        for s in range(K):
+            for t in range(K):
+                v = (ev['QG'][s] if s == t else 0.0) - ev['QrG'][s, t]
+                H[s, K + t * P:K + (t + 1) * P] = H[K + t * P:K + (t + 1) * P, s] = v
+                blk = -ev['rrGG'][s, :, t, :] + ((ev['GG'][s] - ev['M'][s]) if s == t else 0.0)
+                H[K + s * P:K + (s + 1) * P, K + t * P:K + (t + 1) * P] = blk
+        return H
+
+
+def _tangent(free, blocks):
+    """(n, m): a basis of the steps that keep every block summing to 1 and move only the free entries"""
+    Z = []
+    for bl in blocks:
+        fb = bl[free[bl]]
+        for j in fb[1:]:
+            z = np.zeros(free.size)
+            z[j], z[fb[0]] = 1.0, -1.0
+            Z.append(z)
+    return np.array(Z).T if Z else np.zeros((free.size, 0))
+
+
+def fit_windows(ln_E, n_state=2, basis=None, start=None, tol=1e-9, max_iter=500, chunk=1024):
+    """the glitch model of one detector, Sec. 4a, from its window evidences (no mergers): the maximum of
+
+        sum_i ln c_i,   c_i = sum_s f_s prod_w (1 - q_s + q_s pi^s . E_iw),   pi^s = a^s @ basis
+
+    over f and every a^s on the simplex and q in [0, 1].
+
+    ln_E     (n_segment, n_w, n_k) ln E_w[k] (single.window_evidence)
+    n_state  K
+    basis    (n_basis, n_k) rows that are normalized laws over the columns (None: the identity, a free weight per
+             column)
+    start    dict f (K,), q (K,), a (K, n_basis) (default f uniform, q from 1e-3 to 0.1, a uniform)
+    tol      the gain of the Newton step below which it has converged, nats
+    max_iter the number of updates
+    chunk    segments per task of the threads
+
+    In x = (f, Om[0], .., Om[K-1]), Om[s] = (1 - q_s, q_s a^s), every block on a simplex, c_i is linear in each
+    Om[s].  EM over the state of the segment, glitch or not in each window and the basis component of the glitch
+    is x -> x g / mu (g = d ln L / dx, mu = n for f and n_w sum_i r_is for Om[s]), accelerated by SQUAREM
+    (Varadhan & Roland 2008, the extrapolation kept only when it raises ln L), until a cycle gains less than 0.01;
+    then Newton steps with the exact Hessian on the entries above zero and those at zero with g > mu, each block
+    kept on its simplex (the eigenvalues of minus the Hessian taken in absolute value, so the step rises where ln L
+    is not concave), a step kept only when it raises ln L (an EM cycle otherwise), so ln L never decreases.
+    Converged when the gain the Newton step predicts, g . dx / 2, is below tol (nats; the distance to the maximum
+    is then about sqrt(2 tol) standard errors), the entries of empty states (f_s = 0) aside.
+
+    returns dict: f (K,), q (K,), pi (K, n_k), a (K, n_basis), lnl, n_iter (updates), converged, trace (ln L after
+    every update), cov (covariance of x from the Hessian on the entries above zero, the same order), err_f, err_q,
+    err_a; states ordered by increasing q"""
+    lnE = np.asarray(ln_E, float)
+    nk = lnE.shape[-1]
+    B = np.eye(nk) if basis is None else np.asarray(basis, float)
+    if B.ndim != 2 or B.shape[1] != nk or np.any(B < 0) or np.any(np.abs(B.sum(axis=1) - 1.0) > 1e-12):
+        raise ValueError('the rows of basis must be normalized laws over the %d columns' % nk)
+    model = _Windows(lnE, B, basis is None, chunk)
+    K, nb = n_state, B.shape[0]
+    P = nb + 1
+    st = dict(f=np.full(K, 1.0 / K), q=np.geomspace(1e-3, 0.1, K) if K > 1 else np.array([0.01]),
+              a=np.full((K, nb), 1.0 / nb))
+    st.update(start or {})
+    q0 = np.asarray(st['q'], float)
+    x = np.concatenate([np.asarray(st['f'], float), np.concatenate([(1.0 - q0)[:, None],
+                                                                    q0[:, None] * np.asarray(st['a'], float)], 1).ravel()])
+    blocks = [np.arange(K)] + [K + s * P + np.arange(P) for s in range(K)]
+
+    def norm(x):
+        x = np.maximum(x, 0.0)
+        for bl in blocks:
+            x[bl] /= x[bl].sum()
+        return x
+
+    def em(x, ev):
+        g, mu = model.gradient(ev)
+        with np.errstate(all='ignore'):
+            y = np.where((x > 0) & (mu > 0), x * g / mu, x)
+        return norm(y)
+
+    ev = model(x, K)
+    trace, n_iter = [ev['lnl']], 0
+
+    def accept(xn, evn):
+        nonlocal x, ev, n_iter
+        x, ev, n_iter = xn, evn, n_iter + 1
+        trace.append(evn['lnl'])
+
+    def squarem():
+        """one SQUAREM cycle; False when the EM step does not raise ln L"""
+        x1 = em(x, ev)
+        ev1 = model(x1, K)
+        if not ev1['lnl'] > ev['lnl']:
+            return False
+        x2 = em(x1, ev1)
+        r, v = x1 - x, x2 - 2.0 * x1 + x
+        nv = np.linalg.norm(v)
+        al = min(-np.linalg.norm(r) / nv, -1.0) if nv > 0 else -1.0
+        while al < -1.0:
+            xe = x - 2.0 * al * r + al * al * v
+            if np.all(xe >= 0):
+                xe = norm(xe)
+                eve = model(xe, K)
+                accept(x1, ev1)
+                if eve['lnl'] >= ev1['lnl']:
+                    accept(xe, eve)
+                return True
+            al = (al - 1.0) / 2.0 if al < -1.01 else -1.0
+        accept(x1, ev1)
+        return True
+
+    while n_iter < max_iter:
+        l0 = ev['lnl']
+        if not squarem() or ev['lnl'] - l0 < 1e-2:
+            break
+    converged = False
+    ev = model(x, K, hess=True)
+    while n_iter < max_iter:
+        g, mu = model.gradient(ev)
+        H = model.hessian(ev)
+        free = np.concatenate([np.ones(K, bool), np.repeat(x[:K] > 0, P)]) & ((x > 0) | (g > mu))
+        while True:                                                        # Newton on the free entries
+            Z = _tangent(free, blocks)
+            d = np.zeros(x.size)
+            if Z.shape[1] == 0:
+                break
+            with np.errstate(all='ignore'):
+                w, V = np.linalg.eigh(-(Z.T @ H @ Z))
+                w = np.maximum(np.abs(w), 1e-12 * np.abs(w).max())         # an ascent also where not concave
+                d = Z @ (V @ ((V.T @ (Z.T @ g)) / w))
+            out = (x <= 0) & (d < 0) & free
+            if not out.any():
+                break
+            free &= ~out
+        dec = 0.5 * float(g @ d)                                           # the gain the step predicts
+        if not np.isfinite(dec):
+            break
+        if dec < tol:
+            converged = True
+            break
+        neg = (d < 0) & (x > 0)
+        reach = np.where(neg, -x / np.where(neg, d, -1.0), np.inf)
+        hit = np.argmin(reach)
+        t, moved = min(1.0, reach[hit]), False
+        for _ in range(30):
+            xn = x + t * d
+            if t == reach[hit]:
+                xn[hit] = 0.0
+            xn = norm(xn)
+            evn = model(xn, K, hess=True)
+            if evn['lnl'] > ev['lnl']:
+                accept(xn, evn)
+                moved = True
+                break
+            t *= 0.5
+        if not moved:
+            if not squarem():
+                break
+            ev = model(x, K, hess=True)
+    H = model.hessian(ev)
+    Z = _tangent(np.concatenate([np.ones(K, bool), np.repeat(x[:K] > 0, P)]) & (x > 0), blocks)
+    cov = np.zeros((x.size, x.size))
+    if Z.shape[1]:
+        with np.errstate(all='ignore'):
+            cov = Z @ np.linalg.pinv(-(Z.T @ H @ Z), hermitian=True) @ Z.T
+    f, Om = x[:K], x[K:].reshape(K, P)
+    o = np.argsort(1.0 - Om[:, 0], kind='stable')
+    idx = np.concatenate([o, K + (o[:, None] * P + np.arange(P)).ravel()])
+    f, Om, cov = f[o], Om[o], cov[np.ix_(idx, idx)]
+    q = 1.0 - Om[:, 0]
+    qd = np.where(q > 0, q, 1.0)[:, None]
+    a = np.where(q[:, None] > 0, Om[:, 1:] / qd, 1.0 / nb)
+    var_a = np.empty((K, nb))
+    for s in range(K):                                                     # a = Om[1:] / (1 - Om[0])
+        J = np.concatenate([Om[s, 1:, None] / qd[s] ** 2, np.eye(nb) / qd[s]], axis=1)
+        c = cov[K + s * P:K + (s + 1) * P, K + s * P:K + (s + 1) * P]
+        var_a[s] = np.einsum('kj,jl,kl->k', J, c, J)
+    sd = lambda v: np.sqrt(np.maximum(v, 0.0))
+    return dict(f=f, q=q, pi=a @ B, a=a, lnl=float(ev['lnl']), n_iter=n_iter, converged=converged,
+                trace=np.array(trace), cov=cov, err_f=sd(np.diag(cov)[:K]), err_q=sd(np.diag(cov)[K::P]),
+                err_a=sd(var_a))

@@ -561,3 +561,93 @@ def amplitude_weights(edges=RHO_EDGES, gamma=4.0, rho_min=4.0):
     w = np.log(b / a) if gamma == 1.0 else (a ** (1.0 - gamma) - b ** (1.0 - gamma)) / (gamma - 1.0)
     w = np.where(ok, w, 0.0)
     return w / w.sum()
+
+
+def _ln_sum_exp(x, axis, xp):
+    """ln sum exp x over axis, -inf where every term is -inf"""
+    m = x.max(axis=axis, keepdims=True)
+    m = xp.where(m > -np.inf, m, 0.0)
+    with np.errstate(divide="ignore"):
+        return xp.squeeze(m, axis=axis) + xp.log(xp.exp(x - m).sum(axis=axis))
+
+
+def window_evidence(lq, ln_u, lnT, n_window, pi_m=None, xp=np, block=256):
+    """ln E_w[k] = ln (1/n_win) sum_{t in w} sum_m pi_m[m] T_k(w_m(t)), the evidence of each window of the segment
+    (docs/glitch_likelihood.md, Sec. 4a), the windows the n_window consecutive blocks of n_win = n_time / n_window
+    arrival times.
+
+    lq, ln_u   as for histogram
+    lnT        (NV, n_col) as for ln_evidence, e.g. glitch_columns()
+    n_window   a divisor of n_time
+    pi_m       (n_template,) weights of the templates, uniform by default
+
+    ln_evidence of the rows (template, window) of n_win times each, block templates at a time, then the mixture over
+    the templates in the log domain: the mean over the windows of E_w is sum_m pi_m E[m] of the whole segment.
+    returns (n_window, n_col), float64 on the device."""
+    nm, nt = lq.shape
+    if n_window < 1 or nt % n_window:
+        raise ValueError("n_time = %d is not a multiple of n_window = %d" % (nt, n_window))
+    rows = lq.reshape(nm * n_window, nt // n_window)
+    lu = xp.repeat(xp.asarray(ln_u, xp.float64), n_window)
+    lnE = ln_evidence(rows, lu, lnT, xp=xp, block=block * n_window).reshape(nm, n_window, -1)
+    with np.errstate(divide="ignore"):
+        lpm = np.log(np.full(nm, 1.0 / nm) if pi_m is None else np.asarray(pi_m, float))
+    return _ln_sum_exp(lnE + xp.asarray(lpm)[:, None, None], 0, xp)
+
+
+def _ln_mixed(lnE, pi, xp, tiny=1e-280):
+    """ln sum_k pi[s, k] exp lnE[..., k] for every row s of pi: (..., K).  The terms are scaled by the largest of
+    their row; where the law of s has (almost) no weight on the large ones the row is summed again with its own
+    scale"""
+    mx = lnE.max(axis=-1, keepdims=True)
+    mx = xp.where(mx > -np.inf, mx, 0.0)
+    y = _dot(xp.exp(lnE - mx), xp.asarray(pi.T))
+    with np.errstate(divide="ignore"):
+        out = mx + xp.log(y)
+        low = xp.nonzero(y < tiny)
+        if low[0].size:
+            out[low] = _ln_sum_exp(lnE[low[:-1]] + xp.asarray(np.log(pi))[low[-1]], -1, xp)
+    return out
+
+
+def _ln_one_minus_exp(a, xp):
+    """ln(1 - exp(-a)) for a >= 0, accurate at both ends"""
+    with np.errstate(divide="ignore"):
+        return xp.where(a < np.log(2.0), xp.log(-xp.expm1(-a)), xp.log1p(-xp.exp(-a)))
+
+
+def window_posterior(ln_E, f, q, pi, zone=1, xp=np):
+    """the noise ratio, the posterior of the state and the glitch-time weights of the windows of one detector
+    (docs/glitch_likelihood.md, Sec. 4a), in the log domain.
+
+    ln_E   (..., n_w, n_k) ln E_w[k] (window_evidence), any leading axes (segments), on the device of xp
+    f, q   (K,) probability of each state, and of a glitch in a window given the state
+    pi     (K, n_k) the amplitude law of each state over the columns
+    zone   the zone of a window is the window and zone neighbours on each side, circular
+
+        L_w^s = sum_k pi[s, k] E_w[k],   D_w^s = 1 - q_s + q_s L_w^s,   c = sum_s f_s prod_w D_w^s,
+        r_s = f_s prod_w D_w^s / c,   kappa_w^s = prod_{w' in zone(w)} (1 - q_s) / D_w'^s,   kbar_w = sum_s r_s kappa_w^s
+
+    ln D = ln(1 - q) + ln(1 + a), a = q L / (1 - q), and ln kappa = -sum_zone ln(1 + a); 1 - kbar = sum_s r_s
+    (1 - kappa^s) with 1 - kappa = -expm1(ln kappa), so ln kbar next to a loud glitch and ln(1 - kbar) ~
+    ln((2 zone + 1) q) in quiet data keep their relative accuracy.  A state with q_s = 0 (no glitches) or f_s = 0 is
+    allowed.
+
+    returns dict: ln_c (...,), r (..., K), ln_kbar (..., n_w), ln_near (..., n_w) = ln(1 - kbar)"""
+    lnE = xp.asarray(ln_E, xp.float64)
+    f, q, pi = (np.asarray(a, float) for a in (f, q, pi))
+    nw = lnE.shape[-2]
+    if zone < 0 or 2 * zone + 1 > nw:
+        raise ValueError("a zone of %d windows on each side does not fit in %d windows" % (zone, nw))
+    lnL = _ln_mixed(lnE, pi, xp)                                         # (..., n_w, K)
+    with np.errstate(divide="ignore"):
+        lq, l1q, lf = (xp.asarray(v) for v in (np.log(q), np.log1p(-q), np.log(f)))
+    lnD = xp.logaddexp(l1q, lq + lnL)
+    A1 = xp.logaddexp(0.0, lq - l1q + lnL)                                # ln(1 + a) = ln D - ln(1 - q)
+    x = lnD.sum(axis=-2) + lf                                             # ln f_s C^s
+    ln_c = _ln_sum_exp(x, -1, xp)
+    ln_r = x - ln_c[..., None]
+    A = sum(xp.roll(A1, d, axis=-2) for d in range(-zone, zone + 1))     # -ln kappa
+    ln_kbar = _ln_sum_exp(ln_r[..., None, :] - A, -1, xp)
+    ln_near = _ln_sum_exp(ln_r[..., None, :] + _ln_one_minus_exp(A, xp), -1, xp)
+    return dict(ln_c=ln_c, r=xp.exp(ln_r), ln_kbar=ln_kbar, ln_near=ln_near)
