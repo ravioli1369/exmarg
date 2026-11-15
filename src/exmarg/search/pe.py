@@ -21,6 +21,14 @@ With glitch, also the merger likelihood ratios given a glitch of Sec. 4,
 lambda_H, lambda_L and lambda_HL, from the same table read (the gather sums
 S, S kbar_H, S kbar_L and S kbar_H kbar_L in one pass) and one-detector sums
 weighted by o_H, o_L and their products with kbar.
+
+With glitch=dict(model='windows', ...) the glitch-time weights are those of
+the model with many glitches per segment (Sec. 4a): the window evidences of
+each detector (single.window_evidence), the posterior of its state and the
+weights kbar of each window (single.window_posterior), kbar of a window
+given to each of its arrival times; the rest is the same computation, and
+the lambda_HL expression with these weights is the segment's B.
+window_evidences gives the window evidences alone (stage 1 of Sec. 4a).
 """
 
 import numpy as np
@@ -32,6 +40,9 @@ from .. import detectors as _det
 from ..priors import distance_density
 
 GLITCH = dict(pi_k=None, pi_m=None, window=0.1)    # the glitch settings and their defaults, see pe_redshift
+WINDOWS = dict(model="windows", n_window=64, zone=1, pi_m=None, H=None, L=None)   # those of model='windows'
+STATE = ("f", "q", "pi_k")                          # the settings of one detector in model='windows'
+SUM_TOL = 1e-6                                      # how far from 1 the sum of a law may be
 
 
 def _dl_of_z(z):
@@ -188,17 +199,120 @@ def _single_setup(bank, seg, store, geometry):
                 s_b=np.where(bnode >= 0, np.exp(blna) * bank.u, 0.0), n_rho=_single.RHO_EDGES.size - 1)
 
 
+def _weights_array(x, shape, name):
+    """x as a float array of the given shape, finite and >= 0 (ValueError otherwise)"""
+    try:
+        a = np.array(x, float)
+    except (TypeError, ValueError):
+        raise ValueError("glitch setting %s is not an array of numbers" % name)
+    if a.shape != tuple(shape):
+        raise ValueError("glitch setting %s has shape %s, not %s" % (name, a.shape, tuple(shape)))
+    if not np.all(np.isfinite(a)) or np.any(a < 0):
+        raise ValueError("glitch setting %s must be finite and >= 0" % name)
+    return a
+
+
+def _positive_sum(x, shape, name):
+    """weights defined up to a factor: finite, >= 0, with a positive sum"""
+    a = _weights_array(x, shape, name)
+    if not a.sum() > 0:
+        raise ValueError("glitch setting %s must have a positive sum" % name)
+    return a
+
+
+def _law(x, shape, name):
+    """probabilities over the last axis: finite, >= 0, each row summing to 1 within SUM_TOL; returned divided by
+    the sums, so that the model is normalized exactly"""
+    a = _weights_array(x, shape, name)
+    s = a.sum(axis=-1, keepdims=True)
+    if np.any(np.abs(s - 1.0) > SUM_TOL):
+        raise ValueError("glitch setting %s must sum to 1 (within %g) over its last axis; sums %s"
+                         % (name, SUM_TOL, np.array2string(s.ravel(), precision=8)))
+    return a / s
+
+
+def _template_weights(pi_m, n_template, normalize):
+    """pi_m (n_template,) checked (None stays None, uniform); divided by its sum when normalize"""
+    if pi_m is None:
+        return None
+    a = _positive_sum(pi_m, (n_template,), "pi_m")
+    return a / a.sum() if normalize else a
+
+
+def _window_count(n_window, n_time):
+    """n_window as an int that divides n_time (ValueError otherwise)"""
+    if isinstance(n_window, (bool, np.bool_)) or not isinstance(n_window, (int, np.integer)):
+        raise ValueError("glitch setting n_window must be an integer, not %r" % (n_window,))
+    if n_window < 1 or n_time % n_window:
+        raise ValueError("glitch setting n_window = %d must divide n_time = %d" % (n_window, n_time))
+    return int(n_window)
+
+
+def _windows_setup(glitch, bank, lags):
+    """the settings of model='windows' (WINDOWS), checked: n_window divides n_time, 0 <= zone and 2 zone + 1 <=
+    n_window, pi_m (n_template,) >= 0 with a positive sum (divided by it), and for each detector f (K,) and pi_k (K,
+    n_rho) laws (summing to 1 within SUM_TOL, divided by their sums), 0 <= q < 1 (K,)"""
+    g = dict(WINDOWS, **glitch)
+    if set(g) != set(WINDOWS):
+        raise ValueError("unknown glitch settings %s for model 'windows' (known: %s)"
+                         % (sorted(set(g) - set(WINDOWS)), sorted(WINDOWS)))
+    nw = _window_count(g["n_window"], bank.n_time)
+    zone = g["zone"]
+    if isinstance(zone, (bool, np.bool_)) or not isinstance(zone, (int, np.integer)) or zone < 0:
+        raise ValueError("glitch setting zone must be an integer >= 0, not %r" % (zone,))
+    if 2 * zone + 1 > nw:
+        raise ValueError("a zone of %d windows on each side does not fit in n_window = %d" % (zone, nw))
+    nr = _single.RHO_EDGES.size - 1
+    out = dict(model="windows", n_window=nw, zone=int(zone), lags=lags,
+               pi_m=_template_weights(g["pi_m"], bank.u.size, True), lnG=_window_columns(array_module(bank.device)))
+    for I in "HL":
+        p = g[I]
+        if not isinstance(p, dict):
+            raise ValueError("model 'windows' needs glitch setting %s = dict(f=(K,), q=(K,), pi_k=(K, %d))" % (I, nr))
+        if set(p) != set(STATE):
+            raise ValueError("glitch setting %s needs exactly the keys %s; got %s" % (I, list(STATE), sorted(p)))
+        try:
+            f = np.array(p["f"], float)
+        except (TypeError, ValueError):
+            raise ValueError("glitch setting %s.f is not an array of numbers" % I)
+        if f.ndim != 1 or f.size < 1:
+            raise ValueError("glitch setting %s.f must be a non-empty one-dimensional array" % I)
+        K = f.size
+        q = _weights_array(p["q"], (K,), I + ".q")
+        if np.any(q >= 1.0):
+            raise ValueError("glitch setting %s.q must lie in [0, 1); got %s" % (I, q))
+        out[I] = dict(f=_law(f, (K,), I + ".f"), q=q, pi_k=_law(p["pi_k"], (K, nr), I + ".pi_k"))
+    return out
+
+
 def _glitch_setup(glitch, bank, seg, store):
     """the glitch settings (True: the defaults of GLITCH) with pi_k (n_rho,), the half window (samples) and the lags
-    of the delay average: the lags of the tables within the light travel time between the sites"""
-    g = dict(GLITCH, **({} if glitch is True else glitch))
-    if set(g) != set(GLITCH):
-        raise ValueError("unknown glitch settings %s" % sorted(set(g) - set(GLITCH)))
+    of the delay average: the lags of the tables within the light travel time between the sites; with
+    model='windows' those of _windows_setup.  pi_k and pi_m are checked (shapes (n_rho,) and (n_template,), >= 0,
+    positive sums); the window weights kbar of the default model do not depend on their normalization"""
+    if glitch is not True and not isinstance(glitch, dict):
+        raise ValueError("glitch must be None, False, True or a dict of settings, not %r" % (glitch,))
     dt = seg["T"] / bank.n_time
     lags = np.asarray(store.tau_idx, int).ravel()
     lags = lags[np.abs(lags) * dt <= np.linalg.norm(_det.x["H"] - _det.x["L"]) / _det.c]
-    pi_k = _single.amplitude_weights() if g["pi_k"] is None else np.asarray(g["pi_k"], float)
-    return dict(pi_k=pi_k, pi_m=g["pi_m"], window=float(g["window"]), half_window=int(round(g["window"] / dt)),
+    if glitch is not True and "model" in glitch:
+        if glitch["model"] is None:                         # the default model, named
+            glitch = {k: v for k, v in glitch.items() if k != "model"}
+        elif glitch["model"] != "windows":
+            raise ValueError("unknown glitch model %r: leave model out or None (one glitch per segment, Sec. 4) or "
+                             "give 'windows' (Sec. 4a)" % (glitch["model"],))
+        else:
+            return _windows_setup(glitch, bank, lags)
+    g = dict(GLITCH, **({} if glitch is True else glitch))
+    if set(g) != set(GLITCH):
+        raise ValueError("unknown glitch settings %s" % sorted(set(g) - set(GLITCH)))
+    nr = _single.RHO_EDGES.size - 1
+    pi_k = _single.amplitude_weights() if g["pi_k"] is None else _positive_sum(g["pi_k"], (nr,), "pi_k")
+    pi_m = _template_weights(g["pi_m"], bank.u.size, False)
+    window = float(g["window"])
+    if not np.isfinite(window):
+        raise ValueError("glitch setting window must be finite")
+    return dict(model=None, pi_k=pi_k, pi_m=pi_m, window=window, half_window=int(round(g["window"] / dt)),
                 lags=lags)
 
 
@@ -213,13 +327,49 @@ def _glitch_weights(traj, gd, sd, xp):
     above 1e308): the time weights (ln kbar_H, ln kbar_L) of the gather, the weights per time of the one-detector
     sums on each trajectory (rows ln o, ln o + ln kbar; o_H(t) on L, o_L(t') on H) and
     ln c0 = ln (1/n_t) sum_t o_H(t) (1 - kbar_L(t))"""
+    if gd["model"] == "windows":
+        return _window_weights(traj, gd, sd, xp)
     (kH, nH), (kL, nL) = _kbar(traj, "H", gd, sd, xp), _kbar(traj, "L", gd, sd, xp)
-    oH = _single.ln_near_fraction(nH, gd["lags"], xp)               # of the L arrival time t, kbar_H at t + tau
-    oL = _single.ln_near_fraction(nL, -gd["lags"], xp)              # of the H arrival time t', kbar_L at t' - tau
+    return _time_weights(kH, nH, kL, nL, gd["lags"], xp)
+
+
+def _time_weights(kH, nH, kL, nL, lags, xp):
+    """the weights of _glitch_weights from ln kbar_I and ln(1 - kbar_I) (n_time,) of each detector"""
+    oH = _single.ln_near_fraction(nH, lags, xp)                     # of the L arrival time t, kbar_H at t + tau
+    oL = _single.ln_near_fraction(nL, -lags, xp)                    # of the H arrival time t', kbar_L at t' - tau
     x = oH + nL
     m = float(x.max())
     lc0 = -np.inf if m == -np.inf else m + float(xp.log(xp.exp(x - m).sum())) - np.log(x.size)
     return dict(tw=(kH, kL), H=xp.stack([oL, oL + kH]), L=xp.stack([oH, oH + kL]), lc0=lc0)
+
+
+def _window_columns(xp):
+    """the glitch columns ln L_k (NV, n_rho) on the device: the first n_rho columns of single=True"""
+    return xp.asarray(_single.glitch_columns())
+
+
+def _window_evidence(lq, ln_u, lnG, n_window, pi_m, xp):
+    """ln E_w[k] (n_window, n_rho) of one detector; the one call of pe_redshift and of window_evidences"""
+    return _single.window_evidence(lq, ln_u, lnG, n_window, pi_m, xp)
+
+
+def _window_weights(traj, gd, sd, xp):
+    """_glitch_weights of model='windows' (Sec. 4a): per detector the window evidences, the posterior of the state
+    and ln kbar, ln(1 - kbar) of each window (single.window_posterior), given to each of its n_time / n_window
+    arrival times; then the delay averages, the weight rows and ln c0 as for the default model.  Also, per detector
+    I, win_I = (ln c_I, the posterior of the state (K,), ln E_w (n_window, n_rho)) on the host"""
+    nw = gd["n_window"]
+    n_win = traj["lqH"].shape[1] // nw
+    lk, ln, win = {}, {}, {}
+    for I in "HL":
+        lnE = _window_evidence(traj["lq" + I], sd["ln_u"], gd["lnG"], nw, gd["pi_m"], xp)
+        p = gd[I]
+        post = _single.window_posterior(lnE, p["f"], p["q"], p["pi_k"], gd["zone"], xp)
+        lk[I], ln[I] = xp.repeat(post["ln_kbar"], n_win), xp.repeat(post["ln_near"], n_win)
+        win[I] = (float(post["ln_c"]), _single._host(post["r"]), _single._host(lnE))
+    out = _time_weights(lk["H"], ln["H"], lk["L"], ln["L"], gd["lags"], xp)
+    out.update(win_H=win["H"], win_L=win["L"])
+    return out
 
 
 def _single_values(traj, sd, xp, gw=None):
@@ -244,11 +394,12 @@ def _on_nodes(lnE, b, geometry):
     return np.concatenate([np.where(valid, lnE.T, -np.inf), np.where(bnode >= 0, b, -np.inf)[None]])
 
 
-def _single_nodes(one, lamN, geometry, n_rho, far=None, lc0=None):
+def _single_nodes(one, lamN, geometry, n_rho, far=None, lc0=None, win=None):
     """the single-detector values on the node geometry of lamN (same valid pairs, same boundary row, -inf where
     lamN is), the glitch evidences and the largest w, stacked over the segments; with far (n_seg, 3, n_node + 1,
     n_template), the gather sums weighted by kbar_H, kbar_L and both, and ln c0 (n_seg,) also lamN_gH, lamN_gL,
-    lamN_gHL"""
+    lamN_gHL; with win (model='windows': per segment the dict of _window_weights) only lamN_gHL of the three, and
+    ln_c_I (n_seg,), state_I (n_seg, K), ln_window_I (n_seg, n_window, n_rho)"""
     nodes = lambda I, i: np.stack([_on_nodes(o[I][0][i][:, n_rho:], o[I][1][i], geometry) for o in one])
     out = {}
     for I in "HL":
@@ -260,6 +411,13 @@ def _single_nodes(one, lamN, geometry, n_rho, far=None, lc0=None):
         out["lamN_gH"] = np.logaddexp(far[:, 0], nodes("L", 1))
         out["lamN_gL"] = np.logaddexp(far[:, 1], nodes("H", 1))
         out["lamN_gHL"] = np.logaddexp(np.logaddexp(far[:, 2], nodes("L", 2)), np.logaddexp(nodes("H", 2), lc0))
+    if win is not None:
+        del out["lamN_gH"], out["lamN_gL"]                  # no meaning in this model
+        for I in "HL":
+            w = [g["win_" + I] for g in win]
+            out["ln_c_" + I] = np.array([v[0] for v in w])
+            out["state_" + I] = np.stack([v[1] for v in w])
+            out["ln_window_" + I] = np.stack([v[2] for v in w])
     for k in out:
         if k.startswith("lamN_"):
             out[k][~np.isfinite(lamN)] = -np.inf
@@ -315,13 +473,15 @@ def _node_values(bank, seg, ev, store, geometry, groups, block, resident, n_loud
     if single is None:
         return lamN
     lc0 = None if glitch is None else [g["lc0"] for g in gw]
-    return lamN, _single_nodes(one, lamN, geometry, single["n_rho"], far, lc0)
+    win = gw if glitch is not None and glitch["model"] == "windows" else None
+    return lamN, _single_nodes(one, lamN, geometry, single["n_rho"], far, lc0, win)
 
 
 def _single_out(single, n_seg, shape, bank, gd=None):
     """the arrays single=True adds to the result: ln_lambda_H, ln_lambda_L of the given shape per segment, and
     ln_glitch_H, ln_glitch_L, wmax_H, wmax_L, rho_edges; with the glitch settings gd also ln_lambda_gH,
-    ln_lambda_gL, ln_lambda_gHL and glitch_pi_k, glitch_window"""
+    ln_lambda_gL, ln_lambda_gHL and glitch_pi_k, glitch_window, or for model='windows' ln_B of the given shape,
+    ln_c_H, ln_c_L, state_H, state_L, ln_window_H, ln_window_L and glitch_model, glitch_n_window, glitch_zone"""
     if not single:
         return {}
     nm, nr = bank.u.size, _single.RHO_EDGES.size - 1
@@ -330,7 +490,14 @@ def _single_out(single, n_seg, shape, bank, gd=None):
         out["ln_lambda_" + I] = np.full((n_seg,) + shape, -np.inf)
         out["ln_glitch_" + I] = np.full((n_seg, nm, nr), -np.inf)
         out["wmax_" + I] = np.zeros((n_seg, nm))
-    if gd is not None:
+    if gd is not None and gd["model"] == "windows":
+        out["ln_B"] = np.full((n_seg,) + shape, -np.inf)
+        for I in "HL":
+            out["ln_c_" + I] = np.full(n_seg, np.nan)
+            out["state_" + I] = np.full((n_seg, gd[I]["f"].size), np.nan)
+            out["ln_window_" + I] = np.full((n_seg, gd["n_window"], nr), -np.inf)
+        out.update(glitch_model="windows", glitch_n_window=gd["n_window"], glitch_zone=gd["zone"])
+    elif gd is not None:
         for X in ("H", "L", "HL"):
             out["ln_lambda_g" + X] = np.full((n_seg,) + shape, -np.inf)
         out["glitch_pi_k"], out["glitch_window"] = gd["pi_k"], gd["window"]
@@ -338,9 +505,21 @@ def _single_out(single, n_seg, shape, bank, gd=None):
 
 
 def _node_keys(gd):
-    """the node arrays reduced into the result: single detector, and with the glitch terms"""
-    glitch = [] if gd is None else [("ln_lambda_g" + X, "lamN_g" + X) for X in ("H", "L", "HL")]
+    """the node arrays reduced into the result: single detector, and with the glitch terms (model='windows':
+    ln_B, the lambda_HL expression with the window weights)"""
+    if gd is not None and gd["model"] == "windows":
+        glitch = [("ln_B", "lamN_gHL")]
+    else:
+        glitch = [] if gd is None else [("ln_lambda_g" + X, "lamN_g" + X) for X in ("H", "L", "HL")]
     return [("ln_lambda_" + I, "lamN_" + I) for I in "HL"] + glitch
+
+
+def _segment_keys(gd):
+    """the per-segment arrays copied into the result"""
+    keys = [k + I for I in "HL" for k in ("ln_glitch_", "wmax_")]
+    if gd is not None and gd["model"] == "windows":
+        keys += [k + I for I in "HL" for k in ("ln_c_", "state_", "ln_window_")]
+    return keys
 
 
 def pe_redshift(segments, bank, store, rows=None, chunk=8, zmax=8.0, nz=1600,
@@ -374,7 +553,16 @@ def pe_redshift(segments, bank, store, rows=None, chunk=8, zmax=8.0, nz=1600,
                       rho = 4, single.amplitude_weights) and pi_m (n_template,) over the
                       templates (default uniform), and the window (s, default 0.1) of the
                       arrival times near a glitch; the delay average runs over the lags of the
-                      tables within the light travel time between the sites
+                      tables within the light travel time between the sites.
+                      Or dict(model='windows', n_window=64, zone=1, pi_m=None, H=dict(f=, q=,
+                      pi_k=), L=dict(...)): many glitches per segment (docs/glitch_likelihood.md
+                      Sec. 4a), the segment cut into n_window windows (a divisor of n_time), the
+                      zone of a window that and zone windows on each side, pi_m (n_template,)
+                      the glitches over the templates (divided by its sum; default uniform), and
+                      per detector K states (K may differ between H and L) with probabilities
+                      f (K,), glitch probability per window q (K,) in [0, 1) and amplitude laws
+                      pi_k (K, n_rho) on rho_edges (f and the rows of pi_k sum to 1 within 1e-6
+                      and are divided by their sums).  Every setting is checked (ValueError)
 
     ln B averages Lambda over the prior uniform in M_det = 2 m1 (1+z) on
     mdet_range and proportional to D_L^2 in luminosity distance, i.e.
@@ -388,7 +576,14 @@ def pe_redshift(segments, bank, store, rows=None, chunk=8, zmax=8.0, nz=1600,
     (n_segment, n_template) the largest w of each template; with glitch also
     ln_lambda_gH, ln_lambda_gL, ln_lambda_gHL (n_segment, nm1, nz) ln lambda_H,
     ln lambda_L, ln lambda_HL through the nodes and the reduction of ln_lambda,
-    and the settings used, glitch_pi_k and glitch_window."""
+    and the settings used, glitch_pi_k and glitch_window.  With model='windows'
+    instead of the three: ln_B (n_segment, nm1, nz) the lambda_HL expression
+    with the window weights (the B of Sec. 4a, not averaged over the
+    population; ln_b is that of ln_lambda), ln_c_H, ln_c_L (n_segment,) ln of
+    the noise ratio c_I, state_H, state_L (n_segment, K) the posterior of the
+    state, ln_window_H, ln_window_L (n_segment, n_window, n_rho) ln E_w[k]
+    (as window_evidences), and glitch_model ('windows'), glitch_n_window,
+    glitch_zone."""
     if np.any(np.diff(bank.M) <= 0) or np.any(bank.q != 1.0) or np.any(bank.chi != 0.0):
         raise ValueError("pe_redshift needs an ascending equal-mass zero-spin bank")
     xp = array_module(bank.device)
@@ -415,9 +610,8 @@ def pe_redshift(segments, bank, store, rows=None, chunk=8, zmax=8.0, nz=1600,
             out[e] = _to_source_frame(lamN[j], geometry[2], bank.M, yq, m1, z, xp)
             for key, node in _node_keys(gd) if single else ():
                 extra[key][e] = _to_source_frame(one[node][j], geometry[2], bank.M, yq, m1, z, xp)
-            for I in "HL" if single else "":
-                extra["ln_glitch_" + I][e] = one["ln_glitch_" + I][j]
-                extra["wmax_" + I][e] = one["wmax_" + I][j]
+            for key in _segment_keys(gd) if single else ():
+                extra[key][e] = one[key][j]
 
     dl = _dl_of_z(z)
     lnp = np.log(np.maximum((1.0 + z) * dl ** 2 * np.gradient(dl, z), 1e-300))
@@ -427,6 +621,40 @@ def pe_redshift(segments, bank, store, rows=None, chunk=8, zmax=8.0, nz=1600,
     w /= w.sum()
     ln_b = np.array([_log_mean(L, w) for L in out])
     return dict(m1=m1, z=z, ln_lambda=out, ln_b=ln_b, rows=seg["rows"], **extra)
+
+
+def window_evidences(segments, bank, rows=None, chunk=8, n_window=64, pi_m=None):
+    """the window evidences of each segment and detector (docs/glitch_likelihood.md Sec. 4a, stage 1): the
+    matched filter and single.window_evidence, no tables.
+
+    segments   anything read_segments takes
+    bank       mass_bank built on the same segments
+    rows       segment indices (default all)
+    chunk      segments filtered at once
+    n_window   windows per segment, a divisor of bank.n_time
+    pi_m       (n_template,) weights of the templates (>= 0, divided by their sum; default uniform)
+
+    returns dict: ln_window_H, ln_window_L (n_segment, n_window, n_rho) ln E_w[k], the same arrays as pe_redshift
+    with glitch=dict(model='windows') and the same n_window and pi_m; wmax_H, wmax_L (n_segment, n_template) the
+    largest w of each template; rho_edges (n_rho + 1,); rows."""
+    seg = read_segments(segments, rows)
+    nw = _window_count(n_window, bank.n_time)
+    pm = _template_weights(pi_m, bank.u.size, True)
+    xp = array_module(bank.device)
+    lnG, ln_u = _window_columns(xp), np.log(bank.u)
+    n, nm, nr = seg["rows"].size, bank.u.size, _single.RHO_EDGES.size - 1
+    out = {}
+    for I in "HL":
+        out["ln_window_" + I] = np.full((n, nw, nr), -np.inf)
+        out["wmax_" + I] = np.zeros((n, nm))
+    for ev in _chunks(seg, chunk):
+        traj = [_filter(bank, seg, e) for e in ev]
+        for t, e in zip(traj, ev):
+            for I in "HL":
+                out["ln_window_" + I][e] = _single._host(_window_evidence(t["lq" + I], ln_u, lnG, nw, pm, xp))
+                out["wmax_" + I][e] = _single._host(_single._wmax(t["lq" + I], ln_u, xp))
+        del traj
+    return dict(out, rho_edges=_single.RHO_EDGES.copy(), rows=seg["rows"])
 
 
 def distance_weights(y, prior, ymin):
@@ -488,7 +716,7 @@ def pe_intrinsic(segments, bank, store, rows=None, prior="volume", ymin=0.1267, 
     shared_times      the same random arrival times for every template (gather.select_times)
     single            also the single-detector evidences (needs sig2_H == sig2_L)
     glitch            None, or True or a dict of settings: also the merger likelihood ratios
-                      given a glitch (see pe_redshift)
+                      given a glitch, or with model='windows' the B of Sec. 4a (see pe_redshift)
 
     each template reads the store at every node s it reaches, y = sqrt(s/u), and
     Lambda = sum_j w_j Lambda(y_j) with the weights of distance_weights.  ln B
@@ -500,7 +728,9 @@ def pe_intrinsic(segments, bank, store, rows=None, prior="volume", ymin=0.1267, 
     (n_segment, n_template) ln Lambda_S^I with the same distance weights, and
     ln_glitch_H, ln_glitch_L, rho_edges, wmax_H, wmax_L as for pe_redshift; with
     glitch also ln_lambda_gH, ln_lambda_gL, ln_lambda_gHL (n_segment, n_template)
-    with the same distance weights, glitch_pi_k and glitch_window."""
+    with the same distance weights, glitch_pi_k and glitch_window; with
+    model='windows' ln_B (n_segment, n_template) with the same distance weights
+    in their place and the other arrays and settings of pe_redshift."""
     seg = read_segments(segments, rows)
     geometry = _node_geometry(bank, store, ymin)
     yN = geometry[2]
@@ -529,9 +759,8 @@ def pe_intrinsic(segments, bank, store, rows=None, prior="volume", ymin=0.1267, 
             out[e] = _distance_integral(lnW, lamN[j])
             for key, node in _node_keys(gd) if single else ():
                 extra[key][e] = _distance_integral(lnW, one[node][j])
-            for I in "HL" if single else "":
-                extra["ln_glitch_" + I][e] = one["ln_glitch_" + I][j]
-                extra["wmax_" + I][e] = one["wmax_" + I][j]
+            for key in _segment_keys(gd) if single else ():
+                extra[key][e] = one[key][j]
 
     cell = np.ones(bank.u.size)
     for ax in (bank.M, bank.q, bank.chi):
