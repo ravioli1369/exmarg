@@ -166,3 +166,115 @@ def test_worker_pool_from_the_command_line(folder, blocks, tmp_path):
     pool = {p.name: strain.read_epoch(p) for p in sorted(out.glob('epoch_*.npz'))}
     assert list(pool) == list(eps)
     assert all(np.array_equal(pool[n]['d_L'], eps[n]['d_L']) for n in eps)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# resuming into a folder: the settings that determine the output are stored in every epoch and must not change
+
+
+def with_option(args, name, value):
+    """args with the value after the option `name` replaced"""
+    i = args.index(name)
+    return args[:i + 1] + [value] + args[i + 2:]
+
+
+def settings_of(path):
+    with np.load(path) as z:
+        return (str(z['settings_hash']) if 'settings_hash' in z.files else None), int(z['seed'])
+
+
+def strip_hash(path):
+    """the epoch file as conditioned before the settings hash existed"""
+    with np.load(path) as z:
+        keep = {k: z[k] for k in z.files if k not in ('settings_hash', 'settings')}
+    np.savez(path, **keep)
+
+
+def test_resume_refuses_other_settings(folder, tmp_path):
+    """a second run into the same folder with another seed stops, names the seed, and leaves every file as it was;
+    --overwrite recomputes the epochs with the new settings (one hash in all of them, the new seed); the same settings
+    again skip every file"""
+    out = tmp_path / 'resume'
+    first = run(folder, out, '--workers', '1')
+    hashes = {settings_of(p) for p in out.glob('epoch_*.npz')}
+    assert len({h for h, _ in hashes}) == 1 and {s for _, s in hashes} == {7} and None not in {h for h, _ in hashes}
+    before = {p.name: p.stat().st_mtime_ns for p in out.glob('epoch_*.npz')}
+    args = with_option(ARGS, '--seed', '8')
+    with pytest.raises(SystemExit, match='seed'):
+        cond.main([str(folder), str(out)] + args + ['--workers', '1'])
+    assert {p.name: p.stat().st_mtime_ns for p in out.glob('epoch_*.npz')} == before
+    assert list(run(folder, out, '--workers', '1')) == list(first)
+    assert {p.name: p.stat().st_mtime_ns for p in out.glob('epoch_*.npz')} == before
+    assert cond.main([str(folder), str(out)] + args + ['--workers', '1', '--overwrite']) == 0
+    after = {settings_of(p) for p in out.glob('epoch_*.npz')}
+    assert {s for _, s in after} == {8} and len({h for h, _ in after}) == 1 and after != hashes
+    assert len(list(out.glob('epoch_*.npz'))) == len(first)
+
+
+def test_notch_change_is_a_different_setting(folder, tmp_path):
+    out = tmp_path / 'notch'
+    run(folder, out, '--workers', '1')
+    args = with_option(ARGS, '--notches', '33.0:34.0')
+    with pytest.raises(SystemExit, match='notches'):
+        cond.main([str(folder), str(out)] + args + ['--workers', '1'])
+
+
+def test_arrays_resume_refuses_other_settings_and_counts_written(tmp_path, capsys):
+    """.npz input (the case that mixed a short run with seed 7 and a longer one with seed 8 in one folder): refused
+    without --overwrite; the final message counts the epochs the run wrote, not those in the folder"""
+    for i, name in enumerate(('H1', 'L1')):                      # the long input is the short one and 200 s more
+        short = np.random.default_rng(1 + i).standard_normal(200 * FS) * 1e-21
+        extra = np.random.default_rng(10 + i).standard_normal(200 * FS) * 1e-21
+        for tag, x in (('short', short), ('long', np.concatenate([short, extra]))):
+            np.savez(tmp_path / ('%s_%s.npz' % (name, tag)), strain=x, sample_rate=FS, gps_start=G,
+                     dq=np.full(x.size // FS, 3))
+    out = tmp_path / 'out'
+    common = [a for a in ARGS if a not in ('--notches', '29.5:30.5')]
+    args = lambda tag, seed: [str(tmp_path / ('H1_%s.npz' % tag)), str(tmp_path / ('L1_%s.npz' % tag)),
+                              str(out)] + with_option(common, '--seed', seed)
+    assert cond.main(args('short', '7')) == 0
+    n_first = len(list(out.glob('epoch_*.npz')))
+    capsys.readouterr()
+    with pytest.raises(SystemExit, match='seed'):
+        cond.main(args('long', '8'))
+    assert len(list(out.glob('epoch_*.npz'))) == n_first
+    assert cond.main(args('long', '7')) == 0                      # same settings: resumes, the first epochs kept
+    last = capsys.readouterr().out.strip().splitlines()[-1]
+    n_all = len(list(out.glob('epoch_*.npz')))
+    assert n_all > n_first
+    assert '%d epochs in' % n_all in last and '%d written by this run' % (n_all - n_first) in last, last
+    assert cond.main(args('long', '7')) == 0
+    assert '0 written by this run' in capsys.readouterr().out.strip().splitlines()[-1]
+
+
+def test_manifest_needs_one_settings_hash(folder, tmp_path):
+    """write_manifest: a folder in which no epoch has the hash is legacy and accepted; a mixture of hashed and
+    unhashed epochs, or two hashes, is an error naming the files"""
+    out = tmp_path / 'mix'
+    run(folder, out, '--workers', '1')
+    paths = sorted(out.glob('epoch_*.npz'))
+    header = ['test']
+    n = cond.write_manifest(str(out), header)[0]
+    assert n == len(paths) and settings_of(paths[0])[0] in open(out / 'manifest.txt').read()
+    strip_hash(paths[0])
+    with pytest.raises(SystemExit, match=paths[0].name):
+        cond.write_manifest(str(out), header)
+    for p in paths:
+        strip_hash(p)
+    assert cond.write_manifest(str(out), header)[0] == len(paths)           # legacy folder
+    with np.load(paths[1]) as z:
+        d = {k: z[k] for k in z.files}
+    d['settings_hash'] = np.array('0' * 64)
+    np.savez(paths[1], **d)
+    np.savez(paths[2], **dict(d, settings_hash=np.array('1' * 64)))
+    with pytest.raises(SystemExit, match='settings'):
+        cond.write_manifest(str(out), header)
+
+
+def test_segment_and_outside_the_array():
+    """a segment outside the data-quality seconds (np.bitwise_and.reduce of an empty slice is -1) stops the run and
+    names the segment"""
+    bits = np.full(50, 3, np.int64)
+    assert list(cond._segment_and(bits, [10.0, 12.0], 10.0, 4.0)) == [3, 3]
+    with pytest.raises(ValueError, match='GPS 60'):
+        cond._segment_and(bits, [10.0, 60.0], 10.0, 4.0)

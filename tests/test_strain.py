@@ -546,6 +546,58 @@ def test_no_loud_blocks_in_gaussian_noise(run):
             assert np.array_equal(ea[key], eb[key]), key
 
 
+def test_data_quality_slice_must_be_inside_the_array():
+    """np.bitwise_and.reduce of an empty slice is -1 (every bit set): a segment outside the data-quality array must
+    stop the run, with the segment named, in strain.condition (dq shorter than the data) and in the helper"""
+    bits = np.full(100, 3, np.int64)
+    assert strain.segment_and(bits, 10, 20, 1234.0) == 3
+    for a, b in ((100, 108), (-2, 5), (7, 7), (95, 108)):
+        with pytest.raises(ValueError, match="1234.5"):
+            strain.segment_and(bits, a, b, 1234.5)
+    n = int(round((2 * (N + 1) * T + 2 * PAD) * FS))
+    x = {I: sim.noise(I, n, [7, k]) for k, I in enumerate("HL")}
+    short = np.full(int((n / FS) // 2), 127)
+    with pytest.raises(ValueError, match="segment at GPS"):
+        strain.condition(x["H"], x["L"], FS, GPS0, T=T, N=N, notches=sim.NOTCHES, pad=PAD, seed=3, method="median",
+                         dq_H=short, dq_L=np.full(int(n / FS), 127))
+
+
+def hard_case(seed=112, n_block=16):
+    """exponential periodograms on the analysis bins with a few blocks made louder at random, in all bands or in 40 to
+    80 Hz only (found by search: with this seed the blocks flagged in the second pass include one that the third pass
+    clears again when the flags are recomputed from scratch)"""
+    f = np.arange(160, 4097) / 8.0
+    rng = np.random.default_rng(seed)
+    P = rng.exponential(size=(n_block, f.size))
+    for b in rng.choice(n_block, rng.integers(1, n_block // 2), replace=False):
+        P[b] *= np.exp(rng.uniform(0, 3))
+        if rng.random() < 0.5:
+            P[b] = rng.exponential(size=f.size) * np.where((f > 40) & (f < 80), np.exp(rng.uniform(0, 3)), 1.0)
+    return P, f, np.ones(f.size, bool)
+
+
+def test_loud_flags_only_grow():
+    """a block once flagged stays flagged (the docstring of loud_blocks): the flags after k passes are contained in
+    those after k + 1, and the converged flags contain every earlier pass"""
+    P, f, keep = hard_case()
+    flags = [strain.loud_blocks(P, f, keep, "median", iterations=k)[0] for k in range(1, 7)]
+    for k in range(5):
+        assert not (flags[k] & ~flags[k + 1]).any(), (k + 1, np.flatnonzero(flags[k]), np.flatnonzero(flags[k + 1]))
+    loud, passes = strain.loud_blocks(P, f, keep, "median")
+    assert passes < 10 and np.array_equal(loud, flags[-1])
+
+
+def test_one_loud_block_converges():
+    """one block 900 times louder in every band, on 32 others: found, nothing else flagged, in two passes (the second
+    confirms that the flags stopped changing)"""
+    rng = np.random.default_rng(5)
+    f = np.arange(160, 4097) / 8.0
+    P = rng.exponential(size=(33, f.size))
+    P[7] *= 900.0
+    loud, passes = strain.loud_blocks(P, f, np.ones(f.size, bool), "median")
+    assert list(np.flatnonzero(loud)) == [7] and passes == 2
+
+
 def test_unequalized_regenerates_the_data_before_step_5(run):
     """strain.unequalized of an equalized run gives the data of the same run without step 5 (same seed)"""
     eq, plain = run("median eq"), run("median")

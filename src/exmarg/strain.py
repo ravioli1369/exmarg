@@ -243,6 +243,7 @@ def loud_blocks(P, f, keep, method="mean", edges=MONITOR_EDGES, p=1e-6, correct=
     nb = np.array([np.sum(keep & (f >= edges[k]) & ((f <= edges[k + 1]) if k == len(edges) - 2 else
                                                      (f < edges[k + 1]))) for k in range(len(edges) - 1)])
     use = np.ones(P.shape[0], bool)
+    flagged = np.zeros(P.shape[0], bool)
     cache = {}
     for it in range(1, iterations + 1):
         est, count = masked_loo(P, use, method)
@@ -252,11 +253,20 @@ def loud_blocks(P, f, keep, method="mean", edges=MONITOR_EDGES, p=1e-6, correct=
         c = np.array([cache[n][0] for n in count])
         thr = np.array([cache[n][1] for n in count])
         mon = monitors(np.sqrt(P / (c[:, None] * est)), f, edges, keep)
-        loud = np.any(np.nan_to_num(mon, nan=-np.inf) > np.nan_to_num(thr, nan=np.inf), axis=1)
+        loud = flagged | np.any(np.nan_to_num(mon, nan=-np.inf) > np.nan_to_num(thr, nan=np.inf), axis=1)
         if np.array_equal(loud, ~use) or (~loud).sum() < least:
             return loud, it
-        use = ~loud
+        use, flagged = ~loud, loud
     return loud, iterations
+
+
+def segment_and(bits, a, b, gps):
+    """the bits set over all of bits[a:b] (the data-quality seconds of the segment starting at GPS gps).  np.bitwise_and
+    .reduce of an empty slice is -1, every bit set, so a slice that is empty or reaches outside the array is an error"""
+    if not 0 <= a < b <= len(bits):
+        raise ValueError("the data-quality array (%d values) does not cover the segment at GPS %.3f: indices %d to %d"
+                         % (len(bits), gps, a, b))
+    return int(np.bitwise_and.reduce(bits[a:b]))
 
 
 def smooth_spectrum(x, fs, T, smooth=17, pad=0.0, highpass=None):
@@ -501,7 +511,7 @@ def condition(x_H, x_L, fs, gps0, T=8.0, fmin=20.0, fmax=512.0, N=32, notches=()
                 dq = np.asarray(dq, np.int64)
                 a = np.floor((gps - gps0) * dq_rate + 1e-9).astype(int)
                 b = np.ceil((gps + T - gps0) * dq_rate - 1e-9).astype(int)
-                ep["dq_" + I] = np.array([np.bitwise_and.reduce(dq[i:j]) for i, j in zip(a, b)], np.int64)
+                ep["dq_" + I] = np.array([segment_and(dq, i, j, t) for i, j, t in zip(a, b, gps)], np.int64)
         ep.update(gps_epoch=float(gps_epoch), gps_reference=np.array([gps0 + (p + k * L) / fs for k in refs]),
                   fs=float(fs), N=int(N), method=method, correction=float(c), reference=reference,
                   psd="known" if psd is not None else "estimated", equal_noise=bool(equal_noise), seed=int(seed),
@@ -516,6 +526,21 @@ def condition(x_H, x_L, fs, gps0, T=8.0, fmin=20.0, fmax=512.0, N=32, notches=()
         ep["analysable"] = ~ep["loud_H"] & ~ep["loud_L"] & ep["usable"]
         out.append(ep)
     return out
+
+
+def one_settings_hash(hashes):
+    """hashes {epoch file: settings hash or None} of a folder of epochs: the hash every epoch carries, None for a
+    legacy folder in which none does; ValueError (naming files) for a mixture of hashed and unhashed epochs or of
+    different hashes"""
+    found = {}
+    for name, h in sorted(hashes.items()):
+        found.setdefault(h, []).append(name)
+    if len(found) <= 1:
+        return next(iter(found), None)
+    what = ", ".join("%s: %s" % (("no settings hash" if h is None else "settings hash %s" % str(h)[:12]),
+                                 ", ".join(v[:3]) + (" and %d more" % (len(v) - 3) if len(v) > 3 else ""))
+                     for h, v in sorted(found.items(), key=lambda kv: str(kv[0])))
+    raise ValueError("the epochs of one folder were not conditioned with one set of settings (%s)" % what)
 
 
 def unequalized(epoch):

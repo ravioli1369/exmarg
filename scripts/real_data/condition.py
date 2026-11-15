@@ -2,6 +2,7 @@
 
     python scripts/real_data/condition.py <gwosc_dir> <out_dir> [--notches-file F] [--workers 16] [--block 24]
                                           [--seed S] [--N 32] [--method median|mean] [--event-margin 2]
+                                          [--overwrite]
     python scripts/real_data/condition.py H1.npz L1.npz <out_dir> [the same options] [--require 3] [--events gps.txt]
     -> out_dir/epoch_<gps>.npz, one per epoch (read_segments reads them; exmarg.strain.read_epoch with the
        bookkeeping), out_dir/manifest.txt, out_dir/stretches.txt, and for GWOSC input out_dir/events.json
@@ -15,7 +16,13 @@ stretch and the transforms of all its epochs (about 95 MB per 1000 s at 4096 Hz)
 epochs is conditioned in blocks: a block owns up to --block consecutive epochs and is given one more epoch on each
 side, which makes its epochs identical to those of the whole stretch (an epoch depends on its own data, on the curves
 of its two neighbours and on a noise seed set by --seed and its GPS time).  Blocks run in --workers processes.  An
-epoch whose file exists is not recomputed: running the same command again resumes an interrupted run.
+epoch whose file exists is not recomputed: running the same command again resumes an interrupted run.  Every epoch
+file stores the settings that determine its content (everything of strain.condition, the catalogued events, the DQ and
+injection bits required; not the input folder or the number of workers or of epochs per block, which do not change an
+epoch) and their SHA-256 (settings_hash, settings).  A run into a folder whose epochs carry other settings, or none,
+stops and names the settings that differ, unless --overwrite is given: the epochs with other settings are then deleted
+and recomputed.  write_manifest and analyse.py accept one settings hash in all epochs of a folder; a folder in which no
+epoch has it (conditioned before it was stored) is read as it is, a mixture is an error.
 
 Catalogued events (gwosc.events(): GWTC-3 confident and marginal, fetched once and cached in out_dir/events.json; or
 --events, a text file whose first column is the GPS) flag the segments within --event-margin seconds of them.
@@ -38,6 +45,7 @@ bit of --require set in dq; the stretches are conditioned whole, one after the o
 """
 import argparse
 import glob
+import hashlib
 import importlib.util
 import json
 import multiprocessing as mp
@@ -229,7 +237,7 @@ def _segment_and(bits, gps, gps0, T):
     """bits (n_second,) at 1 Hz from gps0 -> (n_segment,) the bits set over all of each segment [gps, gps + T)"""
     a = np.floor(np.asarray(gps) - gps0 + 1e-9).astype(int)
     b = np.ceil(np.asarray(gps) + T - gps0 - 1e-9).astype(int)
-    return np.array([np.bitwise_and.reduce(bits[i:j]) for i, j in zip(a, b)], np.int64)
+    return np.array([strain.segment_and(bits, i, j, t) for i, j, t in zip(a, b, np.atleast_1d(gps))], np.int64)
 
 
 _A2 = {}
@@ -277,7 +285,8 @@ def _condition_block(job):
         ep.update(inj_H=_segment_and(tl['inj_H1'][a:a + m], ep['gps'], job['gps'], ep['T']),
                   inj_L=_segment_and(tl['inj_L1'][a:a + m], ep['gps'], job['gps'], ep['T']),
                   dq_names=np.array(tl['dq_names']), inj_names=np.array(tl['inj_names']),
-                  stretch=np.array(job['stretch'], float), notch_file=c['notch_file'], u_ratio_60=u_ratio(ep))
+                  stretch=np.array(job['stretch'], float), notch_file=c['notch_file'], u_ratio_60=u_ratio(ep),
+                  settings_hash=c['settings_hash'], settings=c['settings_text'])
         write(c['out_dir'], ep)
         written += 1
     return dict(written=written, events=sum(int(ep['event'].sum()) for ep in eps[job['keep'][0]:job['keep'][1]]),
@@ -302,11 +311,10 @@ def catalogue(out_dir, events_file=None):
 
 def write_manifest(out_dir, header):
     """out_dir/manifest.txt from the epoch files in out_dir; returns (epochs, segments, flagged segments)"""
-    rows, names = [], None
-    for path in sorted(glob.glob(os.path.join(out_dir, 'epoch_*.npz'))):
-        if path.endswith('.tmp.npz'):
-            continue
+    rows, names, hashes = [], None, {}
+    for path in epoch_files(out_dir):
         with np.load(path) as z:
+            hashes[os.path.basename(path)] = str(z['settings_hash']) if 'settings_hash' in z.files else None
             dq = [int(np.bitwise_and.reduce(z['dq_' + I])) if 'dq_' + I in z.files else -1 for I in 'HL']
             flags = [int(z['loud_' + I].sum()) if 'loud_' + I in z.files else -1 for I in 'HL']
             used = [int(z['n_used_' + I]) if 'n_used_' + I in z.files else -1 for I in 'HL']
@@ -319,9 +327,14 @@ def write_manifest(out_dir, header):
             if names is None and 'dq_names' in z.files:
                 names = [str(v) for v in z['dq_names']]
     rows.sort(key=lambda r: r[1])
+    try:
+        digest = strain.one_settings_hash(hashes)
+    except ValueError as err:
+        raise SystemExit('%s: %s' % (out_dir, err))
     with open(os.path.join(out_dir, 'manifest.txt.tmp'), 'w') as fh:
         for line in header:
             fh.write('# %s\n' % line)
+        fh.write('# settings sha256 %s\n' % (digest or 'not recorded (conditioned before the hash was stored)'))
         if names:
             fh.write('# dq bit k set: %s passes\n' % ', '.join('%d %s' % kv for kv in enumerate(names)))
         fh.write('# loud: segments flagged loud (strain.loud_blocks); used: unflagged blocks of the epoch; usable: 1 '
@@ -350,6 +363,55 @@ def settings(a):
                 flag=not a.no_flag, flag_p=a.flag_p, flag_iterations=a.flag_iterations, min_blocks=a.min_blocks)
 
 
+def settings_record(kw, events, **extra):
+    """(SHA-256, JSON text) of what determines the content of an epoch: the keyword arguments of strain.condition, the
+    catalogued events (their hash) and the extra entries (the DQ bits required, ...)"""
+    rec = {k: (np.asarray(v, float).tolist() if k == 'notches' else list(v) if isinstance(v, tuple) else v)
+           for k, v in kw.items()}
+    rec['events_sha256'] = hashlib.sha256(np.sort(np.asarray(events, float).ravel()).tobytes()).hexdigest()
+    rec.update(extra)
+    text = json.dumps(rec, sort_keys=True)
+    return hashlib.sha256(text.encode()).hexdigest(), text
+
+
+def _stored_settings(path):
+    """(hash or None, settings dict or None) stored in an epoch file"""
+    with np.load(path) as z:
+        h = str(z['settings_hash']) if 'settings_hash' in z.files else None
+        rec = json.loads(str(z['settings'])) if 'settings' in z.files else None
+    return h, rec
+
+
+def epoch_files(out_dir):
+    return [p for p in sorted(glob.glob(os.path.join(out_dir, 'epoch_*.npz'))) if not p.endswith('.tmp.npz')]
+
+
+def check_resume(out_dir, digest, text, overwrite):
+    """the epochs already in out_dir were conditioned with these settings, or else: SystemExit naming the settings
+    that differ; with overwrite, the others are deleted (to be recomputed).  returns the number deleted"""
+    other = []
+    for path in epoch_files(out_dir):
+        h, rec = _stored_settings(path)
+        if h != digest:
+            other.append((path, h, rec))
+    if not other:
+        return 0
+    if not overwrite:
+        now = json.loads(text)
+        names = sorted({k for _, _, rec in other if rec is not None for k in set(rec) | set(now)
+                        if rec.get(k) != now.get(k)})
+        if any(rec is None for _, _, rec in other):
+            names.append('(settings not recorded in %d epochs: conditioned before they were stored)'
+                         % sum(rec is None for _, _, rec in other))
+        raise SystemExit('%s: %d of its %d epochs were conditioned with other settings (differing: %s; hashes %s, now '
+                         '%s).  Use another folder, or --overwrite to recompute those epochs.'
+                         % (out_dir, len(other), len(epoch_files(out_dir)), ', '.join(names) or 'none found',
+                            ', '.join(sorted({str(h)[:12] for _, h, _ in other})), digest[:12]))
+    for path, _, _ in other:
+        os.remove(path)
+    return len(other)
+
+
 def header(a, kw, source, events_source):
     return ['exmarg conditioned segments, scripts/real_data/condition.py, %s' % time.strftime('%Y-%m-%d %H:%M'),
             'input %s' % source, 'events %s (margin %g s)' % (events_source, a.event_margin),
@@ -363,8 +425,10 @@ def run_gwosc(a):
         os.remove(path)
     t0 = time.time()
     events, events_source = catalogue(a.out_dir, a.events)
-    tl = timeline(a.in_dir, a.require_dq.split(','), a.require_inj.split(','), a.workers)
     kw = settings(a)
+    digest, text = settings_record(kw, events, require_dq=a.require_dq.split(','), require_inj=a.require_inj.split(','))
+    check_resume(a.out_dir, digest, text, a.overwrite)
+    tl = timeline(a.in_dir, a.require_dq.split(','), a.require_inj.split(','), a.workers)
     pad = a.T if a.pad is None else a.pad
     stretches, jobs = plan(tl['good'], tl['gps0'], tl['fs'], a.T, a.N, pad, a.block, a.reference == 'epoch')
     span = (tl['gps0'], tl['gps0'] + tl['good'].size)
@@ -380,7 +444,8 @@ def run_gwosc(a):
             fh.write('%d %d %d\n' % s)
     todo = [j for j in jobs if not all(os.path.exists(os.path.join(a.out_dir, n)) for n in j['names'])]
     print('%d blocks to run (%d done before), %d workers' % (len(todo), len(jobs) - len(todo), a.workers), flush=True)
-    cfg = dict(tl=tl, settings=kw, events=events, out_dir=a.out_dir, notch_file=a.notches_file or '')
+    cfg = dict(tl=tl, settings=kw, events=events, out_dir=a.out_dir, notch_file=a.notches_file or '',
+               settings_hash=digest, settings_text=text)
     t1, done, written = time.time(), 0, 0
     if a.workers <= 1:
         _init(cfg)
@@ -423,7 +488,9 @@ def run_arrays(a):
     events = np.loadtxt(a.events, ndmin=2)[:, 0] if a.events else ()
     os.makedirs(a.out_dir, exist_ok=True)
     kw = settings(a)
-    total = 0
+    digest, text = settings_record(kw, events, require=a.require, fs=a.fs, gps=a.gps)
+    check_resume(a.out_dir, digest, text, a.overwrite)
+    written = 0
     for s0, s1 in runs(good):
         sl = slice(s0 * int(fs), s1 * int(fs))
         eps = strain.condition(x['H']['strain'][sl], x['L']['strain'][sl], fs, t0 + s0, events=events,
@@ -432,14 +499,15 @@ def run_arrays(a):
         for ep in eps:
             if not os.path.exists(os.path.join(a.out_dir, epoch_name(ep['gps_epoch']))):
                 ep.update(stretch=np.array([t0 + s0, t0 + s1], float), notch_file=a.notches_file or '',
-                          u_ratio_60=u_ratio(ep))
+                          u_ratio_60=u_ratio(ep), settings_hash=digest, settings=text)
                 write(a.out_dir, ep)
-        total += len(eps)
+                written += 1
         print('stretch GPS %d + %d s: %d epochs, %d s of segments, %d events flagged'
               % (t0 + s0, s1 - s0, len(eps), len(eps) * (a.N + 1) * a.T, sum(int(ep['event'].sum()) for ep in eps)),
               flush=True)
-    write_manifest(a.out_dir, header(a, kw, ' '.join(a.inputs[:2]), a.events or 'none'))
-    print('%d epochs written to %s (%d coincident good seconds of %d)' % (total, a.out_dir, good.sum(), good.size))
+    n_ep = write_manifest(a.out_dir, header(a, kw, ' '.join(a.inputs[:2]), a.events or 'none'))[0]
+    print('%d epochs in %s, %d written by this run (%d coincident good seconds of %d)'
+          % (n_ep, a.out_dir, written, good.sum(), good.size))
     return 0
 
 
@@ -477,6 +545,8 @@ def main(argv=None):
     p.add_argument('--flag-iterations', type=int, default=10)
     p.add_argument('--min-blocks', type=int, default=16, help='an epoch is usable when its estimates rest on at least '
                                                                'this many unflagged blocks')
+    p.add_argument('--overwrite', action='store_true', help='recompute (delete first) the epochs of the folder that '
+                   'were conditioned with other settings, instead of stopping')
     p.add_argument('--workers', type=int, default=min(16, os.cpu_count() or 1), help='GWOSC input: processes')
     p.add_argument('--block', type=int, default=24, help='GWOSC input: epochs per block (0: whole stretches)')
     a = p.parse_args(argv)
