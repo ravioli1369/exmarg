@@ -187,7 +187,8 @@ def describe(cfg):
     return text
 
 
-def fit(folder, n_state=N_STATE, basis='bins', rho_min=RHO[0], rho_max=RHO[1], veto_w=VETO_W, zone=ZONE):
+def fit(folder, n_state=N_STATE, basis='bins', rho_min=RHO[0], rho_max=RHO[1], veto_w=VETO_W, zone=ZONE,
+        record=RECORD):
     """the fits and the model of the folder: dict lines (the report), model (the content of glitch_model.json without
     its sha256), ok (every fit converged), fits {I: {K: fit_windows result}}, keep (n,), cols, data"""
     if basis not in ('bins', 'power'):
@@ -212,7 +213,7 @@ def fit(folder, n_state=N_STATE, basis='bins', rho_min=RHO[0], rho_max=RHO[1], v
     n = d['k'].size
     loud = {I: d['wmax_' + I] > veto_w for I in 'HL'}
     keep = ~(loud['H'] | loud['L'])
-    Ks = sorted(set(RECORD) | {n_state})
+    Ks = sorted(set(record) | {n_state})
     R = {}
     for I in 'HL':
         E = evidences(paths, I, keep, cols)
@@ -221,8 +222,9 @@ def fit(folder, n_state=N_STATE, basis='bins', rho_min=RHO[0], rho_max=RHO[1], v
     ok = all(R[I][K]['converged'] for I in 'HL' for K in Ks)
 
     L = ['glitch model of the window evidences of %s (docs/glitch_likelihood.md, Sec. 4a)' % folder, describe(cfg),
-         '%d segments in %d files, k %d to %d; %d windows of %.4g s; evidences stored on rho %.4g to %.4g'
-         % (n, len(paths), d['k'][0], d['k'][-1], nw, cfg['T'] / nw, edges[0], edges[-1]),
+         '%d segments in %d files, k %d to %d; %d windows%s; evidences stored on rho %.4g to %.4g'
+         % (n, len(paths), d['k'][0], d['k'][-1], nw, ' of %.4g s' % (cfg['T'] / nw) if 'T' in cfg else '',
+            edges[0], edges[-1]),
          'loudness veto: set aside %d segments whose wmax_H or wmax_L exceeds %g (H %d, L %d); fitted on %d'
          % ((~keep).sum(), veto_w, loud['H'].sum(), loud['L'].sum(), keep.sum()),
          'fitted bins: %d, rho %.4g to %.4g (the law is zero outside); amplitude basis: %s' % (
@@ -318,10 +320,14 @@ def main(argv=None):
     p.add_argument('--basis', choices=('bins', 'power'), default='bins',
                    help='the amplitude law: a free weight per bin, or a mixture of power laws rho^-g')
     p.add_argument('--zone', type=int, default=ZONE, help='windows on each side of a window in its zone')
+    p.add_argument('--record', default=','.join(map(str, RECORD)),
+                   help='numbers of states fitted for the record besides --n-state (comma-separated; a fit of 3 '
+                        'states of a week takes several minutes)')
     a = p.parse_args(argv)
     if not (0 <= a.rho_min < a.rho_max) or a.n_state < 1 or a.zone < 0:
         p.error('need 0 <= rho-min < rho-max, n-state >= 1, zone >= 0')
-    r = fit(a.folder, a.n_state, a.basis, a.rho_min, a.rho_max, a.veto_w, a.zone)
+    r = fit(a.folder, a.n_state, a.basis, a.rho_min, a.rho_max, a.veto_w, a.zone,
+            tuple(int(x) for x in a.record.split(',') if x))
     print('\n'.join(r['lines']), flush=True)
     if not r['ok']:
         return 1
