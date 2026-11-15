@@ -110,3 +110,38 @@ def test_slot_and_scan(tmp_path):
     (tmp_path / 'H1' / (name + '.part')).touch()
     found = gwosc._scan(str(tmp_path))
     assert list(found) == [GPS] and set(found[GPS]) == {'H1', 'L1'}
+
+
+class FakeLocate:
+    """gwosc.locate for a run with files in some slots only: get_urls raises ValueError, as the library does, unless
+    the first and the last slot of the range both have a file"""
+
+    def __init__(self, have):
+        self.have, self.calls = have, 0
+
+    def get_urls(self, det, a, b, dataset=None, sample_rate=None, format=None):
+        self.calls += 1
+        slots = range(a // gwosc.SLOT * gwosc.SLOT, b + 1, gwosc.SLOT)
+        if slots[0] not in self.have[det] or slots[-1] not in self.have[det]:
+            raise ValueError('Cannot find a GWOSC dataset for %s covering [%d, %d)' % (det, a, b + 1))
+        return ['https://x/%s-%s_GWOSC_O3a_4KHZ_R1-%d-%d.hdf5' % (det[0], det, t, gwosc.SLOT)
+                for t in slots if t in self.have[det]]
+
+
+def test_list_pairs_with_empty_slots_at_the_edges(monkeypatch):
+    """a range whose first or last slot has no file in one detector gives the pairs of the slots that have both"""
+    t0 = 302697 * gwosc.SLOT
+    slot = lambda *i: {t0 + k * gwosc.SLOT for k in i}
+    fake = FakeLocate({'H1': slot(1, 2, 3, 5), 'L1': slot(0, 1, 3, 4, 5, 6)})    # H1 misses both edges, L1 the last
+    monkeypatch.setattr(gwosc, '_locate', lambda: fake)
+    pairs = gwosc.list_pairs(t0, t0 + 8 * gwosc.SLOT, run='O3a')
+    assert [p[0] for p in pairs] == sorted(slot(1, 3, 5))
+    assert all('H-H1' in p[1] and 'L-L1' in p[2] for p in pairs)
+    # every edge present: one request per detector, the same answer as before the fix
+    full = FakeLocate({'H1': slot(0, 1, 2), 'L1': slot(0, 1, 2)})
+    monkeypatch.setattr(gwosc, '_locate', lambda: full)
+    assert [p[0] for p in gwosc.list_pairs(t0, t0 + 3 * gwosc.SLOT)] == sorted(slot(0, 1, 2)) and full.calls == 2
+    # no file at all in one detector: no pair, and no exception
+    none = FakeLocate({'H1': set(), 'L1': slot(0, 1)})
+    monkeypatch.setattr(gwosc, '_locate', lambda: none)
+    assert gwosc.list_pairs(t0, t0 + 2 * gwosc.SLOT) == []

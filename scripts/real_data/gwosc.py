@@ -57,10 +57,38 @@ def list_pairs(gps_start, gps_end, run='O3b'):
     locate = _locate()
     urls = {}
     for det in DETECTORS:
-        found = locate.get_urls(det, int(gps_start), int(gps_end) - 1, dataset=run, sample_rate=4096, format='hdf5')
-        urls[det] = {_slot(u): u for u in found}
+        urls[det] = {_slot(u): u for u in _urls(locate, det, int(gps_start), int(gps_end), run)}
     return [(t, urls['H1'][t], urls['L1'][t]) for t in sorted(urls['H1'].keys() & urls['L1'].keys())
             if t < gps_end and t + SLOT > gps_start]
+
+
+def _urls(locate, det, gps_start, gps_end, run):
+    """the file urls of one detector overlapping [gps_start, gps_end).  gwosc.locate.get_urls raises ValueError unless
+    the first and the last slot of the range both have a file, so the range is narrowed from each end to the first
+    slot that has one; [] when none has"""
+    def get(a, b):
+        return locate.get_urls(det, a, b - 1, dataset=run, sample_rate=4096, format='hdf5')
+
+    try:
+        return get(gps_start, gps_end)
+    except ValueError:
+        pass
+    slots = range(gps_start // SLOT * SLOT, gps_end, SLOT)
+
+    def first(order):
+        for t in order:
+            try:
+                get(max(t, gps_start), min(t + SLOT, gps_end))
+                return t
+            except ValueError:
+                continue
+        return None
+
+    lo = first(slots)
+    if lo is None:
+        return []
+    hi = first(reversed(slots))
+    return get(max(lo, gps_start), min(hi + SLOT, gps_end))
 
 
 def _open(url, headers=None):
