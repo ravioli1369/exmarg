@@ -13,12 +13,20 @@ frozen criteria: on the controls nbar within 2.5 standard errors of 0 or at the 
 ln 100, for the mixture and, on the phase-randomized week only, for the Gaussian likelihood too (on the slid and
 reversed weeks the Gaussian likelihood is expected to fail: a control of the test); on the injections the mixture nbar
 within 2.5 sigma of the injected rate.  Without --recorded the directory of the recorded week is not opened.  Exit
-status 1 when a control is missing or fails.
+status 1 when a control fails.
+
+Before any fit, <out>/selection.txt is read (analyse.py writes it) and every variant that is used must cover the
+segments k = 0 .. n_selected - 1 exactly once (no gap, no segment in two files, none missing at the end), and the
+controls must carry the same campaign (every key of the files' meta that the variant does not define: manifest hash,
+seed, segment folder, ymin, zmin, ...).  The recorded week is checked from the names of its files alone.  A violation is
+an error that names the variant and what is missing, and nothing is fitted.
 """
 import argparse
 import glob
 import importlib.util
+import json
 import os
+import re
 import sys
 
 import numpy as np
@@ -35,6 +43,113 @@ RECORDED = 'zero'
 HEAD = ('variant', 'kept', 'aside', 'Gaussian nbar', 'mixture nbar', 'eps_H', 'eps_L', 'gamma_H', 'gamma_L',
         'Gaussian ev. end/max', 'mixture ev. end/max', 'verdict')
 WIDTH = (11, 7, 6, 20, 20, 15, 15, 8, 8, 21, 21, 0)
+
+
+# the meta entries that belong to a variant: the others must be the same in every variant of the week
+VARIANT_KEYS = ('variant', 'control', 'nbar', 'shift', 'merger_truth', 'truth_note')
+FILE = re.compile(r'^plant_(\d+)_(\d+)\.npz$')
+
+
+def selected_total(out):
+    """the number of selected segments of selection.txt (epoch, GPS, segments, selected, first k per line)"""
+    path = os.path.join(out, 'selection.txt')
+    if not os.path.exists(path):
+        raise SystemExit('%s: no selection.txt: the number of segments the week should have is not known' % out)
+    with open(path) as fh:
+        rows = [line.split() for line in fh if line.strip()]
+    return sum(int(r[3]) for r in rows)
+
+
+def _ranges(ks, n):
+    """'k a to b, ...' for the runs of the sorted unique indices ks, within 0 .. n - 1 as given"""
+    ks = np.asarray(sorted(ks), int)
+    if not ks.size:
+        return 'none'
+    cut = np.flatnonzero(np.diff(ks) > 1) + 1
+    runs = [(g[0], g[-1]) for g in np.split(ks, cut)]
+    return ', '.join('k %d to %d' % r if r[0] != r[1] else 'k %d' % r[0] for r in runs)
+
+
+def coverage(out, variant, n, opened):
+    """the problems (list of text) of the files of out/variant against k = 0 .. n - 1: a segment missing, in more than
+    one file, or beyond n; the name of a file that is not of the form plant_<first>_<end>.npz; with opened, the k of
+    each file against its name.  Returns (problems, meta of the files or None when not opened)"""
+    path = os.path.join(out, variant)
+    names = sorted(os.path.basename(p) for p in glob.glob(os.path.join(path, 'plant_*.npz')))
+    if not names:
+        return ['%s: no files in %s; all %d segments (k 0 to %d) missing' % (variant, path, n, n - 1)], None
+    count, problems, metas = np.zeros(max(n, 1), int), [], []
+    over = []
+    for name in names:
+        m = FILE.match(name)
+        if not m:
+            problems.append('%s: file name %s is not plant_<first k>_<end k>.npz' % (variant, name))
+            continue
+        a, b = int(m.group(1)), int(m.group(2))
+        if opened:
+            with np.load(os.path.join(path, name)) as z:
+                k = z['k']
+                metas.append((name, json.loads(str(z['meta']))))
+            if not np.array_equal(k, np.arange(a, b)):
+                problems.append('%s: %s holds segments other than k %d to %d' % (variant, name, a, b - 1))
+        count[a:min(b, n)] += 1
+        over += list(range(max(a, n), b))
+    miss, twice = np.flatnonzero(count[:n] == 0), np.flatnonzero(count[:n] > 1)
+    if miss.size:
+        problems.append('%s: %d of %d segments missing: %s (files present cover %s)'
+                        % (variant, miss.size, n, _ranges(miss, n), _ranges(np.flatnonzero(count[:n] > 0), n)))
+    if twice.size:
+        problems.append('%s: segments in more than one file: %s' % (variant, _ranges(twice, n)))
+    if over:
+        problems.append('%s: segments beyond the %d selected: %s' % (variant, n, _ranges(over, n)))
+    return problems, metas if opened else None
+
+
+def campaign_problems(metas):
+    """{variant: [(file, meta)]} -> the problems (list of text): a key that the variant does not define differs from
+    the first variant's, or the files of a variant differ among themselves, or meta['variant'] is not the folder"""
+    problems, ref, ref_name = [], None, None
+    for v, files in metas.items():
+        own = None
+        for name, meta in files:
+            meta = {k: x for k, x in meta.items() if k != 'run'}
+            if meta.get('variant') != v:
+                problems.append('%s: %s says it is variant %r' % (v, name, meta.get('variant')))
+            mine = {k: x for k, x in meta.items() if k in VARIANT_KEYS}
+            common = {k: x for k, x in meta.items() if k not in VARIANT_KEYS}
+            if own is None:
+                own = mine
+            elif mine != own:
+                problems.append('%s: %s differs from the other files of the variant in %s'
+                                % (v, name, ', '.join(sorted(k for k in set(mine) | set(own) if mine.get(k) != own.get(k)))))
+            if ref is None:
+                ref, ref_name = common, '%s/%s' % (v, name)
+            elif common != ref:
+                keys = sorted(k for k in set(common) | set(ref) if common.get(k) != ref.get(k))
+                problems.append('%s: %s belongs to another campaign than %s (differs in %s)'
+                                % (v, name, ref_name, ', '.join(keys)))
+    return problems, ref
+
+
+def check_week(out, variants, recorded_by_name=()):
+    """the guard: SystemExit with every problem when a variant of `variants` does not cover k = 0 .. n_selected - 1 once
+    each, or the files of the variants disagree on the campaign; the variants of recorded_by_name are checked from the
+    file names alone (their files are not opened).  returns (n_selected, the common campaign keys)"""
+    n = selected_total(out)
+    problems, metas = [], {}
+    for v in variants:
+        p, m = coverage(out, v, n, True)
+        problems += p
+        if m:
+            metas[v] = m
+    for v in recorded_by_name:
+        problems += coverage(out, v, n, False)[0]
+    p, ref = campaign_problems(metas)
+    problems += p
+    if problems:
+        raise SystemExit('%s: the week is not complete or not one campaign, nothing is fitted:\n  %s'
+                         % (out, '\n  '.join(problems)))
+    return n, ref
 
 
 def _pm(r, p, fmt):
@@ -73,11 +188,12 @@ def table(rows):
     return [fmt(HEAD)] + [fmt(c) for c in rows]
 
 
-def fit(out, variant, a):
+def fit(out, variant, a, expected=None):
     path = os.path.join(out, variant)
     if not glob.glob(os.path.join(path, 'plant_*.npz')):
         return None
-    return plant_fit.report(path, veto_w=a.veto_w, w_inf_max=a.w_inf_max, rho_mins=a.rho_min, monitor_cut=a.monitor_cut)
+    return plant_fit.report(path, veto_w=a.veto_w, w_inf_max=a.w_inf_max, rho_mins=a.rho_min, monitor_cut=a.monitor_cut,
+                            expected=expected)
 
 
 def main(argv=None):
@@ -90,9 +206,10 @@ def main(argv=None):
     p.add_argument('--monitor-cut', type=float, default=None, help='as plant_fit.py: set aside segments with a band '
                    'power this many widths above the median')
     a = p.parse_args(argv)
+    n_selected, campaign = check_week(a.out, ORDER, (RECORDED,) if a.recorded else ())
     results = {}
     for v in ORDER:
-        results[v] = fit(a.out, v, a)
+        results[v] = fit(a.out, v, a, n_selected)
         print('fitted %s' % v if results[v] is not None else 'no files in %s' % os.path.join(a.out, v), flush=True)
     rho = next((r['rho_min'] for r in results.values() if r is not None), None)
     print('\nthe week, in the order fixed before the first run; loudness veto w > %g%s, glitch law from rho_min %s; '
@@ -109,7 +226,13 @@ def main(argv=None):
         print('\n--recorded: controls and injections checked again, NOT all pass: the week as recorded stays closed.')
         return 1
     print('\n--recorded: controls and injections checked again, all pass: opening the week as recorded.', flush=True)
-    r = fit(a.out, RECORDED, a)
+    r = fit(a.out, RECORDED, a, n_selected)
+    other = sorted(k for k in set(r['cfg']) - set(VARIANT_KEYS) | set(campaign) - set(VARIANT_KEYS)
+                   if r['cfg'].get(k) != campaign.get(k))
+    if other:
+        print('\n--recorded: the files of %s belong to another campaign than the controls (differ in %s): not shown.'
+              % (RECORDED, ', '.join(other)))
+        return 1
     print('\n'.join(table([row(RECORDED, r)])[1:]))
     if r is not None:
         print('\n' + '\n'.join(r['lines']))

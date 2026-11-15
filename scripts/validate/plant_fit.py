@@ -1,7 +1,7 @@
 """The fits of a planted campaign of plant.py (controls 4 to 9 of docs/glitch_likelihood.md, Sec. 7), on the CPU, with
 the truth alongside.  Exit status 1 when a criterion fails.
 
-    python scripts/validate/plant_fit.py runs/template [--rho-min-fit]
+    python scripts/validate/plant_fit.py runs/template [--rho-min-fit] [--expected N]
 
 For all the segments of the directory together it prints
   - the planted (expected) and realized numbers: segments, mergers, glitches per detector, mergers sharing a segment
@@ -234,8 +234,18 @@ def _consistent_with_zero(r):
     return bool(r['nbar'] <= 1e-9 or r['nbar'] < PULL * e), e
 
 
+def missing_text(k, expected=None):
+    """the missing segments of the sorted indices k: '<n> missing in between', and with the expected total (k from 0 to
+    expected - 1) '<n> missing in between, <a> at the start and <b> at the end of the <expected> expected'"""
+    between = int(k[-1] - k[0] + 1 - k.size)
+    if expected is None:
+        return '%d missing in between' % between
+    return '%d missing in between, %d at the start and %d at the end of the %d expected' % (
+        between, k[0], expected - 1 - k[-1], expected)
+
+
 def report(directory, rho_min_fit=False, veto_w=VETO_W, w_inf_max=W_INF_MAX, rho_mins=None, veto_law='hard',
-           veto_offset=VETO_OFFSET, veto_width=VETO_WIDTH, monitor_cut=None):
+           veto_offset=VETO_OFFSET, veto_width=VETO_WIDTH, monitor_cut=None, expected=None):
     """everything plant_fit prints: dict with lines (the text), kind, counts, keep, rho_cut, fits, scan, unit, curves,
     criteria [(name, ok, text, counted)], ok (every counted criterion passes).  rho_mins: lower ends of the fitted
     glitch law, the first for every fit and criterion, all of them for the joint fit side by side (default: the
@@ -244,7 +254,9 @@ def report(directory, rho_min_fit=False, veto_w=VETO_W, w_inf_max=W_INF_MAX, rho
     veto_offset) / veto_width) (mixture.amplitude_weights).  With either, the fitted slopes of the glitch law are biased
     (gamma +0.27, 6 sigma, at 300000 toy segments, none when the veto acts on the true SNR) while nbar and eps are not:
     the per-bin evidences assume the amplitude uniform inside a bin, and the veto on the noisy measured SNR changes that
-    next to the cut (the conditioning of docs/glitch_likelihood.md, Sec. 8)"""
+    next to the cut (the conditioning of docs/glitch_likelihood.md, Sec. 8).  expected: the number of segments the
+    campaign should have (k = 0 .. expected - 1; real data, where the files do not carry their own range): the
+    segments missing at the start and at the end are reported too, not only those in between"""
     cfg, edges, d, runs, cells = load(directory)
     planted, kind = truth(cfg)
     glitch_known = cfg.get('glitch_truth', True)
@@ -254,7 +266,7 @@ def report(directory, rho_min_fit=False, veto_w=VETO_W, w_inf_max=W_INF_MAX, rho
     rho0 = float(rho_mins[0])
     n = d['k'].size
     L = []
-    gaps = int(d['k'][-1] - d['k'][0] + 1 - n)
+    gaps = missing_text(d['k'], expected)
     if cfg.get('source') == 'strain':
         what = {'recorded': 'THE WEEK AS RECORDED: no truth, no pull and no criterion on nbar',
                 'control': 'a control, no coherent merger: nbar truth 0, the frozen criteria of docs/real_data.md',
@@ -265,8 +277,7 @@ def report(directory, rho_min_fit=False, veto_w=VETO_W, w_inf_max=W_INF_MAX, rho
         L.append('campaign: seed %d, control %s, nbar %g, eps_H %g, eps_L %g, glitches %s, dN/drho ~ rho^-%g on '
                  '[%g, %g]' % (cfg['seed'], cfg['control'], cfg['nbar'], cfg['eps_H'], cfg['eps_L'],
                                cfg['glitch_kind'], cfg['gamma'], cfg['rho_min'], cfg['rho_max']))
-    L.append('%d segments in %d files, k %d to %d (%d missing in between)'
-             % (n, len(runs), d['k'][0], d['k'][-1], gaps))
+    L.append('%d segments in %d files, k %d to %d (%s)' % (n, len(runs), d['k'][0], d['k'][-1], gaps))
     t = {key: [r[key] for r in runs if r.get(key) is not None] for key in ('t_sim', 't_pe', 't_plain')}
     L.append('cost per segment: simulation %s s, analysis %s s, plain analysis %s s (mean over files)'
              % tuple(_f(np.mean(v) if v else np.nan, '%.4f') for v in t.values()))
@@ -503,9 +514,12 @@ def main(argv=None):
                         'widths (half the 16 to 84 percent range) above the median (needs the monitors of analyse.py)')
     p.add_argument('--veto-offset', type=float, default=VETO_OFFSET, help='soft: mean of sqrt(2 wmax) - rho')
     p.add_argument('--veto-width', type=float, default=VETO_WIDTH, help='soft: its standard deviation')
+    p.add_argument('--expected', type=int, default=None,
+                   help='real data: the number of segments of the campaign (k = 0 .. N - 1), to report those missing '
+                        'at the start and at the end (planted campaigns carry their own range)')
     a = p.parse_args(argv)
     r = report(a.results, a.rho_min_fit, a.veto_w, a.w_inf_max, a.rho_min, a.veto_law, a.veto_offset, a.veto_width,
-               a.monitor_cut)
+               a.monitor_cut, a.expected)
     print('\n'.join(r['lines']), flush=True)
     return 0 if r['ok'] else 1
 

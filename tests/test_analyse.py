@@ -4,6 +4,7 @@ on real-data directories): the variants of a synthetic epoch file (strain.write_
 truth, and the guard that keeps the recorded week closed until the controls pass"""
 import glob
 import importlib.util
+import json
 import os
 
 import numpy as np
@@ -242,6 +243,55 @@ def test_driver_parts_and_variants(week, tmp_path):
                      '1266934560', '33', '33', '61']
 
 
+def with_hashes(week, folder, hashes):
+    """a copy of the week's folder in which the epoch files (in time order) carry settings_hash = hashes[i] (None: left
+    without)"""
+    import shutil
+    shutil.copytree(week, folder)
+    for name, h in zip(sorted(f for f in os.listdir(folder) if f.startswith('epoch_')), hashes):
+        ep = strain.read_epoch(os.path.join(folder, name))
+        if h is not None:
+            ep['settings_hash'] = h
+        strain.write_epoch(os.path.join(folder, name), ep)
+    return str(folder)
+
+
+def test_settings_hash_one_across_the_epochs(week, tmp_path):
+    """selection (so run) reads the settings hash of every epoch: none anywhere (a folder conditioned before it was
+    stored) and one everywhere are accepted, with the same selection; hashed with unhashed, or two hashes, stop with a
+    message naming the epochs"""
+    base = analyse.selection(week)
+    same = with_hashes(week, tmp_path / 'same', ['a' * 64] * 4)
+    assert analyse.selection(same) == base
+    with pytest.raises(SystemExit, match='epoch_1266934296.npz') as err:
+        analyse.selection(with_hashes(week, tmp_path / 'mixed', ['a' * 64, 'a' * 64, None, 'a' * 64]))
+    assert 'settings' in str(err.value)
+    with pytest.raises(SystemExit, match='settings'):
+        analyse.selection(with_hashes(week, tmp_path / 'two', ['a' * 64, 'a' * 64, 'b' * 64, 'b' * 64]))
+    a = analyse.parse(['x', 'cpu', str(tmp_path / 'mixed'), '--out', str(tmp_path / 'o')])[1]
+    with pytest.raises(SystemExit, match='settings'):
+        analyse.run(a, Stub().factory)
+
+
+def test_manifest_hash_is_that_of_the_epoch_rows(week, tmp_path):
+    """the manifest hash of a campaign does not change when condition.py is run again and writes another timestamp in
+    the header (the earlier outputs would otherwise be refused), but does when a row changes"""
+    import shutil
+    a = analyse.parse(['x', 'cpu', week, '--out', 'x'])[1]
+    digest = analyse.campaign(a, week, 'pr')['manifest_sha256']
+    again = tmp_path / 'again'
+    shutil.copytree(week, again)
+    with open(os.path.join(week, 'manifest.txt')) as fh:
+        lines = fh.readlines()
+    with open(again / 'manifest.txt', 'w') as fh:
+        fh.writelines(['# exmarg conditioned segments, 2030-01-01 00:00\n', '# a second header line\n'] + lines[1:])
+    assert analyse.campaign(a, str(again), 'pr')['manifest_sha256'] == digest
+    lines[2] = lines[2].replace(' 33 33 ', ' 33 32 ')
+    with open(again / 'manifest.txt', 'w') as fh:
+        fh.writelines(lines)
+    assert analyse.campaign(a, str(again), 'pr')['manifest_sha256'] != digest
+
+
 # ----------------------------------------------------------------------------------------------- plant_fit on the week
 
 
@@ -278,6 +328,8 @@ TOY_VARIANTS = dict(pr=(0.0, 0.0), rev=(0.0, 0.10), **{'slide+0.5': (0.0, 0.10),
 def toy_week(week, tmp_path_factory):
     out = tmp_path_factory.mktemp('toy_week')
     made = {v: write_toy_variant(str(out / v), week, v, *TOY_VARIANTS[v]) for v in TOY_VARIANTS}
+    with open(out / 'selection.txt', 'w') as fh:                       # one epoch of the 6000 toy segments
+        fh.write('epoch_1266933768.npz 1266933768 6000 6000 0\n')
     return str(out), made
 
 
@@ -323,13 +375,43 @@ def test_plant_fit_on_the_week(toy_week):
     J = r['fits']['joint']
     assert r['kind'] == 'plant' and r['truth']['nbar'] == 0.05
     crit = {name: ok for name, ok, _, _ in r['criteria']}
-    assert crit['mixture nbar within 2.5 sigma of the truth'] == (abs(J['nbar'] - 0.05) < 2.5 * J['err']['nbar'])
+    # 300 injected mergers in 5814 kept segments: the rate is recovered (0.0442 +- 0.0047, 1.2 sigma low) and the
+    # criterion passes ...
+    assert 0.035 < J['nbar'] < 0.065 and 0.003 < J['err']['nbar'] < 0.007, J
+    assert crit['mixture nbar within 2.5 sigma of the truth'] is True and r['ok']
+    # ... and it can fail: the same files claimed to hold mergers at 0.2 (4 times the injected rate, 33 sigma away)
+    wrong = os.path.join(out, 'inj_wrong_rate')
+    os.makedirs(wrong)
+    for path in glob.glob(os.path.join(out, 'inj', 'plant_*.npz')):
+        with np.load(path) as f:
+            arrays = {key: f[key] for key in f.files}
+        meta = json.loads(str(arrays.pop('meta')))
+        np.savez(os.path.join(wrong, os.path.basename(path)), meta=np.array(json.dumps(dict(meta, nbar=0.2))), **arrays)
+    r = plant_fit.report(wrong)
+    crit = {name: ok for name, ok, _, _ in r['criteria']}
+    assert crit['mixture nbar within 2.5 sigma of the truth'] is False and not r['ok']
+
+
+def test_plant_fit_reports_segments_missing_at_the_end(toy_week):
+    """plant_fit counted only the gaps in between: with the expected total, the segments missing at the start and at
+    the end are reported (and the line is that of the plants without it)"""
+    out, _ = toy_week
+    k = np.arange(10, 5990)
+    assert plant_fit.missing_text(k) == '0 missing in between'
+    assert plant_fit.missing_text(np.r_[k[:100], k[200:]]) == '100 missing in between'
+    assert plant_fit.missing_text(k, 6000) == '0 missing in between, 10 at the start and 10 at the end of the 6000 ' \
+        'expected'
+    d = os.path.join(out, 'pr')
+    assert '(0 missing in between)' in plant_fit.report(d, rho_mins=[5.0])['lines'][1]
+    line = plant_fit.report(d, rho_mins=[5.0], expected=6100)['lines'][1]
+    assert '0 missing in between, 0 at the start and 100 at the end of the 6100 expected' in line, line
 
 
 # ----------------------------------------------------------------------------------------------- summarize
 
 
-def fake_report(log, failing=()):
+def fake_report(log, failing=(), cfgs=None):
+    """plant_fit.report in place: the campaign (meta) of each variant is cfgs[variant] (default: none)"""
     def report(path, **kw):
         v = os.path.basename(path)
         log.append(v)
@@ -339,18 +421,40 @@ def fake_report(log, failing=()):
         fitted = dict(nbar=0.01, err=dict(nbar=0.01, eps_H=0.001, eps_L=0.001), eps_H=0.01, eps_L=0.02, gamma_H=3.0,
                       gamma_L=3.5)
         return dict(kind='recorded' if v == 'zero' else 'control', ok=ok, criteria=crit, rho_min=5.0,
+                    cfg=(cfgs or {}).get(v, {}),
                     fits=dict(joint=fitted, gauss=fitted), curves=dict(gauss=np.zeros(3), mixture=np.zeros(3)),
                     keep=np.ones(10, bool), lines=['the report of %s' % v])
     return report
 
 
-def test_summarize_guard(tmp_path, monkeypatch, capsys):
+def guard_week(root, week, files=None, only=None):
+    """<root>/selection.txt of the synthetic week and, per variant, files covering k 0 .. n_selected - 1 in two halves
+    (files: {variant: [(first, end)]} instead); the files of controls hold k and the meta of analyse.campaign, those of
+    zero are empty (never to be opened).  returns n_selected"""
+    sel = analyse.selection(week)
+    n = sum(e['n_selected'] for e in sel)
+    os.makedirs(root, exist_ok=True)
+    analyse.record_selection(str(root), sel)
+    args = analyse.parse(['x', 'cpu', week, '--out', 'x', '--seed', '7'])[1]
+    for v in analyse.VARIANTS if only is None else only:
+        os.makedirs(os.path.join(root, v), exist_ok=True)
+        for first, end in (files or {}).get(v, [(0, n // 2), (n // 2, n)]):
+            path = os.path.join(root, v, 'plant_%010d_%010d.npz' % (first, end))
+            if v == 'zero':
+                open(path, 'wb').close()
+            else:
+                plant.write_batch(path, analyse.campaign(args, week, v), dict(first=first, end=end),
+                                  dict(k=np.arange(first, end)))
+    return n
+
+
+def test_summarize_guard(week, tmp_path, monkeypatch, capsys):
     """summarize: the controls in the fixed order (pr, rev, slide+0.5, slide-1.75, inj); without --recorded the
     recorded week is never opened, whatever the controls; with --recorded it is opened last and only when every control
-    passes, and says so; a failing or missing control keeps it closed, exit status 1"""
-    for v in analyse.VARIANTS:
-        os.makedirs(tmp_path / v)
-        (tmp_path / v / 'plant_0000000000_0000000001.npz').write_bytes(b'')
+    passes, and says so; a failing control keeps it closed, exit status 1"""
+    guard_week(tmp_path, week)
+    args = analyse.parse(['x', 'cpu', week, '--out', 'x', '--seed', '7'])[1]
+    cfgs = {v: analyse.campaign(args, week, v) for v in analyse.VARIANTS}
     order = list(summarize.ORDER)
     for argv, failing, opened, code, says in (
             ([], (), order, 0, 'is not opened'),
@@ -358,15 +462,83 @@ def test_summarize_guard(tmp_path, monkeypatch, capsys):
             (['--recorded'], ('slide-1.75',), order, 1, 'NOT all pass: the week as recorded stays closed'),
             ([], ('pr',), order, 1, 'NOT all pass')):
         log = []
-        monkeypatch.setattr(summarize.plant_fit, 'report', fake_report(log, failing))
+        monkeypatch.setattr(summarize.plant_fit, 'report', fake_report(log, failing, cfgs))
         assert summarize.main([str(tmp_path)] + argv) == code, (argv, failing)
         out = capsys.readouterr().out
         assert log == opened and says in out, (argv, failing, log, out)
-    os.remove(tmp_path / 'rev' / 'plant_0000000000_0000000001.npz')
+    # the recorded week of another campaign (opened last, once the controls pass): its numbers are not shown
+    log = []
+    monkeypatch.setattr(summarize.plant_fit, 'report', fake_report(log, (), dict(cfgs, zero=dict(cfgs['zero'], seed=9))))
+    assert summarize.main([str(tmp_path), '--recorded']) == 1
+    out = capsys.readouterr().out
+    assert 'another campaign' in out and 'seed' in out and 'the report of zero' not in out and log[-1] == 'zero'
+
+
+def refused(root, monkeypatch, *argv):
+    """summarize.main on root: the SystemExit message, and the variants fitted before it (must be none)"""
     log = []
     monkeypatch.setattr(summarize.plant_fit, 'report', fake_report(log))
-    assert summarize.main([str(tmp_path), '--recorded']) == 1 and 'zero' not in log
-    assert 'MISSING' in capsys.readouterr().out
+    with pytest.raises(SystemExit) as err:
+        summarize.main([str(root)] + list(argv))
+    assert log == [], 'something was fitted before the guard stopped the run: %s' % log
+    return str(err.value)
+
+
+def test_summarize_guard_covers_every_segment(week, tmp_path, monkeypatch):
+    """before any fit, every variant that is used must cover k = 0 .. n_selected - 1 once each: the first of two files
+    of each control only (the missing end), a gap in the middle, a segment in two files, a variant with no files, no
+    selection.txt, are hard errors that name the variant and what is missing; zero is checked from its file names alone
+    (its files here are empty and cannot be read), and only with --recorded"""
+    root = tmp_path / 'week'
+    n = guard_week(root, week)
+    h = n // 2
+    partial = tmp_path / 'partial'
+    guard_week(partial, week, {v: [(0, h)] for v in summarize.ORDER}, only=summarize.ORDER)
+    msg = refused(partial, monkeypatch)
+    assert all(v in msg for v in summarize.ORDER) and 'k %d to %d' % (h, n - 1) in msg and 'missing' in msg, msg
+    gap = tmp_path / 'gap'
+    guard_week(gap, week, {'rev': [(0, 10), (20, n)]})
+    msg = refused(gap, monkeypatch)
+    assert 'rev' in msg and 'k 10 to 19' in msg and len(msg.splitlines()) == 2, msg
+    twice = tmp_path / 'twice'
+    guard_week(twice, week, {'slide+0.5': [(0, h + 5), (h, n)]})
+    msg = refused(twice, monkeypatch)
+    assert 'slide+0.5' in msg and 'k %d to %d' % (h, h + 4) in msg and 'more than one file' in msg, msg
+    none = tmp_path / 'none'
+    guard_week(none, week, only=[v for v in summarize.ORDER if v != 'inj'])
+    msg = refused(none, monkeypatch)
+    assert 'inj' in msg and 'no files' in msg, msg
+    os.remove(root / 'selection.txt')
+    assert 'selection.txt' in refused(root, monkeypatch)
+    # zero: not looked at without --recorded, by its names only with it
+    short_zero = tmp_path / 'short_zero'
+    guard_week(short_zero, week, {'zero': [(0, h)]})
+    log = []
+    monkeypatch.setattr(summarize.plant_fit, 'report', fake_report(log))
+    assert summarize.main([str(short_zero)]) == 0 and 'zero' not in log
+    msg = refused(short_zero, monkeypatch, '--recorded')
+    assert 'zero' in msg and 'k %d to %d' % (h, n - 1) in msg, msg
+
+
+def test_summarize_guard_one_campaign(week, tmp_path, monkeypatch):
+    """the campaign keys of the files (everything of the meta that the variant does not define: manifest hash, seed,
+    segment folder, ymin, zmin, ...) are the same in every variant: one file of slide-1.75 with another ymin, seed or
+    manifest hash stops the run before a fit, naming the variant and the key; the keys that belong to the variant
+    (control, nbar, shift, ...) may differ"""
+    n = guard_week(tmp_path / 'ok', week)
+    log = []
+    monkeypatch.setattr(summarize.plant_fit, 'report', fake_report(log))
+    assert summarize.main([str(tmp_path / 'ok')]) == 0 and log == list(summarize.ORDER)
+    args = analyse.parse(['x', 'cpu', week, '--out', 'x', '--seed', '7'])[1]
+    for key, value in (('ymin', 0.5), ('seed', 8), ('manifest_sha256', 'f' * 64), ('segments', 'other'),
+                       ('zmin', 0.5), ('epochs_per_file', 3)):
+        root = tmp_path / ('bad_' + key)
+        guard_week(root, week, {'slide-1.75': [(0, n)]})
+        plant.write_batch(os.path.join(root, 'slide-1.75', 'plant_%010d_%010d.npz' % (0, n)),
+                          dict(analyse.campaign(args, week, 'slide-1.75'), **{key: value}), dict(first=0, end=n),
+                          dict(k=np.arange(n)))
+        msg = refused(root, monkeypatch)
+        assert 'slide-1.75' in msg and key in msg, (key, msg)
 
 
 def test_summarize_table(toy_week, capsys):
@@ -382,5 +554,6 @@ def test_summarize_table(toy_week, capsys):
         assert '%s+-%s' % (plant_fit._f(J['nbar'], '%.3g'), plant_fit._f(J['err']['nbar'], '%.2g')) in line, (v, line)
         assert line.split()[1] == str(int(r['keep'].sum()))
     assert not any(l.startswith('zero ') for l in text.splitlines()) and 'is not opened' in text
-    assert code in (0, 1)
+    assert code == 0 and 'all pass' in text                  # the toy controls have no mergers: all pass
+    assert all(l.split(None, 11)[-1].startswith('PASS') for l in text.splitlines() if l.split(' ')[0] in summarize.ORDER)
     print('\n' + text)

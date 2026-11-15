@@ -83,15 +83,30 @@ def selected(z):
     return np.asarray(z['analysable'], bool) & ~np.asarray(z['event'], bool) & bool(z['usable'])
 
 
+def manifest_digest(seg_dir):
+    """SHA-256 of the epoch rows of manifest.txt (the lines that are not comments): the header carries the time of the
+    run of condition.py and would change the hash of an unchanged week.  The manifests of weeks analysed before this
+    (whole file hashed) have another hash for the same rows; summarize.py only needs them to agree with each other"""
+    with open(os.path.join(seg_dir, 'manifest.txt'), 'rb') as fh:
+        rows = [line for line in fh.read().splitlines(keepends=True) if line.strip() and not line.startswith(b'#')]
+    return hashlib.sha256(b''.join(rows)).hexdigest()
+
+
 def selection(seg_dir):
     """every epoch of the manifest: dicts name, gps_epoch, n_segment, n_selected, k (the first k of its selected
-    segments)"""
-    out, k = [], 0
+    segments).  The epochs must carry one settings hash (condition.py), or none of them (conditioned before it was
+    stored); a mixture stops the run"""
+    out, k, hashes = [], 0, {}
     for name, gps in manifest(seg_dir):
         with np.load(os.path.join(seg_dir, name)) as z:
             sel = selected(z)
+            hashes[name] = str(z['settings_hash']) if 'settings_hash' in z.files else None
         out.append(dict(name=name, gps_epoch=gps, n_segment=int(sel.size), n_selected=int(sel.sum()), k=k))
         k += int(sel.sum())
+    try:
+        strain.one_settings_hash(hashes)
+    except ValueError as err:
+        raise SystemExit('%s: %s' % (seg_dir, err))
     return out
 
 
@@ -207,8 +222,7 @@ PER_SEGMENT = plant.KEYS + ('ln_glitch_H', 'ln_glitch_L', 'wmax_H', 'wmax_L')
 
 def campaign(a, seg_dir, variant):
     """the settings of one variant's files (the same in every file of it)"""
-    with open(os.path.join(seg_dir, 'manifest.txt'), 'rb') as fh:
-        digest = hashlib.sha256(fh.read()).hexdigest()
+    digest = manifest_digest(seg_dir)
     nbar = None if variant == 'zero' else a.nbar_inj if variant == 'inj' else 0.0
     cfg = dict(version=VERSION, source='strain', segments=os.path.basename(os.path.normpath(seg_dir)),
                manifest_sha256=digest, selection='usable epoch, analysable, no catalogued event', variant=variant,

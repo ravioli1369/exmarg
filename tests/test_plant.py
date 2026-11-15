@@ -202,7 +202,9 @@ def test_driver_with_stub(tmp_path, capsys):
     that of simulate_batch; ln_glitch_I is the template average of the stub's ln E; a second run finds every file and
     calls nothing; the same segments in one batch of 9 from 0 give the same per-segment arrays bit for bit; a run of
     another campaign into the same directory stops; w_inf is the population weight of the row z = 10 and w_inf_cells
-    its 53 cells, which plant_fit prints with the criteria; a file with another fiducial glitch law is refused"""
+    its 53 cells, which plant_fit prints with the criteria (a control with the stub's positive evidences: the fit runs
+    to nbar = 1 and the run fails, exit status 1, on that criterion alone); a file with another fiducial glitch law is
+    refused"""
     one, two = tmp_path / 'one', tmp_path / 'two'
     stub = drive(one, '--start', '2', '--n', '7', '--batch', '3', '--plain')
     names = sorted(os.path.basename(f) for f in glob.glob(str(one / '*')))
@@ -241,7 +243,9 @@ def test_driver_with_stub(tmp_path, capsys):
     capsys.readouterr()
     code = plant_fit.main([str(two)])
     text = capsys.readouterr().out
-    assert code in (0, 1) and 'population covered: w_inf < 0.0005' in text and 'time curve' in text, text
+    assert code == 1 and 'time curve' in text, text            # the stub's ln Lambda is positive in every segment: the
+    assert 'FAIL  mixture: nbar consistent with 0: nbar 1 +- nan' in text, text        # fit runs to nbar = 1, and a
+    assert 'PASS  population covered: w_inf < 0.0005' in text, text                    # control (truth 0) fails
     assert '53 cells, z 10.000 to 10.000, m1 4.561 to 17.865, M_det 100.3 to 393.0' in text, text
     with np.load(one / names[2]) as f:                                  # another fiducial law: not the same campaign
         arrays = {key: f[key] for key in f.files}
