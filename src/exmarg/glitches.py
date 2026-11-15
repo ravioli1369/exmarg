@@ -8,6 +8,7 @@ never mix.
     draw_rho = power_law_snr(4.0, 5.0, 30.0)                             # dN/d rho ~ rho^-4 on [5, 30]
     glitched, rec = add_template_glitches(segments, {'H': 0.05, 'L': 0.02}, draw_rho, [30.0, 60.0, 90.0], seed=7)
     glitched, rec = add_burst_glitches(segments, 0.05, draw_rho, 'sine-gaussian', seed=7)
+    h, p = glitch_signal(segments, 'H', 'ringdown', 9.0, 2.5, np.random.default_rng(3))   # one glitch, given time
 
 A glitch is in one detector only.  Segment k draws from np.random.default_rng([seed, k]), so the glitches of a
 segment do not depend on the other segments (or on how many there are), and a seed that differs from the one of the
@@ -45,6 +46,12 @@ def add_template_glitches(segments, eps, draw_rho, masses, seed, time_step=None)
 
     returns a new segments dict and the record of the glitches, record[I] for I in 'HL': dict of (n_segment,)
     arrays present (bool), kind ('' where absent), rho, t0 (s), mass, phase (nan where absent)"""
+    return _add(segments, eps, draw_rho, seed, 'template', *_template_shape(segments, masses), time_step)
+
+
+def _template_shape(segments, masses):
+    """(names, draw, waveform) of the template glitch: mass uniform from masses and phase uniform, the profile at
+    arrival time 0 (cached per mass)"""
     masses = np.atleast_1d(np.asarray(masses, float))
     T, fmin, fmax = float(segments['T']), float(segments['fmin']), float(segments['fmax'])
     nu = np.asarray(segments['nu'])
@@ -64,7 +71,7 @@ def add_template_glitches(segments, eps, draw_rho, masses, seed, time_step=None)
             cache[p['mass']] = w
         return cache[p['mass']] * np.exp(1j * p['phase'])
 
-    return _add(segments, eps, draw_rho, seed, 'template', ('mass', 'phase'), draw, waveform, time_step)
+    return ('mass', 'phase'), draw, waveform
 
 
 def add_burst_glitches(segments, eps, draw_rho, kind, seed, f_range=(30.0, 400.0), Q_range=(2.0, 40.0),
@@ -80,6 +87,11 @@ def add_burst_glitches(segments, eps, draw_rho, kind, seed, f_range=(30.0, 400.0
     record[I] has present, kind, rho, t0, phase and, by kind, f0 and Q, width, f0 and Q"""
     if kind not in KINDS:
         raise ValueError('kind must be one of %s' % (KINDS,))
+    return _add(segments, eps, draw_rho, seed, kind, *_burst_shape(kind, f_range, Q_range, width_range), time_step)
+
+
+def _burst_shape(kind, f_range, Q_range, width_range):
+    """(names, draw, waveform) of a burst of one of KINDS, see add_burst_glitches"""
     logu = lambda rng, r: float(np.exp(rng.uniform(np.log(r[0]), np.log(r[1]))))
 
     def draw(rng):
@@ -99,11 +111,38 @@ def add_burst_glitches(segments, eps, draw_rho, kind, seed, f_range=(30.0, 400.0
         return 0.5 * (e / (r + 2j * np.pi * (f - f0)) + np.conj(e) / (r + 2j * np.pi * (f + f0)))
 
     names = ('width', 'phase') if kind == 'gaussian' else ('f0', 'Q', 'phase')
-    return _add(segments, eps, draw_rho, seed, kind, names, draw, waveform, time_step)
+    return names, draw, waveform
+
+
+def glitch_signal(segments, I, kind, rho, t0, rng, masses=None, f_range=(30.0, 400.0), Q_range=(2.0, 40.0),
+                  width_range=(1e-3, 5e-3)):
+    """one glitch at a given arrival time, for several glitches in a segment: 'template' (a mass drawn from masses)
+    or one of KINDS, its shape parameters drawn from rng as add_template_glitches and add_burst_glitches draw them,
+    moved to t0 (s) and scaled to single-detector optimal SNR rho on the noise curve of detector I.
+
+    returns (the signal (n_freq,) complex, to add to d_I, the dict of shape parameters)"""
+    if kind == 'template':
+        names, draw, waveform = _template_shape(segments, masses)
+    elif kind in KINDS:
+        names, draw, waveform = _burst_shape(kind, f_range, Q_range, width_range)
+    else:
+        raise ValueError('kind must be template or one of %s' % (KINDS,))
+    p = draw(rng)
+    f = np.asarray(segments['nu']) / float(segments['T'])
+    return _scaled(waveform(p, f), f, t0, rho, _sig2(segments, I)), p
 
 
 def _sig2(segments, I):
     return np.asarray(segments['sig2_' + I] if 'sig2_' + I in segments else segments['sig2'], float)
+
+
+def _scaled(h, f, t0, rho, sig2):
+    """h moved to the arrival time t0 and scaled to the optimal SNR rho: h exp(-2 pi i f t0) rho / sqrt(2 sum |h|^2
+    / sig2)"""
+    norm = 2.0 * np.sum(np.abs(h) ** 2 / sig2)
+    if not norm > 0:
+        raise ValueError('glitch has no power inside the band')
+    return h * np.exp(-2j * np.pi * f * t0) * (rho / np.sqrt(norm))
 
 
 def _add(segments, eps, draw_rho, seed, kind, names, draw, waveform, time_step):
@@ -125,11 +164,7 @@ def _add(segments, eps, draw_rho, seed, kind, names, draw, waveform, time_step):
                 continue
             if time_step is not None:
                 t0 = (np.rint(t0 / time_step) * time_step) % T
-            h = waveform(p, f)
-            norm = 2.0 * np.sum(np.abs(h) ** 2 / sig2[I])
-            if not norm > 0:
-                raise ValueError('glitch has no power inside the band')
-            d[I][k] += h * np.exp(-2j * np.pi * f * t0) * (rho / np.sqrt(norm))
+            d[I][k] += _scaled(waveform(p, f), f, t0, rho, sig2[I])
             rec[I]['present'][k], rec[I]['kind'][k] = True, kind
             rec[I]['rho'][k], rec[I]['t0'][k] = rho, t0
             for key in names:

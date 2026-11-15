@@ -15,6 +15,12 @@ reversed weeks the Gaussian likelihood is expected to fail: a control of the tes
 within 2.5 sigma of the injected rate.  Without --recorded the directory of the recorded week is not opened.  Exit
 status 1 when a control fails.
 
+Variants analysed with the window model (analyse.py --glitch-model; their files carry ln_B_bar) are fitted with it in
+place of the mixture (plant_fit.py): the row then shows nbar of the window model, the glitches per segment of each
+detector's model (n_window sum_s f_s q_s, from <out>/<variant>/glitch_model.json when it is the model of the files) and
+the start of the model's SHA-256.  Every variant must then carry the window model (glitch_model and n_window are
+campaign keys); the SHA-256 belongs to the variant, each being analysed with the model of its own data.
+
 Before any fit, <out>/selection.txt is read (analyse.py writes it) and every variant that is used must cover the
 segments k = 0 .. n_selected - 1 exactly once (no gap, no segment in two files, none missing at the end), and the
 controls must carry the same campaign (every key of the files' meta that the variant does not define: manifest hash,
@@ -43,10 +49,13 @@ RECORDED = 'zero'
 HEAD = ('variant', 'kept', 'aside', 'Gaussian nbar', 'mixture nbar', 'eps_H', 'eps_L', 'gamma_H', 'gamma_L',
         'Gaussian ev. end/max', 'mixture ev. end/max', 'verdict')
 WIDTH = (11, 7, 6, 20, 20, 15, 15, 8, 8, 21, 21, 0)
+HEAD_W = ('variant', 'kept', 'aside', 'Gaussian nbar', 'window nbar', 'glitches/seg H', 'glitches/seg L', 'model',
+          'Gaussian ev. end/max', 'window ev. end/max', 'verdict')
+WIDTH_W = (11, 7, 6, 20, 20, 15, 15, 13, 21, 21, 0)
 
 
 # the meta entries that belong to a variant: the others must be the same in every variant of the week
-VARIANT_KEYS = ('variant', 'control', 'nbar', 'shift', 'merger_truth', 'truth_note')
+VARIANT_KEYS = ('variant', 'control', 'nbar', 'shift', 'merger_truth', 'truth_note', 'glitch_model_sha256')
 FILE = re.compile(r'^plant_(\d+)_(\d+)\.npz$')
 
 
@@ -172,9 +181,16 @@ def verdict(r):
 
 
 def row(variant, r):
-    """the cells of one variant's row"""
+    """the cells of one variant's row (HEAD, or HEAD_W for the window model)"""
     if r is None:
         return (variant, '', '', '', '', '', '', '', '', '', '', 'MISSING: no files')
+    if r.get('model') == 'windows':
+        G, W, m = r['fits']['gauss'], r['fits']['windows'], r.get('window_model')
+        cg, cw = r['curves']['gauss'], r['curves']['windows']
+        rate = lambda I: plant_fit._f(m['n_window'] * float(np.dot(m[I]['f'], m[I]['q'])), '%.4g') if m else 'n/a'
+        return (variant, str(int(r['keep'].sum())), str(int((~r['keep']).sum())), _pm(G, 'nbar', '%.3g'),
+                _pm(W, 'nbar', '%.3g'), rate('H'), rate('L'), str(r['cfg'].get('glitch_model_sha256'))[:12],
+                '%+.2f/%+.2f' % (cg[-1], cg.max()), '%+.2f/%+.2f' % (cw[-1], cw.max()), verdict(r))
     F, J, G = r['fits'], r['fits']['joint'], r['fits']['gauss']
     cg, cm = r['curves']['gauss'], r['curves']['mixture']
     return (variant, str(int(r['keep'].sum())), str(int((~r['keep']).sum())), _pm(G, 'nbar', '%.3g'),
@@ -183,9 +199,10 @@ def row(variant, r):
             '%+.2f/%+.2f' % (cg[-1], cg.max()), '%+.2f/%+.2f' % (cm[-1], cm.max()), verdict(r))
 
 
-def table(rows):
-    fmt = lambda cells: ' '.join(('%-*s' % (w, c)) if w else c for w, c in zip(WIDTH, cells))
-    return [fmt(HEAD)] + [fmt(c) for c in rows]
+def table(rows, windows=False):
+    width = WIDTH_W if windows else WIDTH
+    fmt = lambda cells: ' '.join(('%-*s' % (w, c)) if w else c for w, c in zip(width, cells))
+    return [fmt(HEAD_W if windows else HEAD)] + [fmt(c) for c in rows]
 
 
 def fit(out, variant, a, expected=None):
@@ -212,11 +229,13 @@ def main(argv=None):
         results[v] = fit(a.out, v, a, n_selected)
         print('fitted %s' % v if results[v] is not None else 'no files in %s' % os.path.join(a.out, v), flush=True)
     rho = next((r['rho_min'] for r in results.values() if r is not None), None)
-    print('\nthe week, in the order fixed before the first run; loudness veto w > %g%s, glitch law from rho_min %s; '
+    windows = any(r is not None and r.get('model') == 'windows' for r in results.values())
+    print('\nthe week, in the order fixed before the first run; loudness veto w > %g%s, %s; '
           'evidence: ln of the evidence ratio against no mergers, prior uniform in ln nbar on [%g, %g]\n'
           % (a.veto_w, '' if a.monitor_cut is None else ', band-power cut at %g widths' % a.monitor_cut,
-             plant_fit._f(rho, '%g'), plant_fit.PRIOR[0], plant_fit.PRIOR[1]))
-    print('\n'.join(table([row(v, results[v]) for v in ORDER])), flush=True)
+             'the window model of each variant\'s own data (glitch parameters of stage 1)' if windows else
+             'glitch law from rho_min %s' % plant_fit._f(rho, '%g'), plant_fit.PRIOR[0], plant_fit.PRIOR[1]))
+    print('\n'.join(table([row(v, results[v]) for v in ORDER], windows)), flush=True)
     passed = all(results[v] is not None and results[v]['ok'] for v in ORDER)
     if not a.recorded:
         print('\ncontrols and injections: %s.  The week as recorded (%s) is not opened; run with --recorded once every '
@@ -233,7 +252,7 @@ def main(argv=None):
         print('\n--recorded: the files of %s belong to another campaign than the controls (differ in %s): not shown.'
               % (RECORDED, ', '.join(other)))
         return 1
-    print('\n'.join(table([row(RECORDED, r)])[1:]))
+    print('\n'.join(table([row(RECORDED, r)], windows)[1:]))
     if r is not None:
         print('\n' + '\n'.join(r['lines']))
     return 0 if r is not None and r['ok'] else 1

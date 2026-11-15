@@ -36,6 +36,22 @@ follow plant.py: the reduction is plant.reduce on the same population (z >= 0.99
 rho_I and t0_I NaN), merger_truth 'injections' for inj and 'none' otherwise (merger False, m1 and z NaN, y and snr 0).
 Per segment also: gps, gps_epoch, the flags event, analysable, loud_H, loud_L, dq_H, dq_L, inj_H, inj_L, the band
 monitors monitor_H, monitor_L (n, 5) and the epoch's u_ratio_60.
+
+The window model (docs/glitch_likelihood.md, Sec. 4a), in two stages:
+    python scripts/real_data/analyse.py none gpu data/segments/O3b_v2 --out runs/week_w --stage windows
+    python scripts/validate/windows_fit.py runs/week_w/<variant>                 # for every variant
+    python scripts/real_data/analyse.py tables/redshift gpu data/segments/O3b_v2 --out runs/week_w --glitch-model auto
+--stage windows (no tables; the store argument is not read): the same selection, variants, groups and k, through
+pe.window_evidences(n_window=--n-window) of all the variants of an epoch in one call, into
+<out>/<variant>/win_<first k>_<end k>.npz, the members of plant.py's win files (ln_window_H, ln_window_L float32 on the
+bins that overlap [--window-rho-min, --window-rho-max], window_rho_edges, window_bin0, wmax_H, wmax_L) with the
+per-segment arrays above; the meta is the campaign without the settings of the merger stage, with stage 'windows',
+n_window and window_rho.  --glitch-model auto: each variant through pe_redshift with the model of
+<out>/<variant>/glitch_model.json, fitted on its own single-detector data (the campaign_key of its files that of the
+variant); --glitch-model <file>: that model for every variant (fitted on any variant of the same campaign: the keys
+VARIANT_KEYS aside).  A model that was modified or has another n_window than --n-window is refused.  Each variant is
+then one pe_redshift call per epoch (same seed and rows as above, so the same arrival times), and its files hold
+plant.py's members of the window model; the meta records glitch_model 'windows', glitch_model_sha256 and n_window.
 """
 import argparse
 import glob
@@ -64,6 +80,9 @@ ZMIN = 0.99119
 CHUNK = 4096
 VERSION = 1
 FLAGS = ('event', 'analysable', 'loud_H', 'loud_L', 'dq_H', 'dq_L', 'inj_H', 'inj_L', 'monitor_H', 'monitor_L')
+# the meta entries that a variant defines (summarize.VARIANT_KEYS without the model's SHA-256)
+VARIANT_KEYS = ('variant', 'control', 'nbar', 'shift', 'merger_truth', 'truth_note')
+MODEL = 'glitch_model.json'
 
 
 def manifest(seg_dir):
@@ -203,25 +222,53 @@ def variants(cfg, ep, names, sampler):
 
 
 def make_analysis(store, device, resident=False, chunk=CHUNK, ymin=None):
-    """factory(segments) builds the bank of plant.MASSES on the epoch's noise curve and returns pe(segments, seed, rows)
-    -> the pe_redshift dict (glitch=True) of those rows of the segments, on plant.GRID"""
+    """factory(segments) builds the bank of plant.MASSES on the epoch's noise curve and returns pe(segments, seed, rows,
+    glitch=True) -> the pe_redshift dict (glitch=True, or the dict of the window model) of those rows of the segments,
+    on plant.GRID"""
     from exmarg.search import mass_bank, pe_redshift
 
     def factory(seg0):
         bank = mass_bank(plant.MASSES, seg0, device)
 
-        def pe(seg, seed, rows):
+        def pe(seg, seed, rows, glitch=True):
             return pe_redshift(seg, bank, store, rows=rows, chunk=chunk, resident=resident, seed=seed, ymin=ymin,
-                               mdet_range=plant.MDET, glitch=True, **plant.GRID)
+                               mdet_range=plant.MDET, glitch=glitch, **plant.GRID)
         return pe
     return factory
 
 
+def make_windows(device, n_window=plant.N_WINDOW, chunk=plant.WINDOW_CHUNK):
+    """stage 1 of the window model: factory(segments) builds the bank of plant.MASSES on the epoch's noise curve and
+    returns win(segments, rows) -> the dict of pe.window_evidences of those rows (no tables)"""
+    from exmarg.search import mass_bank
+    from exmarg.search import pe as pe_module
+
+    def factory(seg0):
+        bank = mass_bank(plant.MASSES, seg0, device)
+
+        def win(seg, rows):
+            return pe_module.window_evidences(seg, bank, rows=rows, chunk=chunk, n_window=n_window)
+        return win
+    return factory
+
+
 PER_SEGMENT = plant.KEYS + ('ln_glitch_H', 'ln_glitch_L', 'wmax_H', 'wmax_L')
+WINDOW_KEYS = ('ln_window_H', 'ln_window_L', 'wmax_H', 'wmax_L')
 
 
-def campaign(a, seg_dir, variant):
-    """the settings of one variant's files (the same in every file of it)"""
+def load_models(a, cfgs):
+    """{variant: (the glitch settings of pe_redshift, the model's SHA-256)} of --glitch-model for the variants of cfgs
+    (their campaigns without the model): 'auto', each variant's own <out>/<variant>/glitch_model.json fitted on its
+    campaign; a file, that model for every variant, fitted on a variant of the same campaign (VARIANT_KEYS aside).
+    plant.glitch_model refuses a modified file, another n_window or another campaign"""
+    if a.glitch_model == 'auto':
+        return {v: plant.glitch_model(os.path.join(a.out, v, MODEL), cfg, a.n_window) for v, cfg in cfgs.items()}
+    return {v: plant.glitch_model(a.glitch_model, cfg, a.n_window, ignore=VARIANT_KEYS) for v, cfg in cfgs.items()}
+
+
+def campaign(a, seg_dir, variant, sha=None):
+    """the settings of one variant's files (the same in every file of it): of the merger stage, with the window model
+    of SHA-256 sha when given, or of the windows stage (a.stage)"""
     digest = manifest_digest(seg_dir)
     nbar = None if variant == 'zero' else a.nbar_inj if variant == 'inj' else 0.0
     cfg = dict(version=VERSION, source='strain', segments=os.path.basename(os.path.normpath(seg_dir)),
@@ -236,11 +283,14 @@ def campaign(a, seg_dir, variant):
                bank=(float(plant.MASSES[0]), float(plant.MASSES[-1]), plant.MASSES.size), grid=plant.GRID,
                ymin=plant.default_ymin() if a.ymin is None else float(a.ymin), n_loud=1024, n_random=1024,
                glitch_settings='pe default')
+    cfg = plant.stage_settings(cfg, a)
+    if sha is not None:
+        cfg = plant.with_model(cfg, sha, a.n_window)
     return json.loads(json.dumps(cfg))
 
 
-def path_of(out, variant, k0, k1):
-    return os.path.join(out, variant, 'plant_%010d_%010d.npz' % (k0, k1))
+def path_of(out, variant, k0, k1, prefix='plant'):
+    return os.path.join(out, variant, '%s_%010d_%010d.npz' % (prefix, k0, k1))
 
 
 def epoch_arrays(ep, rows, n, inj):
@@ -266,17 +316,29 @@ def stamp():
     return time.strftime('%Y-%m-%d %H:%M:%S')
 
 
+def merger_shared(res):
+    """the members of a plant file that are not per segment"""
+    return dict(rho_edges=np.asarray(res['rho_edges'], float),
+                glitch_pi_k=np.asarray(res.get('glitch_pi_k', np.nan), float),
+                glitch_window=np.asarray(res.get('glitch_window', np.nan), float))
+
+
 def run(a, factory, log=print):
     """the groups of epochs of this part, every requested variant; returns the paths written"""
     names = [v for v in VARIANTS if v in a.variants]
     sel = selection(a.segments)
     os.makedirs(a.out, exist_ok=True)
     record_selection(a.out, sel)
+    windows = a.stage == 'windows'
+    prefix = plant.PREFIX[a.stage]
     cfgs = {v: campaign(a, a.segments, v) for v in names}
+    models = load_models(a, cfgs) if a.glitch_model else None
+    if models:
+        cfgs = {v: campaign(a, a.segments, v, models[v][1]) for v in names}
     for v in names:
         os.makedirs(os.path.join(a.out, v), exist_ok=True)
-        for path in sorted(glob.glob(os.path.join(a.out, v, 'plant_*.npz'))):
-            plant.check_campaign(path, cfgs[v])
+        plant.check_folder(os.path.join(a.out, v), cfgs[v])
+    bins = plant.window_bins(a.window_rho_min, a.window_rho_max) if windows else None
     pop = plant.population(ZMIN)
     sampler = plant.Sampler(pop, plant.MDET)
     params = dict(seed=a.seed, nbar_inj=a.nbar_inj)
@@ -284,7 +346,7 @@ def run(a, factory, log=print):
     todo = groups(len(sel), a.epochs_per_file, a.part)
     for g, (e0, e1) in enumerate(todo):
         k0, k1 = sel[e0]['k'], sel[e1 - 1]['k'] + sel[e1 - 1]['n_selected']
-        need = [v for v in names if k1 > k0 and not os.path.exists(path_of(a.out, v, k0, k1))]
+        need = [v for v in names if k1 > k0 and not os.path.exists(path_of(a.out, v, k0, k1, prefix))]
         if not need:
             log('%s  epochs [%d, %d) k [%d, %d): %s' % (stamp(), e0, e1, k0, k1, 'present, skipped' if k1 > k0 else
                                                           'no segment selected'), flush=True)
@@ -306,34 +368,47 @@ def run(a, factory, log=print):
                     stack[I][slots[v]] = var[v]['d_' + I]
             seg = dict(var[need[0]], d_H=stack['H'], d_L=stack['L'])
             take = np.concatenate([slots[v] for v in need])
+            seed = plant.stream(a.seed, int(round(float(ep['gps_epoch']))), 'pe')
             t1 = time.time()
             pe = factory(seg)
-            res = pe(seg, plant.stream(a.seed, int(round(float(ep['gps_epoch']))), 'pe'), take)
-            t2 = time.time()
-            for j, v in enumerate(need):
-                part = dict(m1=res['m1'], z=res['z'], **{key: np.asarray(res[key])[j * n:(j + 1) * n]
-                                                         for key in PER_SEGMENT})
-                arrays = plant.reduce(part, pop, plant.MDET)
-                arrays.update(epoch_arrays(ep, rows, n, inj if v == 'inj' else None))
-                arrays['k'] = sel[e]['k'] + np.arange(n)
-                acc[v].append(arrays)
-            shared = dict(rho_edges=np.asarray(res['rho_edges'], float),
-                          glitch_pi_k=np.asarray(res.get('glitch_pi_k', np.nan), float),
-                          glitch_window=np.asarray(res.get('glitch_window', np.nan), float))
+            if windows:                                 # every variant in one call, sliced
+                res = pe(seg, take)
+                arrays = {v: plant.reduce_windows(dict(rho_edges=res['rho_edges'], **{
+                    key: np.asarray(res[key])[j * n:(j + 1) * n] for key in WINDOW_KEYS}), bins)
+                    for j, v in enumerate(need)}
+                shared = plant.window_shared(bins)
+            elif models:                                # a model per variant: a call per variant, the same rows
+                arrays = {}
+                for v in need:
+                    res = pe(seg, seed, slots[v], models[v][0])
+                    arrays[v] = plant.reduce(res, pop, plant.MDET)
+                shared = merger_shared(res)
+            else:
+                res = pe(seg, seed, take)
+                arrays = {v: plant.reduce(dict(m1=res['m1'], z=res['z'], **{
+                    key: np.asarray(res[key])[j * n:(j + 1) * n] for key in PER_SEGMENT}), pop, plant.MDET)
+                    for j, v in enumerate(need)}
+                shared = merger_shared(res)
             del res
+            t2 = time.time()
+            for v in need:
+                arrays[v].update(epoch_arrays(ep, rows, n, inj if v == 'inj' else None))
+                arrays[v]['k'] = sel[e]['k'] + np.arange(n)
+                acc[v].append(arrays[v])
             t_build += t1 - t0
             t_pe += t2 - t1
             n_rows += n * len(need)
         for v in need:
             parts = acc[v]
             arrays = {key: np.concatenate([p[key] for p in parts]) for key in parts[0] if key != 'w_inf_cells'}
-            arrays['w_inf_cells'] = np.unique(np.concatenate([p['w_inf_cells'] for p in parts]).reshape(-1, 2),
-                                              axis=0).astype(np.int32)
+            if not windows:
+                arrays['w_inf_cells'] = np.unique(np.concatenate([p['w_inf_cells'] for p in parts]).reshape(-1, 2),
+                                                  axis=0).astype(np.int32)
             arrays.update(shared)
             info = dict(device=a.device, chunk=a.chunk, resident=a.resident, pid=os.getpid(), host=socket.gethostname(),
                         first=int(k0), end=int(k1), epochs=[int(e0), int(e1)], written=stamp(),
                         t_sim=t_build / max(n_rows, 1), t_pe=t_pe / max(n_rows, 1), t_plain=None)
-            path = path_of(a.out, v, k0, k1)
+            path = path_of(a.out, v, k0, k1, prefix)
             plant.write_batch(path, cfgs[v], info, arrays)
             written.append(path)
         rows_done += n_rows
@@ -354,9 +429,20 @@ def parser():
     p.add_argument('--seed', type=int, default=1, help='0 <= seed < 2^20')
     p.add_argument('--part', default='0/1', help='i/n: the i-th of n contiguous ranges of epoch groups')
     p.add_argument('--epochs-per-file', dest='epochs_per_file', type=int, default=8)
-    p.add_argument('--chunk', type=int, default=CHUNK, help='rows filtered at once, capped by the free GPU memory')
+    p.add_argument('--chunk', type=int, default=None,
+                   help='rows filtered at once, capped by the free GPU memory (default %d); windows stage: by '
+                        'window_evidences (default %d)' % (CHUNK, plant.WINDOW_CHUNK))
     p.add_argument('--ymin', type=float, default=None, help='ymin of pe_redshift (default plant.default_ymin())')
     p.add_argument('--resident', action='store_true', help='keep every table on the GPU (needs ~48 GB)')
+    p.add_argument('--stage', choices=plant.STAGES, default='merger',
+                   help='merger: pe_redshift (default); windows: stage 1 of the window model, win_*.npz (no tables)')
+    p.add_argument('--n-window', type=int, default=plant.N_WINDOW, help='windows of a segment (window model)')
+    p.add_argument('--window-rho-min', type=float, default=plant.WINDOW_RHO[0],
+                   help='windows stage: keep the amplitude bins that overlap [window-rho-min, window-rho-max]')
+    p.add_argument('--window-rho-max', type=float, default=plant.WINDOW_RHO[1])
+    p.add_argument('--glitch-model', default=None, metavar='auto|JSON',
+                   help='merger stage with the window model: auto, <out>/<variant>/glitch_model.json for each variant; '
+                        'or one file for every variant')
     return p
 
 
@@ -366,6 +452,14 @@ def parse(argv=None):
     a.variants = [v.strip() for v in a.variants.split(',') if v.strip()]
     if not a.variants or set(a.variants) - set(VARIANTS):
         p.error('--variants: a subset of %s' % ','.join(VARIANTS))
+    if a.chunk is None:
+        a.chunk = plant.WINDOW_CHUNK if a.stage == 'windows' else CHUNK
+    if a.stage == 'windows' and (a.glitch_model or a.ymin is not None):
+        p.error('--glitch-model and --ymin are of the merger stage')
+    if not (0 <= a.window_rho_min < a.window_rho_max):
+        p.error('need 0 <= window-rho-min < window-rho-max')
+    if a.n_window < 1:
+        p.error('need n-window >= 1')
     try:
         i, n = (int(x) for x in a.part.split('/'))
     except ValueError:
@@ -381,7 +475,9 @@ def parse(argv=None):
 def main(argv=None, factory=None):
     """factory: replaces the analysis with the tables (tests)"""
     p, a = parse(argv)
-    if factory is None:
+    if factory is None and a.stage == 'windows':
+        factory = make_windows(a.device, a.n_window, a.chunk)
+    elif factory is None:
         if not glob.glob(os.path.join(a.store, 'bd_*.npz')):
             p.error('no bd_*.npz in %s' % a.store)
         loaded = {}
@@ -395,8 +491,9 @@ def main(argv=None, factory=None):
                       flush=True)
             return make_analysis(loaded['store'], a.device, a.resident, a.chunk,
                                  plant.default_ymin() if a.ymin is None else a.ymin)(seg)
-    print('%s  %s, part %d/%d, variants %s, into %s' % (stamp(), a.segments, a.part[0], a.part[1], ','.join(a.variants),
-                                                         a.out), flush=True)
+    print('%s  %s, part %d/%d, variants %s, into %s; stage %s%s' % (
+        stamp(), a.segments, a.part[0], a.part[1], ','.join(a.variants), a.out, a.stage,
+        ', glitch model %s' % a.glitch_model if a.glitch_model else ''), flush=True)
     run(a, factory)
     return 0
 

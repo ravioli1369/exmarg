@@ -4,6 +4,7 @@ independent, the driver end to end with a stub in place of pe_redshift, the cove
 plant_fit on the toy evidences of tests/test_mixture.py against direct calls of exmarg.search.mixture"""
 import glob
 import importlib.util
+import json
 import os
 
 import numpy as np
@@ -26,7 +27,7 @@ def _script(name):
     return mod
 
 
-plant, plant_fit = _script('plant'), _script('plant_fit')
+plant, plant_fit, windows_fit = _script('plant'), _script('plant_fit'), _script('windows_fit')
 
 
 def config(*extra):
@@ -35,6 +36,7 @@ def config(*extra):
 
 
 MIXED = ('--nbar', '0.5', '--eps-H', '0.5', '--eps-L', '0.5', '--glitch-kind', 'mixed')
+STATES = ('--glitch-states', '0.7:0.01,0.3:0.1', '--glitch-kind', 'mixed', '--rho-min', '4')
 
 
 def grid():
@@ -175,15 +177,23 @@ class Stub:
         shape[:, -1] = -np.inf
         res = dict(m1=m1, z=z, rows=np.arange(n), ln_b=a, ln_lambda=a[:, None, None] + shape[None])
         if glitch:
-            for j, key in enumerate(plant.KEYS[1:]):
-                res[key] = res['ln_lambda'] + 0.1 * (j + 1)
+            windows = isinstance(glitch, dict)                          # the window model: its outputs, which
+            for j, key in enumerate(('ln_B', 'ln_lambda_H', 'ln_lambda_L') if windows else plant.KEYS[1:]):
+                res[key] = res['ln_lambda'] + 0.1 * (j + 1)                # depend on its parameters
             nr, nm = RHO_EDGES.size - 1, plant.MASSES.size
             for I in 'HL':
                 res['ln_glitch_' + I] = q[I][:, None, None] * np.linspace(0, 1, nm)[None, :, None] \
                     * np.linspace(-1, 2, nr)[None, None, :]
                 res['wmax_' + I] = (np.abs(seg['d_' + I]) ** 2 / seg['sig2']).max(axis=1)[:, None] \
                     * np.linspace(0.5, 1, nm)[None]
-            res.update(rho_edges=RHO_EDGES.copy(), glitch_pi_k=np.full(nr, 1.0 / nr))
+                if windows:
+                    res['ln_c_' + I] = q[I] * glitch[I]['q'][-1]
+                    res['state_' + I] = np.tile(np.asarray(glitch[I]['f']), (n, 1))
+            res['rho_edges'] = RHO_EDGES.copy()
+            if windows:
+                res['ln_B'] = res['ln_B'] - 10.0 * glitch['H']['q'][0]
+            else:
+                res['glitch_pi_k'] = np.full(nr, 1.0 / nr)
         return res
 
 
@@ -568,3 +578,466 @@ def test_plant_fit_soft_veto(toy_dirs):
     B = mixture.ln_mixture(e['S'], e['gH'], e['gL'], lnG(e['EH']), lnG(e['EL']), eps['H'], eps['L'], ln_lam_gHL=e['HL'])
     assert np.allclose(r['lnB_true'], B, rtol=0, atol=1e-10)
     assert 'soft cut' in '\n'.join(r['lines']) and 'the law up to 12 (soft)' in '\n'.join(r['lines'])
+
+
+# ----------------------------------------------------------------------------------------------- window-model glitches
+
+
+def test_glitch_states_rates():
+    """the window model planted (states 0.7:0.01, 0.3:0.1 in both detectors, 64 windows, mixed kinds, rho^-3 on [4,
+    200]) over 600 segments: the fraction of segments in each state and the mean number of glitches per segment in each
+    state within 4 standard errors of f and 64 q; glitch_I is n_glitches_I > 0, rho_I (the loudest) inside [4, 200],
+    t0_I on the matched-filter grid; every kind is the loudest somewhere; the states of H and L uncorrelated
+    (|r| < 4 / sqrt(600)).  With q doubled the states, and in each window the presence, are those of the first
+    campaign (the same uniforms), so that every segment has at least as many glitches; another law for L leaves the
+    data and the glitches of H as they were"""
+    n, nw = 600, plant.N_WINDOW
+    s = plant.Sampler(plant.population())
+    cfg = config('--nbar', '0.3', *STATES)
+    assert cfg['glitch_states'] == dict(H=[[0.7, 0.01], [0.3, 0.1]], L=[[0.7, 0.01], [0.3, 0.1]], n_window=64)
+    seg, tr = plant.simulate_batch(cfg, 0, n, s)
+    dt = plant.controls.time_step(seg)
+    lines = []
+    for I in 'HL':
+        st, ng = tr['glitch_state_' + I], tr['n_glitches_' + I]
+        for j, (f, q) in enumerate(((0.7, 0.01), (0.3, 0.1))):
+            frac, sd = (st == j).mean(), np.sqrt(f * (1 - f) / n)
+            mean, sdn = ng[st == j].mean(), np.sqrt(nw * q * (1 - q) / (st == j).sum())
+            lines.append('%s state %d: fraction %.4f (f %.2f, sd %.4f), glitches per segment %.3f (64 q %.2f, sd %.3f)'
+                         % (I, j, frac, f, sd, mean, nw * q, sdn))
+            assert abs(frac - f) < 4 * sd and abs(mean - nw * q) < 4 * sdn, lines[-1]
+        g = tr['glitch_' + I]
+        assert np.array_equal(g, ng > 0) and np.all((tr['rho_' + I][g] >= 4) & (tr['rho_' + I][g] <= 200))
+        assert np.all(np.isnan(tr['rho_' + I][~g])) and set(tr['kind_' + I][g]) == set(plant.KINDS)
+        assert np.allclose(tr['t0_' + I][g] / dt, np.rint(tr['t0_' + I][g] / dt), rtol=0, atol=1e-6)
+    r = np.corrcoef(tr['glitch_state_H'], tr['glitch_state_L'])[0, 1]
+    print('\n' + '\n'.join(lines) + '\nstates of H and L: r = %.3f' % r)
+    assert abs(r) < 4 / np.sqrt(n)
+    seg2, tr2 = plant.simulate_batch(config('--nbar', '0.3', '--glitch-states', '0.7:0.02,0.3:0.2', '--glitch-kind',
+                                            'mixed', '--rho-min', '4'), 0, 200, s)
+    for I in 'HL':
+        assert np.array_equal(tr2['glitch_state_' + I], tr['glitch_state_' + I][:200])
+        assert np.all(tr2['n_glitches_' + I] >= tr['n_glitches_' + I][:200])
+        assert (tr2['n_glitches_' + I] > tr['n_glitches_' + I][:200]).any()
+    seg3, tr3 = plant.simulate_batch(config('--nbar', '0.3', *STATES, '--glitch-states-L', '0.5:0.3,0.5:0.0'), 0, 200,
+                                     s)
+    assert np.array_equal(seg3['d_H'], seg['d_H'][:200]) and not np.array_equal(seg3['d_L'], seg['d_L'][:200])
+    for key in ('glitch_state_H', 'n_glitches_H', 'rho_H', 't0_H', 'kind_H'):
+        assert same(tr3[key], tr[key][:200]), key
+
+
+@pytest.mark.parametrize('control', plant.CONTROLS)
+def test_split_reproducible_states(control):
+    """with the window model planted, segment k is the same data and truth bit for bit in one batch from 0 and in the
+    splits [3, 9) and [3, 5) + [5, 9), for every control"""
+    cfg = config('--nbar', '0.5', '--glitch-states', '0.5:0.02,0.5:0.2', '--glitch-kind', 'mixed', '--control',
+                 control)
+    s = plant.Sampler(plant.population())
+    ref, tref = plant.simulate_batch(cfg, 0, 9, s)
+    assert tref['glitch_H'].sum() > 2 and tref['glitch_L'].sum() > 2
+    for split in ([(3, 9)], [(3, 5), (5, 9)]):
+        parts = [plant.simulate_batch(cfg, a, b, s) for a, b in split]
+        for I in 'HL':
+            assert np.array_equal(np.concatenate([p[0]['d_' + I] for p in parts]), ref['d_' + I][3:]), (split, I)
+        for key in tref:
+            assert same(np.concatenate([p[1][key] for p in parts]), tref[key][3:]), (split, key)
+
+
+@pytest.mark.parametrize('control', ('none', 'time-slide', 'segment-slide'))
+def test_paired_campaigns_share_noise_and_mergers(control):
+    """three campaigns of one seed, without glitches, with one glitch per segment (--eps, mixed) and with the window
+    model (mixed): the mergers (presence, m1, z, y, optimal SNR, signals after the control) are the same, a detector
+    segment without a glitch holds the same data bit for bit in all three, and one with glitches differs from the
+    glitch-free data by the glitches alone: with exactly one, 2 sum |d - d_0|^2 / sig2 = rho^2 (1e-9).  Another seed
+    shares nothing"""
+    s = plant.Sampler(plant.population())
+    base = ('--nbar', '0.3', '--seed', '9', '--control', control)
+    n = 40
+    seg0, t0 = plant.simulate_batch(config(*base), 0, n, s)
+    other, _ = plant.simulate_batch(config('--nbar', '0.3', '--seed', '10', '--control', control), 0, n, s)
+    assert not any(np.array_equal(seg0['d_H'][i], other['d_H'][j]) for i in range(n) for j in range(n))
+    counts = []
+    for extra in (('--eps-H', '0.3', '--eps-L', '0.3', '--glitch-kind', 'mixed', '--rho-min', '4'),
+                  ('--glitch-states', '0.6:0.005,0.4:0.03', '--glitch-kind', 'mixed', '--rho-min', '4')):
+        seg, tr = plant.simulate_batch(config(*base, *extra), 0, n, s)
+        for key in ('merger', 'm1', 'z', 'y', 'snr', 'merger_H', 'merger_L', 'coherent'):
+            assert same(tr[key], t0[key]), key
+        for I in 'HL':
+            g = tr['glitch_' + I]
+            one = tr['n_glitches_' + I] == 1 if 'n_glitches_' + I in tr else g
+            assert 0 < g.sum() < n and one.any(), (extra, I)
+            assert np.array_equal(seg['d_' + I][~g], seg0['d_' + I][~g])
+            assert all(not np.array_equal(seg['d_' + I][i], seg0['d_' + I][i]) for i in np.flatnonzero(g))
+            diff = seg['d_' + I][one] - seg0['d_' + I][one]
+            snr2 = 2.0 * np.sum(np.abs(diff) ** 2 / seg['sig2'], axis=1)
+            assert np.allclose(snr2, tr['rho_' + I][one] ** 2, rtol=1e-9, atol=0), (extra, I)
+            counts.append(int(g.sum()))
+    print('\nsegments with glitches (eps H, L; states H, L): %s of %d' % (counts, n))
+
+
+def test_glitch_states_options(capsys):
+    """the command line: --glitch-states with bad pairs, f not summing to 1 or q outside [0, 1], or with --eps, a
+    --n-window that does not divide the 32768 samples, the options of the merger stage with --stage windows, and an
+    empty range of bins are refused before anything runs; one detector's states alone give the other no glitch"""
+    base = ['s', 'cpu', '--n', '3', '--nbar', '0.1', '--out', 'never']
+    for extra in (['--glitch-states', '0.5:0.1,0.5'], ['--glitch-states', '0.6:0.1,0.6:0.2'],
+                  ['--glitch-states', '1:1.5'], ['--glitch-states', 'a:b'],
+                  ['--glitch-states', '1:0.1', '--eps-H', '0.1'], ['--n-window', '48'],
+                  ['--stage', 'windows', '--plain'], ['--stage', 'windows', '--glitch-model', 'm.json'],
+                  ['--stage', 'windows', '--ymin', '0.1'], ['--stage', 'windows', '--window-rho-min', '5',
+                                                           '--window-rho-max', '4']):
+        with pytest.raises(SystemExit):
+            plant.main(base + extra, factory=lambda seg: None)
+        assert 'error' in capsys.readouterr().err, extra
+    assert not os.path.exists('never')
+    cfg = config('--nbar', '0', '--glitch-states-H', '1:0.05')
+    assert cfg['glitch_states']['L'] == [[1.0, 0.0]] and cfg['glitch_states']['H'] == [[1.0, 0.05]]
+
+
+# ----------------------------------------------------------------------------------------------- the windows stage
+
+
+def window_stub(seg, rows, n_window):
+    """pe.window_evidences in place: ln E_w (n, n_window, n_rho), a deterministic function of the data of the rows (the
+    excess power of consecutive blocks of bins, one block per window, times a ramp over the bins), and wmax as the
+    Stub's"""
+    nr, nm = RHO_EDGES.size - 1, plant.MASSES.size
+    out = dict(rho_edges=RHO_EDGES.copy(), rows=np.asarray(rows))
+    for I in 'HL':
+        p = np.abs(np.asarray(seg['d_' + I])[rows]) ** 2 / seg['sig2']
+        pw = np.stack([c.mean(axis=1) for c in np.array_split(p, n_window, axis=1)], axis=1) - 1.0
+        out['ln_window_' + I] = pw[:, :, None] * np.linspace(-1, 2, nr)[None, None, :]
+        out['wmax_' + I] = p.max(axis=1)[:, None] * np.linspace(0.5, 1, nm)[None]
+    return out
+
+
+class WinStub:
+    """the windows stage's factory in place: builds once, records the number of segments of each call"""
+
+    def __init__(self, n_window=plant.N_WINDOW):
+        self.calls, self.factories, self.n_window = [], 0, n_window
+
+    def factory(self, seg0):
+        self.factories += 1
+        return self.win
+
+    def win(self, seg):
+        self.calls.append(seg['d_H'].shape[0])
+        return window_stub(seg, np.arange(seg['d_H'].shape[0]), self.n_window)
+
+
+def test_windows_stage_driver(tmp_path):
+    """--stage windows next to the merger stage of the same campaign (segments 2 to 8, batches of 3, mixed glitches,
+    segment slide): the win files cover the ranges of the plant files, [2, 3), [3, 6), [6, 9), with the same truth and
+    wmax; ln_window_I float32 (n, 64, 14) are the stub's on the 14 bins that overlap [3, 12.2] (window_bin0 6,
+    window_rho_edges 3 to 14.0); the meta is the campaign without the merger settings, with stage, n_window,
+    window_rho, and the campaign_key of both stages is one; the stub is built once and called once per batch; a second
+    run calls nothing; one batch of 9 from 0 gives the same per-segment arrays; and a run of another campaign (seed) or
+    with another n_window into the folder stops, as does the merger stage of another campaign next to win files only"""
+    one = tmp_path / 'one'
+    drive(one, '--start', '2', '--n', '7', '--batch', '3')
+    win = drive(one, '--start', '2', '--n', '7', '--batch', '3', '--stage', 'windows', stub=WinStub())
+    plants = sorted(os.path.basename(f) for f in glob.glob(str(one / 'plant_*.npz')))
+    wins = sorted(os.path.basename(f) for f in glob.glob(str(one / 'win_*.npz')))
+    assert [w[4:] for w in wins] == [p[6:] for p in plants] == ['%010d_%010d.npz' % r for r in ((2, 3), (3, 6), (6, 9))]
+    assert win.factories == 1 and win.calls == [1, 3, 3]
+    assert not [f for f in os.listdir(one) if f.startswith('.')]
+    cfg = config('--nbar', '0.3', '--eps-H', '0.3', '--eps-L', '0.3', '--glitch-kind', 'mixed', '--control',
+                 'segment-slide', '--seed', '5', '--stage', 'windows')
+    bins = plant.window_bins(3.0, 12.2)
+    for p, w in zip(plants, wins):
+        meta_p, meta_w = plant.read_meta(one / p), plant.read_meta(one / w)
+        meta_w.pop('run')
+        assert meta_w == cfg and meta_w['stage'] == 'windows' and meta_w['n_window'] == 64
+        assert meta_w['window_rho'] == [3.0, 12.2] and not set(plant.MERGER_KEYS) & set(meta_w)
+        assert plant.campaign_key(meta_w) == plant.campaign_key(meta_p)
+        a, b = int(w[4:14]), int(w[15:25])
+        seg, truth = plant.simulate_batch(cfg, a, b, plant.Sampler(plant.population()))
+        ref = window_stub(seg, np.arange(b - a), 64)
+        with np.load(one / p) as fp, np.load(one / w) as fw:
+            for key in list(truth) + ['wmax_H', 'wmax_L']:
+                assert same(fw[key], fp[key]), key
+            for I in 'HL':
+                assert fw['ln_window_' + I].dtype == np.float32 and fw['ln_window_' + I].shape == (b - a, 64, 14)
+                assert np.array_equal(fw['ln_window_' + I], ref['ln_window_' + I][:, :, bins].astype(np.float32))
+            assert int(fw['window_bin0']) == 6 and np.array_equal(fw['window_rho_edges'], RHO_EDGES[6:21])
+    again = drive(one, '--start', '2', '--n', '7', '--batch', '3', '--stage', 'windows', stub=WinStub())
+    assert again.calls == [] and again.factories == 0
+    two = tmp_path / 'two'
+    drive(two, '--start', '0', '--n', '9', '--batch', '9', '--stage', 'windows', stub=WinStub())
+    with np.load(two / ('win_%010d_%010d.npz' % (0, 9))) as f9:
+        for w in wins:
+            a, b = int(w[4:14]), int(w[15:25])
+            with np.load(one / w) as fw:
+                for key in fw.files:
+                    if key != 'meta' and fw[key].ndim and fw[key].shape[0] == b - a and key != 'window_rho_edges':
+                        assert same(fw[key], f9[key][a:b]), key
+    with pytest.raises(SystemExit, match='another campaign.*seed'):
+        drive(one, '--start', '0', '--n', '3', '--batch', '3', '--stage', 'windows', '--seed', '6', stub=WinStub())
+    with pytest.raises(SystemExit, match='another campaign.*n_window'):
+        drive(one, '--start', '2', '--n', '1', '--batch', '3', '--stage', 'windows', '--n-window', '32',
+              stub=WinStub(32))
+    with pytest.raises(SystemExit, match='another campaign.*nbar'):
+        drive(two, '--start', '0', '--n', '3', '--batch', '3', '--nbar', '0.2')
+    assert sorted(os.listdir(two)) == ['win_%010d_%010d.npz' % (0, 9)]
+
+
+def test_windows_analysis_wiring(monkeypatch):
+    """make_windows: the bank of plant.MASSES on the segments, and pe.window_evidences called with it, n_window and
+    chunk, and no tables"""
+    from exmarg.search import pe as pe_module
+    seen = []
+    monkeypatch.setattr(pe_module, 'window_evidences', lambda seg, bank, **kw: seen.append((seg, bank, kw)) or 'r',
+                        raising=False)
+    seg, _ = plant.simulate_batch(config('--nbar', '0'), 0, 2, plant.Sampler(plant.population()))
+    win = plant.make_windows('cpu', 32, 4)(seg)
+    assert win(seg) == 'r'
+    (s, bank, kw), = seen
+    assert s is seg and np.array_equal(bank.M, plant.MASSES) and kw == dict(chunk=4, n_window=32)
+
+
+# ----------------------------------------------------------------------------------------------- stage 2, the model
+
+
+def make_model(path, key, n_window=64, q_scale=1.0):
+    """a window model in the format of windows_fit.py, fitted (here: made up) on the campaign of campaign_key key;
+    returns its SHA-256"""
+    pi = np.zeros((2, RHO_EDGES.size - 1))
+    pi[0, 8:19], pi[1, 8:19] = np.linspace(1, 2, 11), np.linspace(2, 1, 11)
+    pi /= pi.sum(axis=1, keepdims=True)
+    det = lambda f, q: dict(f=f, q=[q[0] * q_scale, q[1]], pi_k=pi.tolist())
+    model = dict(model='windows', n_window=n_window, zone=1, pi_m=None, rho_edges=RHO_EDGES.tolist(),
+                 H=det([0.8, 0.2], [0.004, 0.05]), L=det([0.9, 0.1], [0.002, 0.08]),
+                 settings=dict(fitted_edges=RHO_EDGES[8:20].tolist()), campaign=key)
+    return windows_fit.write_model(str(path), json.loads(json.dumps(model)))
+
+
+def test_model_stage_driver(tmp_path, capsys):
+    """--glitch-model with the model of the campaign's own window evidences: pe gets glitch=dict(model 'windows',
+    n_window, zone, pi_m, H and L f, q, pi_k of the file); the files hold ln_B_bar, ln_lambda_bar, ln_lambda_H_bar,
+    ln_lambda_L_bar (population averages of the grids), ln_c_I (n,), state_I (n, K) and no ln_lambda_g*; the meta
+    records glitch_model 'windows', its SHA-256 and n_window; a second run calls nothing.  Refused: another model
+    (resuming), a model of another campaign, of another n_window or a run with another --n-window, a modified or a
+    missing file.  plant_fit fits these files with the window model and describes the model of the folder"""
+    out = tmp_path / 'm'
+    drive(out, '--start', '0', '--n', '6', '--batch', '3', '--stage', 'windows', stub=WinStub())
+    key = plant.campaign_key(plant.read_meta(out / ('win_%010d_%010d.npz' % (0, 3))))
+    path = out / 'glitch_model.json'
+    sha = make_model(path, key)
+    stub = drive(out, '--start', '0', '--n', '6', '--batch', '3', '--glitch-model', str(path))
+    model = plant.read_model(str(path))[0]
+    assert len(stub.calls) == 2
+    for n, seed, g in stub.calls:
+        assert g['model'] == 'windows' and g['n_window'] == 64 and g['zone'] == 1 and g['pi_m'] is None
+        for I in 'HL':
+            for p in ('f', 'q', 'pi_k'):
+                assert np.array_equal(g[I][p], np.asarray(model[I][p])), (I, p)
+    cfg = plant.with_model(config('--nbar', '0.3', '--eps-H', '0.3', '--eps-L', '0.3', '--glitch-kind', 'mixed',
+                                  '--control', 'segment-slide', '--seed', '5'), sha, 64)
+    m1, z = grid()
+    for a, b in ((0, 3), (3, 6)):
+        meta = plant.read_meta(out / ('plant_%010d_%010d.npz' % (a, b)))
+        meta.pop('run')
+        assert meta == cfg and meta['glitch_model'] == 'windows' and meta['glitch_model_sha256'] == sha
+        seg, _ = plant.simulate_batch(cfg, a, b, plant.Sampler(plant.population()))
+        res = Stub().pe(seg, plant.stream(5, a, 'pe'), plant.glitch_model(str(path), cfg, 64)[0])
+        with np.load(out / ('plant_%010d_%010d.npz' % (a, b))) as f:
+            assert not [k for k in f.files if k.startswith('ln_lambda_g')]
+            for k in plant.KEYS_W:
+                assert np.allclose(f[k + '_bar'], ln_lambda_bar(res[k], m1, z, plant.MDET, plant.population()),
+                                   rtol=0, atol=1e-12), k
+            for I in 'HL':
+                assert np.array_equal(f['ln_c_' + I], res['ln_c_' + I]) and f['state_' + I].shape == (3, 2)
+    again = drive(out, '--start', '0', '--n', '6', '--batch', '3', '--glitch-model', str(path))
+    assert again.calls == []
+    other = tmp_path / 'other.json'
+    make_model(other, key, q_scale=2.0)
+    with pytest.raises(SystemExit, match='another campaign.*glitch_model_sha256'):
+        drive(out, '--start', '0', '--n', '3', '--batch', '3', '--glitch-model', str(other))
+    make_model(other, dict(key, seed=6))
+    with pytest.raises(SystemExit, match='fitted on another campaign.*seed'):
+        drive(tmp_path / 'x', '--start', '0', '--n', '3', '--batch', '3', '--glitch-model', str(other))
+    make_model(other, key, n_window=32)
+    with pytest.raises(SystemExit, match='n_window = 32'):
+        drive(tmp_path / 'x', '--start', '0', '--n', '3', '--batch', '3', '--glitch-model', str(other))
+    with pytest.raises(SystemExit, match='n_window = 64, the run 32'):
+        drive(tmp_path / 'x', '--start', '0', '--n', '3', '--batch', '3', '--glitch-model', str(path), '--n-window',
+              '32')
+    changed = json.loads(open(path).read())
+    changed['L']['q'][1] = 0.0801
+    with open(other, 'w') as fh:
+        json.dump(changed, fh)
+    with pytest.raises(SystemExit, match='modified'):
+        drive(tmp_path / 'x', '--start', '0', '--n', '3', '--batch', '3', '--glitch-model', str(other))
+    with pytest.raises(SystemExit, match='no glitch model'):
+        drive(tmp_path / 'x', '--start', '0', '--n', '3', '--batch', '3', '--glitch-model', str(tmp_path / 'none'))
+    assert not os.path.exists(tmp_path / 'x') or not os.listdir(tmp_path / 'x')
+    r = plant_fit.report(str(out))
+    text = '\n'.join(r['lines'])
+    assert r['model'] == 'windows' and set(r['fits']) == {'gauss', 'windows'} and r['window_model']['sha256'] == sha
+    assert 'window model, ln(1 + nbar (Bbar - 1))' in text and 'state 2 fraction 0.2, 3.2 glitches per segment' in text
+    os.remove(path)
+    assert 'no glitch_model.json in the folder' in '\n'.join(plant_fit.report(str(out))['lines'])
+    make_model(path, key, q_scale=2.0)
+    assert 'is another model' in '\n'.join(plant_fit.report(str(out))['lines'])
+
+
+# ----------------------------------------------------------------------------------------------- the fit of nbar
+
+
+def synthetic_B(n, nbar, seed, mus=(1.5, 2.5, 3.5), w=(0.5, 0.3, 0.2)):
+    """ln Bbar of n segments, a merger in each with probability nbar: x ~ N(mu, 1), mu drawn from mus with weights w,
+    with a merger and N(0, 1) without; Bbar = sum_j w_j exp(mu_j x - mu_j^2 / 2), the exact population-averaged
+    likelihood ratio of x (its mean over segments without a merger is 1).  returns (ln Bbar, merger flags)"""
+    rng = np.random.default_rng(seed)
+    mus, w = np.asarray(mus, float), np.asarray(w, float)
+    m = rng.random(n) < nbar
+    mu = mus[np.minimum(np.searchsorted(np.cumsum(w), rng.random(n), side='right'), mus.size - 1)]
+    x = rng.standard_normal(n) + np.where(m, mu, 0.0)
+    return logsumexp(np.log(w)[None] + mus[None] * x[:, None] - 0.5 * mus[None] ** 2, axis=1), m
+
+
+def test_nbar_fit_recovers_and_covers():
+    """nbar_fit on synthetic Bbar from a known mixture: 20000 segments at nbar 0.05 recover it within 2.5 standard
+    errors and noise alone gives 0 within 2.5 (or the lower edge); the estimate is the maximum of sum ln(1 + nbar (B -
+    1)) on a grid of 2e5 points and its error 1 / sqrt(-d^2 ln L / d nbar^2) by finite differences (1e-4); over 400
+    replicas of 4000 segments the pulls have mean within 4 / sqrt(400) of 0 and 91 to 99.5 percent within 2"""
+    lnB, m = synthetic_B(20000, 0.05, 1)
+    r = plant_fit.nbar_fit(lnB)
+    msg = 'nbar %.5f +- %.5f (truth 0.05, %d mergers), ln L %.3f' % (r['nbar'], r['err']['nbar'], m.sum(), r['lnl'])
+    assert abs(r['nbar'] - 0.05) < 2.5 * r['err']['nbar'] and r['edge'] is None, msg
+    lnl = lambda x: mixture.log_likelihood(x, lnB, 0.0, 0.0, log=True)
+    g = np.linspace(0.0, 0.2, 200001)
+    best = g[np.argmax([lnl(x) for x in g[np.abs(g - r['nbar']) < 0.002]]) + np.flatnonzero(
+        np.abs(g - r['nbar']) < 0.002)[0]]
+    assert abs(best - r['nbar']) < 2e-6 and abs(r['lnl'] - lnl(r['nbar'])) < 1e-9
+    h = 1e-4
+    curv = (lnl(r['nbar'] + h) - 2 * lnl(r['nbar']) + lnl(r['nbar'] - h)) / h ** 2
+    assert abs(r['err']['nbar'] * np.sqrt(-curv) - 1) < 1e-4, (r['err']['nbar'], 1 / np.sqrt(-curv))
+    z0 = plant_fit.nbar_fit(synthetic_B(20000, 0.0, 2)[0])
+    msg += '; noise: nbar %.5f +- %.5f' % (z0['nbar'], z0['err']['nbar'])
+    assert plant_fit._consistent_with_zero(z0)[0], msg
+    pulls = []
+    for i in range(400):
+        lb, _ = synthetic_B(4000, 0.05, 100 + i)
+        f = plant_fit.nbar_fit(lb)
+        pulls.append((f['nbar'] - 0.05) / f['err']['nbar'])
+    pulls = np.array(pulls)
+    msg += '; 400 replicas: mean pull %+.3f, sd %.3f, within 2: %.3f' % (pulls.mean(), pulls.std(), np.mean(
+        np.abs(pulls) < 2))
+    print('\n' + msg)
+    assert abs(pulls.mean()) < 4 / np.sqrt(400) and 0.91 <= np.mean(np.abs(pulls) < 2) <= 0.995, msg
+
+
+def test_nbar_fit_edges():
+    """B below 1 everywhere: nbar 0 at the lower edge with the curvature error; B above 1 everywhere: nbar 1 at the
+    upper edge; one segment with B overflowing (ln B = 800) among noise: a finite estimate inside (0, 1); B exactly 1
+    counts nothing; ln B nan raises"""
+    low = plant_fit.nbar_fit(np.full(100, -0.5))
+    assert low['nbar'] == 0.0 and low['edge'] == 'lower' and np.isclose(low['err']['nbar'], 1 / np.sqrt(100 * np.expm1(
+        -0.5) ** 2))
+    high = plant_fit.nbar_fit(np.full(100, 2.0))
+    assert high['nbar'] == 1.0 and high['edge'] == 'upper'
+    lnB, _ = synthetic_B(5000, 0.0, 3)
+    huge = plant_fit.nbar_fit(np.r_[lnB, 800.0])
+    assert 0 < huge['nbar'] < 1 and np.isfinite(huge['err']['nbar']) and huge['edge'] is None
+    assert plant_fit.nbar_fit(np.r_[lnB, np.zeros(50)])['nbar'] == pytest.approx(
+        plant_fit.nbar_fit(lnB)['nbar'], abs=1e-12)
+    with pytest.raises(ValueError):
+        plant_fit.nbar_fit(np.r_[lnB, np.nan])
+
+
+def write_windows_files(directory, cfg, lnB, lnL, m, wmax, splits):
+    """synthetic files of the merger stage with the window model (the members of plant.py) under the campaign cfg"""
+    n = lnB.size
+    nr = RHO_EDGES.size - 1
+    per = dict(k=np.arange(n), ln_B_bar=lnB, ln_lambda_bar=lnL, ln_lambda_H_bar=0.5 * lnL, ln_lambda_L_bar=0.5 * lnL,
+               w_inf=np.zeros(n), merger=m, merger_H=m, merger_L=m, coherent=m & (cfg['control'] == 'none'),
+               m1=np.full(n, np.nan), z=np.full(n, np.nan), y=np.zeros(n), snr=np.zeros(n))
+    for I in 'HL':
+        per.update({'ln_c_' + I: np.zeros(n), 'state_' + I: np.tile([0.9, 0.1], (n, 1)), 'ln_glitch_' + I:
+                    np.zeros((n, nr)), 'wmax_' + I: wmax[I], 'glitch_' + I: np.zeros(n, bool),
+                    'kind_' + I: np.full(n, ''), 'rho_' + I: np.full(n, np.nan), 't0_' + I: np.full(n, np.nan)})
+    os.makedirs(directory, exist_ok=True)
+    for a, b in splits:
+        plant.write_batch(os.path.join(directory, 'plant_%010d_%010d.npz' % (a, b)), cfg,
+                          dict(first=a, end=b, t_sim=1e-3, t_pe=0.1, t_plain=None),
+                          dict({key: v[a:b] for key, v in per.items()}, rho_edges=RHO_EDGES,
+                               glitch_pi_k=np.array(np.nan), glitch_window=np.array(np.nan),
+                               w_inf_cells=np.zeros((0, 2), np.int32)))
+
+
+@pytest.fixture(scope='module')
+def windows_dirs(tmp_path_factory):
+    """synthetic window-model campaigns: Bbar of synthetic_B at nbar 0.05 (12000 segments, some loud), declared at the
+    truth, at 0.2 and as a time-slide control; noise alone declared a control.  The Gaussian likelihood is Bbar times a
+    factor e^3 in the 5 percent of segments that hold a 'glitch'"""
+    root = tmp_path_factory.mktemp('wmodel')
+    n = 12000
+    lnB, m = synthetic_B(n, 0.05, 7)
+    rng = np.random.default_rng(8)
+    lnL = lnB + 3.0 * (rng.random(n) < 0.05)
+    wmax = {I: rng.exponential(15.0, n) for I in 'HL'}
+    out = {}
+    for name, nbar, control, data in (('plant', 0.05, 'none', (lnB, m)), ('wrong', 0.2, 'none', (lnB, m)),
+                                      ('control', 0.05, 'time-slide', (lnB, m)),
+                                      ('null', 0.05, 'time-slide', synthetic_B(n, 0.0, 9))):
+        cfg = plant.with_model(config('--nbar', str(nbar), '--control', control), 'ab' * 32, 64)
+        path = str(root / name)
+        write_windows_files(path, cfg, data[0], lnL, data[1], wmax, ((0, 5000), (5000, n)))
+        out[name] = (path, data[0], lnL, data[1], wmax)
+    return out
+
+
+def test_plant_fit_window_model(windows_dirs, capsys):
+    """plant_fit on files of the window model: the segments with wmax above 72 set aside; the window-model row is
+    nbar_fit on ln Bbar of the kept segments, the Gaussian row mixture.fit at eps = 0 on ln Lambda_bar (the same with
+    any lambda given a glitch: they do not enter); the time curve that of Bbar; the unit mean of Bbar - 1 over the kept
+    segments without a merger, with the number of segments that carry half of sum |Bbar - 1|, each printed; the
+    criterion 'window model nbar within 2.5 sigma of the truth' is that comparison (passes at the truth, fails declared
+    at 0.2, exit status 1); declared a control with mergers in it, 'window model: nbar consistent with 0' fails, and
+    noise alone passes both control criteria (exit status 0)"""
+    path, lnB, lnL, m, wmax = windows_dirs['plant']
+    r = plant_fit.report(path)
+    keep = (wmax['H'] <= 72) & (wmax['L'] <= 72)
+    assert np.array_equal(r['keep'], keep) and 20 < (~keep).sum() < 400 and r['model'] == 'windows'
+    W, G = r['fits']['windows'], r['fits']['gauss']
+    ref = plant_fit.nbar_fit(lnB[keep])
+    assert W['nbar'] == ref['nbar'] and W['err']['nbar'] == ref['err']['nbar']
+    for lam_g in (lnL[keep], np.random.default_rng(1).normal(0, 3, keep.sum())):
+        d = mixture.fit(lnL[keep], lam_g, lam_g, np.zeros((keep.sum(), RHO_EDGES.size - 1)),
+                        np.zeros((keep.sum(), RHO_EDGES.size - 1)), RHO_EDGES, log=True, lam_gHL=lam_g,
+                        fixed=tuple(p for p in mixture.PARAMETERS if p != 'nbar'),
+                        start=dict(plant_fit.START, eps_H=0.0, eps_L=0.0, rho_min_H=4.0, rho_min_L=4.0))
+        assert G['nbar'] == d['nbar'] and G['err']['nbar'] == d['err']['nbar'] and G['lnl'] == d['lnl']
+    text = '\n'.join(r['lines'])
+    for F in (W, G):
+        assert '%.5g +- %.5g' % (F['nbar'], F['err']['nbar']) in text
+    assert np.allclose(r['curves']['windows'], mixture.time_curve(lnB[keep], plant_fit.NBAR_GRID, lambda g: 1 / g,
+                                                                  log=True), rtol=0, atol=1e-12)
+    quiet = ~m[keep]
+    x = np.expm1(lnB[keep][quiet])
+    dev = np.sort(np.abs(x))[::-1]
+    carry = int(np.searchsorted(np.cumsum(dev), 0.5 * dev.sum())) + 1
+    mu, se, c = r['unit']['all']['Bbar - 1, window model']
+    assert c == quiet.sum() and np.isclose(mu, x.mean(), rtol=1e-12) and np.isclose(se, x.std(ddof=1) / np.sqrt(c))
+    assert '%+.3e +- %.2e  (%d, %+.1f sigma); half of sum |x - 1| in %d' % (x.mean(), se, c, x.mean() / se, carry) \
+        in text and abs(x.mean()) < 3 * se
+    crit = {name: ok for name, ok, _, _ in r['criteria']}
+    assert crit['window model nbar within 2.5 sigma of the truth'] == (abs(W['nbar'] - 0.05) < 2.5 * W['err']['nbar'])
+    assert crit['window model nbar within 2.5 sigma of the truth'] and r['ok']
+    print('\n' + text)
+    r = plant_fit.report(windows_dirs['wrong'][0])
+    assert not {name: ok for name, ok, _, _ in r['criteria']}['window model nbar within 2.5 sigma of the truth']
+    capsys.readouterr()
+    assert plant_fit.main([windows_dirs['wrong'][0]]) == 1
+    r = plant_fit.report(windows_dirs['control'][0])
+    crit = {name: (ok, counted) for name, ok, _, counted in r['criteria']}
+    assert r['kind'] == 'control' and crit['window model: nbar consistent with 0'] == (False, True)
+    c = r['curves']['windows']
+    assert crit['window model: evidence below ln 100'] == (bool(c.max() < np.log(100)), True)
+    r = plant_fit.report(windows_dirs['null'][0])
+    crit = {name: (ok, counted) for name, ok, _, counted in r['criteria']}
+    assert crit['window model: nbar consistent with 0'] == (True, True) and crit[
+        'window model: evidence below ln 100'] == (True, True), r['lines'][-6:]
+    assert plant_fit.main([windows_dirs['null'][0]]) == 0

@@ -6,6 +6,10 @@ CPU.  Needs the redshift tables; meant for a GPU.
     CUDA_VISIBLE_DEVICES=1 python scripts/validate/plant.py tables/redshift gpu --start 204800 --n 204800 --seed 1
         --nbar 0.05 --eps-H 0.1 --eps-L 0.03 --glitch-kind template --gamma 3 --rho-min 6 --out runs/template
     python scripts/validate/plant.py ... --control time-slide --out runs/template_slide [--plain] [--resident]
+    python scripts/validate/plant.py none gpu --stage windows --n 204800 --nbar 0.3 --glitch-states 0.9:0.002,0.1:0.05
+        --out runs/states                                   # stage 1, then: windows_fit.py runs/states
+    python scripts/validate/plant.py tables/redshift gpu --n 204800 --nbar 0.3 --glitch-states 0.9:0.002,0.1:0.05
+        --glitch-model runs/states/glitch_model.json --out runs/states    # stage 2, then: plant_fit.py runs/states
 
 The plant.  Every segment (T = 8 s, 20 to 512 Hz, the H noise curve in both detectors, exmarg.pp.simulate) holds, with
 probability --nbar, one equal-mass zero-spin merger of the population of the analysis: exmarg.priors.population_m1_z
@@ -31,7 +35,8 @@ equal to stream(seed, 0, use) + k.  Uses, in USES order: the noise and extrinsic
 stream(seed, first, 'noise'), seeds segment k of the batch with exactly that), the merger (presence first, then m1
 and z, drawn in every segment), the glitch of H and the glitch of L (one exmarg.glitches call per segment and
 detector, that detector drawn first so that presence, SNR and time come first in its stream), the kinds of 'mixed', the
-phases of 'phase-randomize', and the arrival times pe_redshift samples (its seed plus the row).  Segment k is
+phases of 'phase-randomize', the arrival times pe_redshift samples (its seed plus the row), and the glitches of the
+window model (below).  Segment k is
 therefore the same data whatever --start, --n and --batch; campaigns with different seeds share no stream; the merger
 parameters and the noise do not depend on --nbar, and presence, SNR and time of the glitches do not depend on
 --glitch-kind or on the eps of the other detector.
@@ -52,9 +57,36 @@ settings, the same in every file, and under 'run' the device, host, timings), rh
     merger, m1, z, y, snr                the merger planted in segment k (m1, z nan, y and snr 0 when absent)
     merger_H, merger_L, coherent         a merger signal in the H, L data after the control; coherent: aligned in both
     glitch_I, kind_I, rho_I, t0_I        the glitch in the data of detector I after the control (t0 moved with it)
+
+Glitches of the window model (docs/glitch_likelihood.md, Sec. 4a), --glitch-states f1:q1,f2:q2 for both detectors or
+--glitch-states-H, --glitch-states-L (not with --eps-H, --eps-L): each detector-segment is in state s with probability
+f_s, and each of its --n-window windows (n_time / n_window matched-filter samples, n_time = 8 nu_max) holds a glitch
+with probability q_s, independently, at a sample uniform in the window, SNR from the law of --gamma, --rho-min,
+--rho-max, kind from --glitch-kind ('mixed': drawn per glitch), added with exmarg.glitches.glitch_signal.  Streams:
+child j of numpy.random.SeedSequence(stream(seed, k, 'windows')) (j = 0 for H, 1 for L) draws the state, then for
+every window its presence, SNR and sample, whatever the state, q or kind; child 2 + j the kind and shape of each
+glitch in window order.  Noise and mergers are those of the campaign with the same seed without glitches or with
+--eps glitches.  Per segment glitch_I, kind_I, rho_I, t0_I then describe the loudest glitch of detector I, and
+    glitch_state_I, n_glitches_I         its state (index into the f:q pairs) and number of glitches
+The campaign records glitch_states = {H, L: [[f, q], ...], n_window}.
+
+Stage 1 of the window model, --stage windows (no tables; the store argument is not read): the same segments, batches
+and controls, through pe.window_evidences(n_window=--n-window) on the bank of the analysis, into
+win_<first>_<end>.npz next to the plant files of the campaign, with meta (the campaign without the settings of the
+merger stage, and stage 'windows', n_window, window_rho), window_rho_edges (n_bin + 1,) the edges of the amplitude bins
+of RHO_EDGES that overlap [--window-rho-min, --window-rho-max], window_bin0 the index of the first, and per segment k,
+the truth arrays as above, wmax_H, wmax_L and
+    ln_window_H, ln_window_L (n, n_window, n_bin) float32   ln E_w[k] of each window on those bins
+windows_fit.py fits them and writes glitch_model.json.  Stage 2, --glitch-model glitch_model.json: pe_redshift with
+glitch=dict(model='windows', ...) of that file (refused when the file was modified, its n_window is not --n-window or
+it was fitted on another campaign, campaign_key); the campaign records glitch_model 'windows', glitch_model_sha256 and
+n_window, and the files hold ln_B_bar, ln_lambda_bar, ln_lambda_H_bar, ln_lambda_L_bar (as above), ln_c_H, ln_c_L
+(n,) and state_H, state_L (n, K) the noise ratio and posterior of the state of each detector, ln_glitch_I, wmax_I,
+w_inf, and no ln_lambda_g*.  The files of the two stages of one folder must be of the same campaign_key.
 """
 import argparse
 import glob
+import hashlib
 import json
 import os
 import socket
@@ -66,12 +98,13 @@ from scipy.special import logsumexp
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(ROOT, 'src'))
-from exmarg.glitches import KINDS as BURSTS, add_burst_glitches, add_template_glitches, power_law_snr
+from exmarg.glitches import KINDS as BURSTS, add_burst_glitches, add_template_glitches, glitch_signal, power_law_snr
 from exmarg.pp import simulate
 from exmarg.priors import population_m1_z
 from exmarg.search import controls, population as popavg
 from exmarg.search.pe import _dl_of_z
 from exmarg.search.segments import D0
+from exmarg.search.single import RHO_EDGES
 
 T, FMIN, FMAX = 8.0, 20.0, 512.0
 MASSES = np.geomspace(20.0, 400.0, 120)
@@ -82,9 +115,19 @@ SHIFT = 0.5
 CHUNK = 128
 KINDS = ('template',) + tuple(BURSTS)
 CONTROLS = ('none', 'time-slide', 'segment-slide', 'phase-randomize', 'time-reverse')
-USES = ('noise', 'merger', 'glitch_H', 'glitch_L', 'kind', 'phase', 'pe')
+USES = ('noise', 'merger', 'glitch_H', 'glitch_L', 'kind', 'phase', 'pe', 'windows')
 KEYS = ('ln_lambda', 'ln_lambda_gH', 'ln_lambda_gL', 'ln_lambda_gHL', 'ln_lambda_H', 'ln_lambda_L')
+KEYS_W = ('ln_lambda', 'ln_B', 'ln_lambda_H', 'ln_lambda_L')        # the grids of pe_redshift with the window model
 VERSION = 1
+STAGES = ('merger', 'windows')
+N_WINDOW = 64
+WINDOW_RHO = (3.0, 12.2)
+WINDOW_CHUNK = 8                            # segments filtered at once by window_evidences (its default)
+# the campaign settings of the merger stage alone, and those of the stages: campaign_key leaves them out
+MERGER_KEYS = ('grid', 'ymin', 'n_loud', 'n_random', 'glitch_settings', 'tables', 'shared_times', 'glitch_model',
+               'glitch_model_sha256')
+STAGE_KEYS = ('stage', 'n_window', 'window_rho')
+PREFIX = dict(merger='plant', windows='win')
 
 
 def stream(seed, k, use):
@@ -164,6 +207,53 @@ def glitch(seg, i, k, I, cfg, kind, draw_rho, dt):
     return new['d_H'][0], {key: rec['H'][key][0] for key in ('present', 'kind', 'rho', 't0')}
 
 
+def parse_states(text):
+    """[[f, q], ...] from 'f1:q1,f2:q2,...': the probability of each state of a detector-segment and that of a glitch
+    in a window in that state (ValueError unless f >= 0 sums to 1 and 0 <= q <= 1)"""
+    try:
+        fq = [[float(x) for x in item.split(':')] for item in text.split(',') if item.strip()]
+    except ValueError:
+        raise ValueError('glitch states %r: need f1:q1,f2:q2,...' % text)
+    if not fq or any(len(p) != 2 for p in fq):
+        raise ValueError('glitch states %r: need f1:q1,f2:q2,...' % text)
+    f, q = np.array(fq).T
+    if np.any(f < 0) or abs(f.sum() - 1.0) > 1e-9 or np.any((q < 0) | (q > 1)):
+        raise ValueError('glitch states %r: need f >= 0 summing to 1 and 0 <= q <= 1' % text)
+    return fq
+
+
+def window_glitches(seg, i, k, I, cfg, draw_rho, dt):
+    """the glitches of the window model in the data of detector I, row i (segment k), see the module docstring:
+    (their sum (n_freq,) complex, the record: state, n, and present, kind, rho, t0 of the loudest)"""
+    st = cfg['glitch_states']
+    f, q = np.asarray(st[I], float).T
+    nw = st['n_window']
+    n_time = int(round(cfg['T'] / dt))
+    if n_time % nw:
+        raise ValueError('n_time = %d is not a multiple of n_window = %d' % (n_time, nw))
+    nwin, j = n_time // nw, 'HL'.index(I)
+    root = stream(cfg['seed'], k, 'windows')
+    rng = np.random.default_rng(np.random.SeedSequence(root, spawn_key=(j,)))
+    u = rng.uniform()
+    u_on = rng.uniform(size=nw)
+    rho = np.array([draw_rho(rng) for _ in range(nw)])
+    sample = rng.integers(nwin, size=nw)
+    s = min(int(np.searchsorted(np.cumsum(f) / f.sum(), u, side='right')), f.size - 1)
+    on = np.flatnonzero(u_on < q[s])
+    shape = np.random.default_rng(np.random.SeedSequence(root, spawn_key=(2 + j,)))
+    one = dict(nu=seg['nu'], sig2=seg['sig2'], T=seg['T'], fmin=seg['fmin'], fmax=seg['fmax'])
+    h, kinds_ = np.zeros(np.size(seg['nu']), complex), []
+    for w in on:
+        kind = KINDS[shape.integers(len(KINDS))] if cfg['glitch_kind'] == 'mixed' else cfg['glitch_kind']
+        h += glitch_signal(one, I, kind, rho[w], (w * nwin + sample[w]) * dt, shape, masses=MASSES)[0]
+        kinds_.append(kind)
+    rec = dict(state=s, n=on.size, present=on.size > 0, kind='', rho=np.nan, t0=np.nan)
+    if on.size:
+        top = int(np.argmax(rho[on]))
+        rec.update(kind=kinds_[top], rho=rho[on[top]], t0=(on[top] * nwin + sample[on[top]]) * dt)
+    return h, rec
+
+
 def simulate_batch(cfg, first, end, sampler):
     """segments first .. end - 1 of the campaign cfg: (the segments dict of pp.simulate with mergers, glitches and the
     control applied, the truth: dict of (end - first,) arrays, see the module docstring)"""
@@ -196,6 +286,15 @@ def simulate_batch(cfg, first, end, sampler):
                 seg['d_' + I][i] = d
                 for key in g[I]:
                     g[I][key][i] = rec[key]
+    states = cfg.get('glitch_states')
+    for I in 'HL' if states else '':
+        g[I].update(state=np.zeros(n, int), n=np.zeros(n, int))
+        for i, k in enumerate(ks):
+            h, rec = window_glitches(seg, i, k, I, cfg, draw_rho, dt)
+            if rec['n']:
+                seg['d_' + I][i] = seg['d_' + I][i] + h
+            for key in g[I]:
+                g[I][key][i] = rec[key]
     mL, control = present.copy(), cfg['control']
     if control == 'time-slide':
         seg = controls.time_slide(seg, cfg['shift'])
@@ -221,38 +320,91 @@ def simulate_batch(cfg, first, end, sampler):
     for I in 'HL':
         truth.update({'glitch_' + I: g[I]['present'], 'kind_' + I: g[I]['kind'], 'rho_' + I: g[I]['rho'],
                       't0_' + I: g[I]['t0']})
+        if states:
+            truth.update({'glitch_state_' + I: g[I]['state'], 'n_glitches_' + I: g[I]['n']})
     return seg, {key: np.asarray(v)[keep] for key, v in truth.items()}
 
 
 def reduce(res, pop, mdet_range=MDET):
     """the per-segment arrays kept from a pe_redshift result (glitch=True): ln Lbar of the six ln_lambda grids on the
-    population pop, w_inf and w_inf_cells, ln of the template average of E_I (n, n_rho) and the largest w"""
+    population pop, w_inf and w_inf_cells, ln of the template average of E_I (n, n_rho) and the largest w.  With the
+    window model (ln_B in res): ln Lbar of the grids KEYS_W, w_inf over the cells where ln_lambda or ln_B is not
+    finite, and ln_c_I (n,), state_I (n, K) as given"""
     m1, z = res['m1'], res['z']
-    out = {key + '_bar': np.atleast_1d(popavg.ln_lambda_bar(res[key], m1, z, mdet_range, pop)) for key in KEYS}
+    windows = 'ln_B' in res
+    out = {key + '_bar': np.atleast_1d(popavg.ln_lambda_bar(res[key], m1, z, mdet_range, pop))
+           for key in (KEYS_W if windows else KEYS)}
     w = popavg.population_weights(m1, z, mdet_range, pop)
     bad = ~np.isfinite(np.asarray(res['ln_lambda'])) & (w > 0)[None]
+    if windows:
+        bad |= ~np.isfinite(np.asarray(res['ln_B'])) & (w > 0)[None]
     out['w_inf'] = np.array([w[b].sum() for b in bad])
     out['w_inf_cells'] = np.argwhere(bad.any(axis=0)).astype(np.int32)
     for I in 'HL':
         lnE = np.asarray(res['ln_glitch_' + I], float)
         out['ln_glitch_' + I] = logsumexp(lnE, axis=1) - np.log(lnE.shape[1])
         out['wmax_' + I] = np.asarray(res['wmax_' + I], float).max(axis=1)
+        if windows:
+            out['ln_c_' + I] = np.asarray(res['ln_c_' + I], float)
+            out['state_' + I] = np.asarray(res['state_' + I], float)
     return out
+
+
+def window_bins(rho_min, rho_max):
+    """(n_rho,) bool: the amplitude bins of RHO_EDGES that overlap [rho_min, rho_max], contiguous"""
+    bins = (RHO_EDGES[1:] > rho_min) & (RHO_EDGES[:-1] < rho_max)
+    if not bins.any():
+        raise ValueError('no amplitude bin overlaps [%g, %g]' % (rho_min, rho_max))
+    return bins
+
+
+def reduce_windows(res, bins):
+    """the per-segment arrays kept from a pe.window_evidences result: ln_window_I (n, n_window, bins.sum()) float32 on
+    the amplitude bins `bins` of RHO_EDGES, and the largest w over the templates wmax_I (n,)"""
+    if not np.array_equal(np.asarray(res['rho_edges'], float), RHO_EDGES):
+        raise ValueError('window_evidences returned other amplitude bins than single.RHO_EDGES')
+    out = {}
+    for I in 'HL':
+        out['ln_window_' + I] = np.asarray(res['ln_window_' + I])[:, :, bins].astype(np.float32)
+        out['wmax_' + I] = np.asarray(res['wmax_' + I], float).max(axis=1)
+    return out
+
+
+def window_shared(bins):
+    """the members of a win file that are not per segment: the edges of the bins kept and the index of the first"""
+    b = np.flatnonzero(bins)
+    return dict(window_rho_edges=RHO_EDGES[b[0]:b[-1] + 2].copy(), window_bin0=np.array(b[0]))
 
 
 def make_analysis(store, device, resident=False, chunk=CHUNK, ymin=None, shared_times=False):
     """the analysis behind a narrow interface: factory(segments) builds the bank on these segments (every batch has the
     same frequency grid and noise curve) and returns pe(segments, seed, glitch) -> the pe_redshift dict on GRID, with
-    glitch=True or None"""
+    glitch=True or None, or the dict of the window model (glitch_model)"""
     from exmarg.search import mass_bank, pe_redshift
 
     def factory(seg0):
         bank = mass_bank(MASSES, seg0, device)
 
         def pe(seg, seed, glitch):
+            g = glitch if isinstance(glitch, dict) else (True if glitch else None)
             return pe_redshift(seg, bank, store, chunk=chunk, resident=resident, seed=seed, ymin=ymin,
-                               mdet_range=MDET, glitch=True if glitch else None, shared_times=shared_times, **GRID)
+                               mdet_range=MDET, glitch=g, shared_times=shared_times, **GRID)
         return pe
+    return factory
+
+
+def make_windows(device, n_window=N_WINDOW, chunk=WINDOW_CHUNK):
+    """stage 1 of the window model behind the same interface: factory(segments) builds the bank on these segments and
+    returns win(segments) -> the dict of pe.window_evidences (no tables)"""
+    from exmarg.search import mass_bank
+    from exmarg.search import pe as pe_module
+
+    def factory(seg0):
+        bank = mass_bank(MASSES, seg0, device)
+
+        def win(seg):
+            return pe_module.window_evidences(seg, bank, chunk=chunk, n_window=n_window)
+        return win
     return factory
 
 
@@ -279,7 +431,83 @@ def campaign(args):
         cfg['tables'] = 'published'
     if getattr(args, 'shared_times', False):
         cfg['shared_times'] = True
-    return json.loads(json.dumps(cfg))
+    states = glitch_states(args)
+    if states:
+        cfg['glitch_states'] = dict(states, n_window=args.n_window)
+    return json.loads(json.dumps(stage_settings(cfg, args)))
+
+
+def glitch_states(args):
+    """{H: [[f, q], ...], L: ...} of --glitch-states, --glitch-states-H, --glitch-states-L, or None"""
+    both = getattr(args, 'glitch_states', None)
+    one = {I: getattr(args, 'glitch_states_' + I, None) or both for I in 'HL'}
+    if not any(one.values()):
+        return None
+    return {I: parse_states(one[I]) if one[I] else [[1.0, 0.0]] for I in 'HL'}
+
+
+def stage_settings(cfg, args):
+    """the campaign of the stage of args: the windows stage leaves out the settings of the merger stage (MERGER_KEYS)
+    and records stage, n_window and the range of the amplitude bins kept"""
+    if getattr(args, 'stage', 'merger') != 'windows':
+        return cfg
+    cfg = {key: v for key, v in cfg.items() if key not in MERGER_KEYS}
+    return dict(cfg, stage='windows', n_window=args.n_window, window_rho=[args.window_rho_min, args.window_rho_max])
+
+
+def with_model(cfg, sha, n_window):
+    """the campaign of the merger stage with the window model of the file of SHA-256 sha"""
+    return dict(cfg, glitch_model='windows', glitch_model_sha256=sha, n_window=n_window)
+
+
+def campaign_key(cfg):
+    """the settings that fix the data and the bank: the campaign without those of a stage (MERGER_KEYS, STAGE_KEYS),
+    the same for the windows stage, the merger stage and the merger stage with the window model of one campaign"""
+    return {key: v for key, v in cfg.items() if key not in MERGER_KEYS + STAGE_KEYS + ('run',)}
+
+
+def _differ(a, b):
+    return ', '.join(sorted(key for key in set(a) | set(b) if a.get(key) != b.get(key)))
+
+
+def model_sha256(model):
+    """SHA-256 of a glitch model without its sha256 entry: of its JSON with sorted keys and no spaces"""
+    body = {key: v for key, v in model.items() if key != 'sha256'}
+    return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
+def read_model(path):
+    """(the glitch model of windows_fit.py, its SHA-256); SystemExit when the file is missing or was modified (the
+    SHA-256 recorded in it is not that of the rest)"""
+    if not os.path.exists(path):
+        raise SystemExit('%s: no glitch model (windows_fit.py writes it)' % path)
+    with open(path) as fh:
+        try:
+            model = json.load(fh)
+        except ValueError as err:
+            raise SystemExit('%s: not a JSON glitch model (%s)' % (path, err))
+    if not isinstance(model, dict) or model.get('sha256') != model_sha256(model):
+        raise SystemExit('%s: the glitch model was modified after it was written (SHA-256 does not match)' % path)
+    return model, model['sha256']
+
+
+def glitch_model(path, cfg, n_window, ignore=()):
+    """the glitch settings of pe_redshift (model 'windows') from the file of windows_fit.py, for the run of campaign
+    cfg: SystemExit when the file was modified, is not a window model on RHO_EDGES, has another n_window, or was fitted
+    on another campaign (campaign_key of its files against that of cfg, the keys of ignore aside).  returns (glitch
+    dict, the model's SHA-256)"""
+    model, sha = read_model(path)
+    if model.get('model') != 'windows' or not np.array_equal(np.asarray(model.get('rho_edges'), float), RHO_EDGES):
+        raise SystemExit('%s: not a window model on the amplitude bins single.RHO_EDGES' % path)
+    if model['n_window'] != n_window:
+        raise SystemExit('%s: the model has n_window = %s, the run %s' % (path, model['n_window'], n_window))
+    mine = {key: v for key, v in campaign_key(cfg).items() if key not in ignore}
+    theirs = {key: v for key, v in model['campaign'].items() if key not in ignore}
+    if mine != theirs:
+        raise SystemExit('%s: the model was fitted on another campaign (differs in %s)' % (path, _differ(mine, theirs)))
+    det = {I: dict(f=np.asarray(model[I]['f'], float), q=np.asarray(model[I]['q'], float),
+                   pi_k=np.asarray(model[I]['pi_k'], float)) for I in 'HL'}
+    return dict(model='windows', n_window=model['n_window'], zone=model['zone'], pi_m=model['pi_m'], **det), sha
 
 
 def read_meta(path):
@@ -295,6 +523,20 @@ def check_campaign(path, cfg):
         raise SystemExit('%s belongs to another campaign (differs in %s)' % (path, ', '.join(diff)))
 
 
+def check_folder(out, cfg):
+    """every result file of the folder out against the run of campaign cfg: the files of its stage must be of the
+    same campaign, those of the other stage of the same campaign_key"""
+    mine = PREFIX[cfg.get('stage', 'merger')]
+    for path in sorted(glob.glob(os.path.join(out, 'plant_*.npz')) + glob.glob(os.path.join(out, 'win_*.npz'))):
+        if os.path.basename(path).startswith(mine + '_'):
+            check_campaign(path, cfg)
+            continue
+        meta = read_meta(path)
+        if campaign_key(meta) != campaign_key(cfg):
+            raise SystemExit('%s belongs to another campaign (differs in %s)'
+                             % (path, _differ(campaign_key(meta), campaign_key(cfg))))
+
+
 def write_batch(path, cfg, run, arrays):
     """one result file, written under a temporary name in the same directory and renamed"""
     tmp = os.path.join(os.path.dirname(path) or '.', '.%s.%s.%d.tmp.npz' % (os.path.basename(path)[:-4],
@@ -307,17 +549,21 @@ def stamp():
     return time.strftime('%Y-%m-%d %H:%M:%S')
 
 
-def run(cfg, out, start, n, batch, factory, plain=False, info=None, log=print):
+def run(cfg, out, start, n, batch, factory, plain=False, info=None, log=print, glitch=True):
     """the campaign cfg over segments start .. start + n - 1 into the directory out; factory(segments) -> pe (see
-    make_analysis) is called once, before the first batch to analyse.  returns the paths written"""
+    make_analysis, glitch: True or the window model of glitch_model), or win for the windows stage (make_windows), is
+    called once, before the first batch to analyse.  returns the paths written"""
     os.makedirs(out, exist_ok=True)
-    for path in sorted(glob.glob(os.path.join(out, 'plant_*.npz'))):
-        check_campaign(path, cfg)
+    check_folder(out, cfg)
+    windows = cfg.get('stage') == 'windows'
+    if windows and plain:
+        raise ValueError('plain applies to the merger stage')
+    bins = window_bins(*cfg['window_rho']) if windows else None
     pop = population(cfg['zmin'])
     sampler = Sampler(pop, cfg['mdet_range'])
     pe, done, written, began = None, 0, [], time.time()
     for first, end in batches(start, n, batch):
-        path = os.path.join(out, 'plant_%010d_%010d.npz' % (first, end))
+        path = os.path.join(out, '%s_%010d_%010d.npz' % ('win' if windows else 'plant', first, end))
         if os.path.exists(path):
             check_campaign(path, cfg)
             done += end - first
@@ -329,7 +575,19 @@ def run(cfg, out, start, n, batch, factory, plain=False, info=None, log=print):
         if pe is None:
             pe = factory(seg)
         t2 = time.time()
-        res = pe(seg, stream(cfg['seed'], first, 'pe'), True)
+        if windows:
+            arrays = reduce_windows(pe(seg), bins)
+            m = end - first
+            times = dict(t_sim=(t1 - t0) / m, t_pe=(time.time() - t2) / m, t_plain=None)
+            arrays.update(truth, **window_shared(bins))
+            write_batch(path, cfg, dict(info or {}, host=socket.gethostname(), first=first, end=end, written=stamp(),
+                                        **times), arrays)
+            written.append(path)
+            done += m
+            log('%s  [%d, %d) %d of %d segments; simulation %.4f s, window evidences %.4f s per segment; %.0f s'
+                % (stamp(), first, end, done, n, times['t_sim'], times['t_pe'], time.time() - began), flush=True)
+            continue
+        res = pe(seg, stream(cfg['seed'], first, 'pe'), glitch)
         arrays = reduce(res, pop, cfg['mdet_range'])
         t3 = time.time()
         if plain:
@@ -369,7 +627,9 @@ def parser():
     p.add_argument('--rho-max', type=float, default=200.0, help='default: the last amplitude bin edge of the model')
     p.add_argument('--control', default='none', choices=CONTROLS)
     p.add_argument('--batch', type=int, default=512, help='segments simulated and analysed at once')
-    p.add_argument('--chunk', type=int, default=CHUNK, help='segments filtered at once inside pe_redshift')
+    p.add_argument('--chunk', type=int, default=None,
+                   help='segments filtered at once inside pe_redshift (default %d) or window_evidences (%d)'
+                        % (CHUNK, WINDOW_CHUNK))
     p.add_argument('--ymin', type=float, default=None, help='ymin of pe_redshift (default D0 / D_L(10) (1 - 1e-6))')
     p.add_argument('--zmin', type=float, default=ZMIN, help='smallest z of the population (plant and analysis); '
                    '0.99119, the lower edge of the grid cell at z = 1.025, puts the step on a cell edge')
@@ -379,20 +639,60 @@ def parser():
                    help='the same random arrival times for every template (recorded in the campaign)')
     p.add_argument('--published-tables', action='store_true',
                    help='read the tables as published, without unbias (a comparison; recorded in the campaign)')
+    p.add_argument('--glitch-states', default=None, metavar='F1:Q1,F2:Q2',
+                   help='glitches of the window model in both detectors: state probabilities f and glitch probability '
+                        'q per window in each state (not with --eps-H, --eps-L)')
+    p.add_argument('--glitch-states-H', default=None, metavar='F1:Q1,...', help='the same for H alone')
+    p.add_argument('--glitch-states-L', default=None, metavar='F1:Q1,...', help='the same for L alone')
+    p.add_argument('--n-window', type=int, default=N_WINDOW,
+                   help='windows of a segment: of the planted window model, of the windows stage and of the model')
+    p.add_argument('--stage', choices=STAGES, default='merger',
+                   help='merger: pe_redshift (default); windows: stage 1 of the window model, win_*.npz (no tables)')
+    p.add_argument('--window-rho-min', type=float, default=WINDOW_RHO[0],
+                   help='windows stage: keep the amplitude bins that overlap [window-rho-min, window-rho-max]')
+    p.add_argument('--window-rho-max', type=float, default=WINDOW_RHO[1])
+    p.add_argument('--glitch-model', default=None, metavar='JSON',
+                   help='merger stage with the window model of this file of windows_fit.py (same campaign)')
     p.add_argument('--out', required=True, help='directory of the result files')
     return p
 
 
+def n_time_of(T_, fmax):
+    """the number of matched-filter samples of a segment, 8 nu_max (bank.MassBank)"""
+    return 8 * int(np.floor(fmax * T_ + 1e-9))
+
+
 def main(argv=None, factory=None):
-    """factory: replaces the analysis with the tables (tests)"""
+    """factory: replaces the analysis with the tables, or window_evidences for the windows stage (tests)"""
     p = parser()
     a = p.parse_args(argv)
     if not (0 <= a.nbar <= 1 and 0 <= a.eps_H <= 1 and 0 <= a.eps_L <= 1):
         p.error('nbar and eps must lie in [0, 1]')
     if not (0 < a.rho_min < a.rho_max) or a.n < 1 or a.batch < 1 or a.start < 0 or not 0 <= a.seed < 2 ** 20:
         p.error('need 0 < rho_min < rho_max, n >= 1, batch >= 1, start >= 0, 0 <= seed < 2^20')
+    if a.n_window < 1 or n_time_of(T, FMAX) % a.n_window:
+        p.error('--n-window must divide the %d matched-filter samples of a segment' % n_time_of(T, FMAX))
+    windows = a.stage == 'windows'
+    if a.chunk is None:
+        a.chunk = WINDOW_CHUNK if windows else CHUNK
+    if windows and (a.glitch_model or a.plain or a.published_tables or a.shared_times or a.ymin is not None):
+        p.error('--glitch-model, --plain, --published-tables, --shared-times and --ymin are of the merger stage')
+    if windows and not (0 <= a.window_rho_min < a.window_rho_max):
+        p.error('need 0 <= window-rho-min < window-rho-max')
+    try:
+        states = glitch_states(a)
+    except ValueError as err:
+        p.error(str(err))
+    if states and (a.eps_H > 0 or a.eps_L > 0):
+        p.error('--glitch-states plants the window model: not with --eps-H, --eps-L')
     cfg = campaign(a)
-    if factory is None:
+    glitch = True
+    if a.glitch_model:
+        glitch, sha = glitch_model(a.glitch_model, cfg, a.n_window)
+        cfg = with_model(cfg, sha, a.n_window)
+    if factory is None and windows:
+        factory = make_windows(a.device, a.n_window, a.chunk)
+    elif factory is None:
         if not glob.glob(os.path.join(a.store, 'bd_*.npz')):
             p.error('no bd_*.npz in %s' % a.store)
 
@@ -405,7 +705,7 @@ def main(argv=None, factory=None):
     print('%s  campaign %s; segments %d to %d in batches of %d into %s'
           % (stamp(), json.dumps(cfg), a.start, a.start + a.n - 1, a.batch, a.out), flush=True)
     run(cfg, a.out, a.start, a.n, a.batch, factory, a.plain,
-        dict(device=a.device, chunk=a.chunk, resident=a.resident, pid=os.getpid()))
+        dict(device=a.device, chunk=a.chunk, resident=a.resident, pid=os.getpid()), glitch=glitch)
     return 0
 
 

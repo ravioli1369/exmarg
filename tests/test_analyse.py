@@ -14,6 +14,7 @@ from exmarg import strain
 from exmarg.detectors import S
 from exmarg.search import RHO_EDGES, controls, mass_bank, mixture
 from test_mixture import EDGES, LAWS, Toy, law
+from test_plant import make_model, synthetic_B, window_stub
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -27,6 +28,7 @@ def _script(name, folder):
 
 analyse = _script('analyse', 'real_data')
 summarize = _script('summarize', 'real_data')
+windows_fit = _script('windows_fit', 'validate')
 plant_fit = summarize.plant_fit
 plant = analyse.plant
 
@@ -162,14 +164,15 @@ class Stub:
     records the calls"""
 
     def __init__(self):
-        self.calls = []
+        self.calls, self.glitches = [], []
 
     def factory(self, seg0):
         return self.pe
 
-    def pe(self, seg, seed, rows):
+    def pe(self, seg, seed, rows, glitch=True):
         rows = np.asarray(rows)
         self.calls.append((seed, rows.copy()))
+        self.glitches.append(glitch)
         n = rows.size
         g = plant.GRID
         m1, z = np.geomspace(*g['m1_range'], g['nm1']), np.linspace(0.02, g['zmax'], g['nz'])
@@ -178,7 +181,8 @@ class Stub:
         Md = 2.0 * m1[:, None] * (1.0 + z[None, :])
         shape = np.where((Md >= 20) & (Md <= 400), 0.1 * np.log1p(z)[None, :] - m1[:, None] / 500, -np.inf)
         res = dict(m1=m1, z=z, rows=rows, ln_lambda=a[:, None, None] + shape[None])
-        for j, key in enumerate(plant.KEYS[1:]):
+        windows = isinstance(glitch, dict)                       # the window model: its outputs, functions of it
+        for j, key in enumerate(('ln_B', 'ln_lambda_H', 'ln_lambda_L') if windows else plant.KEYS[1:]):
             res[key] = res['ln_lambda'] + 0.1 * (j + 1)
         nr, nm = RHO_EDGES.size - 1, plant.MASSES.size
         for I in 'HL':
@@ -186,7 +190,13 @@ class Stub:
                 * np.linspace(-1, 2, nr)[None, None, :]
             res['wmax_' + I] = (np.abs(seg['d_' + I][rows]) ** 2 / seg['sig2']).max(axis=1)[:, None] \
                 * np.linspace(0.5, 1, nm)[None]
-        res.update(rho_edges=RHO_EDGES.copy(), glitch_pi_k=np.full(nr, 1.0 / nr), glitch_window=0.1)
+            if windows:
+                res['ln_c_' + I] = q[I] * glitch[I]['q'][-1]
+                res['state_' + I] = np.tile(np.asarray(glitch[I]['f']), (n, 1))
+        if windows:
+            res.update(rho_edges=RHO_EDGES.copy(), ln_B=res['ln_B'] - 10.0 * glitch['H']['q'][0])
+        else:
+            res.update(rho_edges=RHO_EDGES.copy(), glitch_pi_k=np.full(nr, 1.0 / nr), glitch_window=0.1)
         return res
 
 
@@ -557,3 +567,270 @@ def test_summarize_table(toy_week, capsys):
     assert code == 0 and 'all pass' in text                  # the toy controls have no mergers: all pass
     assert all(l.split(None, 11)[-1].startswith('PASS') for l in text.splitlines() if l.split(' ')[0] in summarize.ORDER)
     print('\n' + text)
+
+
+# ----------------------------------------------------------------------------------------------- the window model
+
+
+class WinStub:
+    """pe.window_evidences in place for the week: test_plant.window_stub of the rows asked; records the calls"""
+
+    def __init__(self, n_window=plant.N_WINDOW):
+        self.calls, self.n_window = [], n_window
+
+    def factory(self, seg0):
+        return self.win
+
+    def win(self, seg, rows):
+        self.calls.append(np.asarray(rows).copy())
+        return window_stub(seg, np.asarray(rows), self.n_window)
+
+
+def test_windows_stage_week(week, tmp_path):
+    """analyse.main --stage windows next to the merger stage: in every variant the win files have the names (k ranges)
+    of the plant files and the same k, gps, flags, monitors, truth and wmax; ln_window_I float32 (n, 64, 14) is the
+    stub's on the selected rows of the variant's data; one call per epoch with the rows of every variant (those of the
+    merger stage); the meta is the campaign without the merger settings, with stage 'windows', and campaign_key that of
+    the plant files; --part splits and --variants subsets give the same files bit for bit; a second run calls nothing;
+    a run of another seed or n_window into the folder stops.  windows_fit reads a variant whole, and refuses it with a
+    file missing at the end (the selection)"""
+    out = tmp_path / 'w'
+    merger = drive(week, out, '--epochs-per-file', '1')
+    win = drive(week, out, '--epochs-per-file', '1', '--stage', 'windows', stub=WinStub())
+    assert len(win.calls) == 3 and all(np.array_equal(a, b) for a, b in zip(win.calls, [c[1] for c in merger.calls]))
+    s = plant.Sampler(plant.population(analyse.ZMIN), plant.MDET)
+    bins = plant.window_bins(3.0, 12.2)
+    a = analyse.parse(['x', 'cpu', week, '--out', 'x', '--seed', '7', '--epochs-per-file', '1'])[1]
+    sel = analyse.selection(week)
+    for v in analyse.VARIANTS:
+        plants = sorted(os.path.basename(f) for f in glob.glob(str(out / v / 'plant_*.npz')))
+        wins = sorted(os.path.basename(f) for f in glob.glob(str(out / v / 'win_*.npz')))
+        assert [w[4:] for w in wins] == [p[6:] for p in plants] and len(wins) == 3, v
+        for p, w, e in zip(plants, wins, [e for e in sel if e['n_selected']]):
+            mp, mw = plant.read_meta(out / v / p), plant.read_meta(out / v / w)
+            assert mw['stage'] == 'windows' and plant.campaign_key(mw) == plant.campaign_key(mp) and 'ymin' not in mw
+            mw.pop('run')
+            a.stage = 'windows'
+            assert mw == analyse.campaign(a, week, v)
+            a.stage = 'merger'
+            ep = strain.read_epoch(os.path.join(week, e['name']))
+            var, rows, inj = analyse.variants(dict(seed=7, nbar_inj=0.3), ep, (v,), s)
+            ref = window_stub(var[v], np.arange(rows.size), 64)
+            with np.load(out / v / p) as fp, np.load(out / v / w) as fw:
+                for key in fp.files:
+                    if key in fw.files and key != 'meta':
+                        assert np.array_equal(fp[key], fw[key], equal_nan=fp[key].dtype.kind == 'f'), (v, key)
+                assert {'gps', 'monitor_H', 'event', 'merger', 'wmax_L'} <= set(fw.files)
+                for I in 'HL':
+                    assert fw['ln_window_' + I].dtype == np.float32
+                    assert fw['ln_window_' + I].shape == (rows.size, 64, 14)
+                    assert np.array_equal(fw['ln_window_' + I], ref['ln_window_' + I][:, :, bins].astype(np.float32))
+    two = tmp_path / 'two'
+    drive(week, two, '--epochs-per-file', '1', '--stage', 'windows', '--part', '0/2', stub=WinStub())
+    drive(week, two, '--epochs-per-file', '1', '--stage', 'windows', '--part', '1/2', '--variants', 'pr,inj',
+          stub=WinStub())
+    drive(week, two, '--epochs-per-file', '1', '--stage', 'windows', '--part', '1/2', stub=WinStub())
+    for v in analyse.VARIANTS:
+        for f in glob.glob(str(out / v / 'win_*.npz')):
+            with np.load(f) as x, np.load(two / v / os.path.basename(f)) as y:
+                for key in x.files:
+                    if key != 'meta':
+                        assert np.array_equal(x[key], y[key], equal_nan=x[key].dtype.kind == 'f'), (v, key)
+    assert drive(week, out, '--epochs-per-file', '1', '--stage', 'windows', stub=WinStub()).calls == []
+    with pytest.raises(SystemExit, match='another campaign.*seed'):
+        drive(week, out, '--epochs-per-file', '1', '--stage', 'windows', '--seed', '8', stub=WinStub())
+    with pytest.raises(SystemExit, match='another campaign.*n_window'):
+        drive(week, out, '--epochs-per-file', '1', '--stage', 'windows', '--n-window', '32', stub=WinStub(32))
+    cfg, d, shared, paths = windows_fit.load(str(out / 'pr'))
+    n_sel = sum(e['n_selected'] for e in sel)
+    assert np.array_equal(d['k'], np.arange(n_sel)) and len(paths) == 3
+    os.remove(sorted(paths)[-1])
+    with pytest.raises(SystemExit, match='cover k 0 to 60 of the 94 selected'):
+        windows_fit.load(str(out / 'pr'))
+
+
+def windows_week(week, out):
+    """the windows stage of the synthetic week into out and a made-up model per variant (distinct q) in
+    <out>/<variant>/glitch_model.json with the campaign key of its files: {variant: SHA-256}"""
+    drive(week, out, '--epochs-per-file', '2', '--stage', 'windows', stub=WinStub())
+    shas = {}
+    for i, v in enumerate(analyse.VARIANTS):
+        meta = plant.read_meta(sorted(glob.glob(str(out / v / 'win_*.npz')))[0])
+        shas[v] = make_model(out / v / 'glitch_model.json', plant.campaign_key(meta), q_scale=1.0 + i)
+    return shas
+
+
+def test_model_stage_week(week, tmp_path):
+    """--glitch-model auto: every variant is one pe call per epoch with its own model (q of its file) at its rows of
+    the merger stage and the seed stream(seed, GPS of the epoch, 'pe'); its files record glitch_model 'windows', that
+    model's SHA-256 and n_window, and hold ln_B_bar, ln_c_I, state_I and no ln_lambda_g*.  A given file is used for
+    every variant (fitted on a variant of the same week).  Refused before any call: a variant without its model, the
+    model of another variant in auto, another n_window, a model of another week as a given file, a modified file, and
+    --glitch-model with --stage windows"""
+    out = tmp_path / 'm'
+    shas = windows_week(week, out)
+    stub = drive(week, out, '--epochs-per-file', '2', '--glitch-model', 'auto')
+    sel = {1266933768: np.setdiff1d(np.arange(NSEG), [3, 30]), 1266934296: np.setdiff1d(np.arange(NSEG), [8, 9, 20]),
+           1266934560: np.arange(NSEG)}
+    expect = [(plant.stream(7, g, 'pe'), analyse.VARIANTS.index(v) * NSEG + sel[g], v)
+              for g in sel for v in analyse.VARIANTS]
+    assert len(stub.calls) == len(expect)
+    for (seed, rows), glitch, (seed_e, rows_e, v) in zip(stub.calls, stub.glitches, expect):
+        model = plant.read_model(str(out / v / 'glitch_model.json'))[0]
+        assert seed == seed_e and np.array_equal(rows, rows_e) and glitch['model'] == 'windows', v
+        assert all(np.array_equal(glitch[I][p], model[I][p]) for I in 'HL' for p in ('f', 'q', 'pi_k')), v
+    for v in analyse.VARIANTS:
+        for f in glob.glob(str(out / v / 'plant_*.npz')):
+            meta = plant.read_meta(f)
+            assert meta['glitch_model'] == 'windows' and meta['glitch_model_sha256'] == shas[v]
+            assert meta['n_window'] == 64
+            with np.load(f) as x:
+                assert {'ln_B_bar', 'ln_c_H', 'state_L', 'ln_lambda_bar'} <= set(x.files)
+                assert not [k for k in x.files if k.startswith('ln_lambda_g')] and x['state_H'].shape[1] == 2
+    assert drive(week, out, '--epochs-per-file', '2', '--glitch-model', 'auto').calls == []
+    given = tmp_path / 'given'
+    drive(week, given, '--epochs-per-file', '2', '--glitch-model', str(out / 'slide+0.5' / 'glitch_model.json'))
+    assert {plant.read_meta(f)['glitch_model_sha256'] for f in glob.glob(str(given / '*' / 'plant_*.npz'))} == {
+        shas['slide+0.5']}
+    bad = tmp_path / 'bad'
+    windows_week(week, bad)
+    os.remove(bad / 'rev' / 'glitch_model.json')
+    for extra, match in ((('--glitch-model', 'auto'), 'rev/glitch_model.json: no glitch model'),
+                         (('--glitch-model', 'auto', '--n-window', '32'), 'n_window = 64, the run 32')):
+        stub = Stub()
+        with pytest.raises(SystemExit, match=match):
+            drive(week, bad, '--epochs-per-file', '2', *extra, stub=stub)
+        assert stub.calls == []
+    import shutil
+    shutil.copy(bad / 'pr' / 'glitch_model.json', bad / 'rev' / 'glitch_model.json')
+    with pytest.raises(SystemExit, match='rev/glitch_model.json: the model was fitted on another campaign.*control'):
+        drive(week, bad, '--epochs-per-file', '2', '--glitch-model', 'auto', stub=Stub())
+    meta = plant.read_meta(sorted(glob.glob(str(bad / 'pr' / 'win_*.npz')))[0])
+    make_model(tmp_path / 'other_week.json', dict(plant.campaign_key(meta), manifest_sha256='f' * 64))
+    with pytest.raises(SystemExit, match='another campaign.*manifest_sha256'):
+        drive(week, tmp_path / 'x', '--epochs-per-file', '2', '--glitch-model', str(tmp_path / 'other_week.json'))
+    changed = json.loads(open(bad / 'pr' / 'glitch_model.json').read())
+    changed['H']['f'] = [0.7, 0.3]
+    with open(tmp_path / 'changed.json', 'w') as fh:
+        json.dump(changed, fh)
+    with pytest.raises(SystemExit, match='modified'):
+        drive(week, tmp_path / 'x', '--epochs-per-file', '2', '--glitch-model', str(tmp_path / 'changed.json'))
+    with pytest.raises(SystemExit):
+        analyse.parse(['x', 'cpu', week, '--out', 'x', '--stage', 'windows', '--glitch-model', 'auto'])
+    assert not glob.glob(str(tmp_path / 'x' / '*' / 'plant_*.npz'))
+
+
+def test_variant_keys_agree():
+    """the keys a variant defines are the same in analyse.py and summarize.py (which adds the model's SHA-256)"""
+    assert set(summarize.VARIANT_KEYS) == set(analyse.VARIANT_KEYS) | {'glitch_model_sha256'}
+
+
+def fake_report_w(log, failing=(), cfgs=None):
+    """plant_fit.report of files of the window model in place"""
+    def report(path, **kw):
+        v = os.path.basename(path)
+        log.append(v)
+        ok = v not in failing
+        crit = [('window model: nbar consistent with 0', ok, '', True),
+                ('Gaussian: nbar consistent with 0', False, '', v == 'pr')]
+        fitted = dict(nbar=0.01, err=dict(nbar=0.01))
+        model = dict(n_window=64, H=dict(f=[0.8, 0.2], q=[0.004, 0.05]), L=dict(f=[0.9, 0.1], q=[0.002, 0.08]))
+        return dict(kind='recorded' if v == 'zero' else 'control', ok=ok, criteria=crit, rho_min=None, model='windows',
+                    cfg=(cfgs or {}).get(v, {}), window_model=model, fits=dict(windows=fitted, gauss=fitted),
+                    curves=dict(gauss=np.zeros(3), windows=np.zeros(3)), keep=np.ones(10, bool),
+                    lines=['the report of %s' % v])
+    return report
+
+
+def guard_week_w(root, week, files=None, only=None, change=None):
+    """guard_week with the meta of the merger stage with the window model (a SHA-256 per variant); change: {variant:
+    dict of meta entries replaced}.  returns n_selected and the campaigns"""
+    sel = analyse.selection(week)
+    n = sum(e['n_selected'] for e in sel)
+    os.makedirs(root, exist_ok=True)
+    analyse.record_selection(str(root), sel)
+    args = analyse.parse(['x', 'cpu', week, '--out', 'x', '--seed', '7'])[1]
+    cfgs = {v: dict(analyse.campaign(args, week, v, '%064x' % (i + 1)), **(change or {}).get(v, {}))
+            for i, v in enumerate(analyse.VARIANTS)}
+    for v in analyse.VARIANTS if only is None else only:
+        os.makedirs(os.path.join(root, v), exist_ok=True)
+        for first, end in (files or {}).get(v, [(0, n // 2), (n // 2, n)]):
+            path = os.path.join(root, v, 'plant_%010d_%010d.npz' % (first, end))
+            if v == 'zero':
+                open(path, 'wb').close()
+            else:
+                plant.write_batch(path, cfgs[v], dict(first=first, end=end), dict(k=np.arange(first, end)))
+    return n, cfgs
+
+
+def test_summarize_guard_window_model(week, tmp_path, monkeypatch, capsys):
+    """summarize on variants of the window model (each its own SHA-256, which is allowed): the controls in the fixed
+    order with the table of the window model; zero never opened without --recorded, opened last with it when every
+    control passes, and not opened when one fails; incomplete controls, a variant analysed with the mixture (no
+    glitch_model) or with another n_window are refused before any fit"""
+    n, cfgs = guard_week_w(tmp_path / 'ok', week)
+    order = list(summarize.ORDER)
+    for argv, failing, opened, code, says in (
+            ([], (), order, 0, 'is not opened'),
+            (['--recorded'], (), order + ['zero'], 0, 'all pass: opening the week as recorded'),
+            (['--recorded'], ('rev',), order, 1, 'NOT all pass: the week as recorded stays closed'),
+            ([], ('inj',), order, 1, 'NOT all pass')):
+        log = []
+        monkeypatch.setattr(summarize.plant_fit, 'report', fake_report_w(log, failing, cfgs))
+        assert summarize.main([str(tmp_path / 'ok')] + argv) == code, (argv, failing)
+        text = capsys.readouterr().out
+        assert log == opened and says in text, (argv, failing, log, text)
+        assert 'window nbar' in text and 'glitches/seg H' in text and '0.8448' in text and '0.6272' in text
+        assert [l.split()[7] for l in text.splitlines() if l.split(' ')[0] in order] == [
+            cfgs[v]['glitch_model_sha256'][:12] for v in order]
+    for name, files, change, match in (
+            ('partial', {v: [(0, n // 2)] for v in summarize.ORDER}, None, 'missing'),
+            ('mixture', None, {'slide-1.75': dict(glitch_model=None)}, 'slide-1.75.*glitch_model'),
+            ('n_window', None, {'rev': dict(n_window=32)}, 'rev.*n_window')):
+        root = tmp_path / name
+        guard_week_w(root, week, files, change=change)
+        log = []
+        monkeypatch.setattr(summarize.plant_fit, 'report', fake_report_w(log))
+        with pytest.raises(SystemExit, match=match):
+            summarize.main([str(root), '--recorded'])
+        assert log == [], (name, log)
+
+
+def test_summarize_window_model_table(week, tmp_path, capsys):
+    """summarize end to end on synthetic files of the window model in every variant (Bbar of test_plant.synthetic_B:
+    no mergers in the controls, mergers at 0.05 injected): each row has the numbers of plant_fit.report, the controls
+    and the injections pass, and the recorded week is not opened"""
+    out = tmp_path / 'toy'
+    os.makedirs(out)
+    with open(out / 'selection.txt', 'w') as fh:
+        fh.write('epoch_1266933768.npz 1266933768 6000 6000 0\n')
+    a = analyse.parse(['x', 'cpu', week, '--out', 'x', '--seed', '7', '--nbar-inj', '0.05'])[1]
+    rng = np.random.default_rng(3)
+    for i, v in enumerate(analyse.VARIANTS):
+        lnB, m = synthetic_B(6000, 0.05 if v in ('inj', 'zero') else 0.0, 30 + i)
+        m = m if v == 'inj' else np.zeros(6000, bool)
+        n = lnB.size
+        per = dict(k=np.arange(n), ln_B_bar=lnB, ln_lambda_bar=lnB + 2.0 * (rng.random(n) < 0.05),
+                   ln_lambda_H_bar=0.5 * lnB, ln_lambda_L_bar=0.5 * lnB, w_inf=np.zeros(n), merger=m, merger_H=m,
+                   merger_L=m, coherent=m, m1=np.full(n, np.nan), z=np.full(n, np.nan), y=np.zeros(n),
+                   snr=np.zeros(n), gps=1.2669e9 + 8.0 * np.arange(n))
+        for I in 'HL':
+            per.update({'ln_c_' + I: np.zeros(n), 'state_' + I: np.tile([0.9, 0.1], (n, 1)),
+                        'ln_glitch_' + I: np.zeros((n, RHO_EDGES.size - 1)), 'wmax_' + I: rng.exponential(5.0, n),
+                        'glitch_' + I: np.zeros(n, bool), 'kind_' + I: np.full(n, ''), 'rho_' + I: np.full(n, np.nan),
+                        't0_' + I: np.full(n, np.nan)})
+        os.makedirs(out / v)
+        plant.write_batch(str(out / v / ('plant_%010d_%010d.npz' % (0, n))), analyse.campaign(a, week, v, '%064x' % 5),
+                          dict(first=0, end=n), dict(per, rho_edges=RHO_EDGES, glitch_pi_k=np.array(np.nan),
+                                                     glitch_window=np.array(np.nan),
+                                                     w_inf_cells=np.zeros((0, 2), np.int32)))
+    code = summarize.main([str(out)])
+    text = capsys.readouterr().out
+    print('\n' + text)
+    for v in summarize.ORDER:
+        r = plant_fit.report(str(out / v))
+        W = r['fits']['windows']
+        line = [l for l in text.splitlines() if l.startswith(v + ' ')][0]
+        assert '%s+-%s' % (plant_fit._f(W['nbar'], '%.3g'), plant_fit._f(W['err']['nbar'], '%.2g')) in line, (v, line)
+        assert line.split()[1] == str(int(r['keep'].sum())) and 'PASS' in line, line
+    assert code == 0 and 'is not opened' in text and not any(l.startswith('zero ') for l in text.splitlines())

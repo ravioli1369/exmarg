@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 
 from exmarg.detectors import S
-from exmarg.glitches import add_burst_glitches, add_template_glitches, power_law_snr
+from exmarg.glitches import add_burst_glitches, add_template_glitches, glitch_signal, power_law_snr
 from exmarg.search import mass_bank
 
 T, FMIN, FMAX = 4.0, 25.0, 256.0
@@ -206,3 +206,47 @@ def test_sine_gaussian_peaks_at_f0_and_ranges():
         assert abs(seg['f'][np.argmax(np.abs(new['d_H'][k]))] - r['f0'][k]) <= 1.0 / T     # the spectrum peaks at f0
     with pytest.raises(ValueError):
         add_burst_glitches(seg, 1.0, lambda rng: 10.0, 'chirp', seed=2)
+
+
+@pytest.mark.parametrize('kind', KINDS)
+def test_glitch_signal_is_the_glitch_of_add(kind):
+    """glitch_signal, given the generator of add_template_glitches or add_burst_glitches (seed [seed, 0]) after their
+    presence, SNR and time draws, returns bit for bit the signal those add to zero data, with the same shape parameters,
+    in H (drawn first) and in L (after the draws of H); its SNR on the noise curve of the detector asked is rho; an
+    unknown kind raises"""
+    seg = segments(1, seed=8, noise=False)
+    draw_rho, masses = power_law_snr(3.0, 4.0, 40.0), [30.0, 45.0, 60.0]
+    for I, J in (('H', 'L'), ('L', 'H')):
+        new, rec = add(kind, seg, {I: 1.0, J: 0.0}, draw_rho, seed=13)
+        rng = np.random.default_rng([13, 0])
+        rng.uniform(), draw_rho(rng), rng.uniform(0.0, T)
+        if I == 'L':                                            # H draws presence, SNR, time and shape first
+            glitch_signal(seg, 'H', kind, 1.0, 0.0, rng, masses=masses)
+            rng.uniform(), draw_rho(rng), rng.uniform(0.0, T)
+        h, p = glitch_signal(seg, I, kind, rec[I]['rho'][0], rec[I]['t0'][0], rng, masses=masses)
+        assert np.array_equal(h, new['d_' + I][0]) and np.all(new['d_' + J] == 0), (kind, I)
+        assert all(p[key] == rec[I][key][0] for key in p), (p, {key: rec[I][key][0] for key in p})
+        assert abs(snr2(h, seg['sig2_' + I]) / rec[I]['rho'][0] ** 2 - 1) < 1e-12
+    assert not np.array_equal(seg['sig2_L'], seg['sig2_H'])
+    with pytest.raises(ValueError):
+        glitch_signal(seg, 'H', 'chirp', 7.0, 1.0, np.random.default_rng(2))
+
+
+def test_glitch_signal_template_peak():
+    """a template glitch of glitch_signal at a sample t0 of the matched filter peaks there with |z|^2 / u = rho^2 / 2
+    (as add_template_glitches with time_step); two of them in one segment at different times give two peaks"""
+    seg = segments(1, noise=False)
+    seg['sig2_L'] = seg['sig2_H'].copy()
+    bank = mass_bank(np.array([40.0]), seg, 'cpu')
+    dt = bank.T / bank.n_time
+    sig2 = {'H': seg['sig2_H'], 'L': seg['sig2_L']}
+    rng = np.random.default_rng(4)
+    i0, i1 = 1234, 6000
+    h0, _ = glitch_signal(seg, 'H', 'template', 11.0, i0 * dt, rng, masses=[40.0])
+    h1, _ = glitch_signal(seg, 'H', 'template', 6.0, i1 * dt, rng, masses=[40.0])
+    for h, peaks in ((h0, [(i0, 11.0)]), (h0 + h1, [(i0, 11.0), (i1, 6.0)])):
+        lq = bank.trajectories({'H': h, 'L': np.zeros_like(h)}, sig2)['lqH']
+        power = np.exp(2.0 * lq.astype(float))[0] / bank.u[0]
+        for i, rho in peaks:
+            window = power[i - 64:i + 65]
+            assert int(np.argmax(window)) == 64 and abs(window[64] / (rho ** 2 / 2) - 1) < 2e-3, (i, window[64])
