@@ -246,3 +246,31 @@ def test_select_times_shared():
         assert np.all(np.abs(est.mean(axis=0) - f.sum(axis=1)) < 4 * err), \
             "shared %s: selected sum %s +- %s, full sum %s" % (shared, est.mean(axis=0), err, f.sum(axis=1))
         assert np.all(err < 0.02 * f.sum(axis=1)), "the test resolves a bias of a few percent"
+
+
+def test_float64_weights_deep_in_the_tail(case):
+    """a log weight near -3000 reaches the CPU gather in float64: float32 has a spacing of 2.4e-4 there and would
+    round -3000.00005 by 5e-5 (and each weight of a random set by up to 1.2e-4), 50 times RTOL"""
+    a, lkH, lkL = case
+    n_time = lkH.size
+    d = -3000.00005
+    flat = np.full(n_time, d)
+    got = gather_cpu(**a, time_weights=(flat, np.zeros(n_time)))       # a constant weight is a shift of ln Lambda
+    np.testing.assert_allclose(got[1], got[0] + d, rtol=0, atol=1e-9)
+    wH, wL = lkH.astype(np.float64) + d, lkL.astype(np.float64) + d
+    got = gather_cpu(**a, time_weights=(wH, wL))
+    _close(got, reference(**a, lkH=wH, lkL=wL))
+
+
+def test_nan_time_weights(case):
+    """a NaN time weight is an error naming the weights (and the times); -inf is a zero weight, clipped at LK_MIN"""
+    a, lkH, lkL = case
+    bad = lkH.copy()
+    bad[[7, 100]] = np.nan
+    with pytest.raises(ValueError, match=r"lkH has 2 NaN.*\[7, 100\]"):
+        gather_cpu(**a, time_weights=(bad, lkL))
+    with pytest.raises(ValueError, match=r"lkL has 2 NaN"):
+        gather_cpu(**a, time_weights=(lkH, bad))
+    ok = lkH.copy()
+    ok[7] = -np.inf
+    assert np.all(np.isfinite(gather_cpu(**a, time_weights=(ok, lkL))))

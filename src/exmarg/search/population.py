@@ -8,8 +8,9 @@ on the (m1, z) grid of pe_redshift, with the cell weights of notebook 07 (and of
     w(m1, z) ~ p(m1) p(z) dm1 dz      inside mdet_range of M_det = 2 m1 (1 + z), zero outside, sum 1
 
 dm1, dz the np.gradient spacings of the grid, p(m1), p(z) the population of exmarg.priors.population_m1_z()
-interpolated on the grid (zero outside its tables).  A cell where ln Lambda is -inf or nan (outside the bank)
-adds nothing.  The same average applies to ln_lambda_gH, ln_lambda_gL, ln_lambda_H, ln_lambda_L of pe_redshift.
+interpolated on the grid (zero outside its tables).  A cell where ln Lambda is -inf (outside the bank) adds
+nothing; a nan anywhere is a ValueError, not a Lambda of 0.  The same average applies to ln_lambda_gH,
+ln_lambda_gL, ln_lambda_H, ln_lambda_L of pe_redshift.
 """
 
 import numpy as np
@@ -41,18 +42,24 @@ def ln_lambda_bar(ln_lambda, m1, z, mdet_range=(20.0, 400.0), population=None, c
 
     ln_lambda  (n_segment, nm1, nz) or (nm1, nz): ln Lambda on the grid (m1, z) of pe_redshift
     m1, z, mdet_range, population  see population_weights
-    chunk      segments averaged at once"""
+    chunk      segments averaged at once
+
+    -inf is Lambda = 0; nan (a likelihood ratio that failed) raises ValueError naming the segments."""
     w = population_weights(m1, z, mdet_range, population)
     L = np.asarray(ln_lambda, float)
     one = L.ndim == 2
     L = L[None] if one else L
     if L.shape[1:] != w.shape:
         raise ValueError('ln_lambda has cells %s, the grid %s' % (L.shape[1:], w.shape))
+    nan = np.nonzero(np.isnan(L).any(axis=(1, 2)))[0]
+    if nan.size:
+        raise ValueError('ln_lambda has NaN in %d of %d segments, segments %s'
+                         % (nan.size, L.shape[0], nan[:20].tolist()))
     pos = w > 0
     out = np.empty(L.shape[0])
     for c in range(0, L.shape[0], chunk):
         V = L[c:c + chunk]
-        ok = (V > -np.inf) & pos[None]                     # nan and -inf count as Lambda = 0
+        ok = (V > -np.inf) & pos[None]                     # -inf counts as Lambda = 0
         V = np.where(ok, V, -np.inf)
         mx = V.max(axis=(1, 2))
         sh = np.where(np.isfinite(mx), mx, 0.0)

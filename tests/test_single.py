@@ -262,3 +262,84 @@ def test_log_weights():
     ref = logsumexp(phi[None] + lw[:, None, :], axis=2) - np.log(nt)
     print("ln_merger_at with log weights: max error %.1e" % np.abs(got - ref).max())
     assert np.abs(got - ref).max() < 2e-5
+
+
+def test_glitch_time_series_zero_weight_block():
+    """templates with pi_m = 0 for a whole block (the log-sum-exp over the block has max -inf): the series is that of
+    the templates with weight, whatever the block size, and glitch_time_weights of an all -inf series (no glitch
+    evidence anywhere) is the weights of a flat one: no time is preferred, the probability that the glitch is away
+    from t' is 1 - (2 W + 1) / n"""
+    rng = np.random.default_rng(0)
+    lq, ln_u, w = trajectory(rng, 6, 2048, loud=[(4, 100, 60.0)])
+    pk = single.amplitude_weights()
+    pm = np.array([0.0, 0.0, 0.0, 0.0, 0.5, 0.5])
+    ref = single.glitch_time_series(lq[4:], ln_u[4:], pk, pm[4:])
+    for block in (256, 2, 1):
+        with np.errstate(invalid="raise"):                 # the nan came from -inf - -inf
+            lg = single.glitch_time_series(lq, ln_u, pk, pm, block=block)
+        assert np.isfinite(lg).all()
+        np.testing.assert_allclose(lg, ref, rtol=0, atol=1e-12)
+    lg = single.glitch_time_series(lq, ln_u, pk, np.zeros(6), block=2)          # no weight at all
+    assert np.all(lg == -np.inf)
+    n, hw = 64, 5
+    ln_k, ln_n = single.glitch_time_weights(np.full(n, -np.inf), hw)
+    assert np.allclose(np.exp(ln_k), 1.0 - (2 * hw + 1) / n, rtol=0, atol=1e-14)
+    assert np.allclose(np.exp(ln_n), (2 * hw + 1) / n, rtol=1e-14, atol=0)
+
+
+def test_vloud_off_grid():
+    """a vloud that is not a multiple of DV: the quiet set is v <= DV (J - 2) and the loud set the rest, so every
+    arrival time is counted once.  The unit column has ln E = 0 and so has a unit merger column of ln_merger_at;
+    columns l(w; x) against the exact sum; and the mean of the glitch time series against sum pi_m pi_k E"""
+    rng = np.random.default_rng(3)
+    lq, ln_u, w = trajectory(rng, 2, 20000, loud=[(0, 10, 40.0)])
+    nm, nt = w.shape
+    unit = np.zeros((single.NV, 1))
+    xs = np.array([0.5, 25.0])
+    lnT = ln_l(single.V[:, None] ** 2, xs[None, :])
+    ref = logsumexp(ln_l(w[:, :, None], xs[None, None, :]), axis=1) - np.log(nt)
+    pk = rng.uniform(0.0, 1.0, single.RHO_EDGES.size - 1)
+    pk /= pk.sum()
+    for vloud in (2.0, 1.234, 1.236, 1.2349, 0.5):
+        got = single.ln_evidence(lq, ln_u, unit, vloud=vloud)
+        print("vloud %.4f: ln E of the unit column %+.1e" % (vloud, np.abs(got).max()))
+        assert np.abs(got).max() < 1e-12
+        assert np.abs(single.ln_evidence(lq, ln_u, lnT, vloud=vloud) - ref).max() < 2e-5
+        lnE = single.ln_evidence(lq, ln_u, single.glitch_columns(), vloud=vloud)
+        lg = single.glitch_time_series(lq, ln_u, pk, vloud=vloud)
+        assert abs(logsumexp(lg) - np.log(nt) - logsumexp(lnE + np.log(pk)[None, :] - np.log(nm))) < 1e-12
+    s = np.array([0.5, 4.0])
+    phi = np.stack([single._ln_phi(np.sqrt(w[m]), np.full(nt, s[m])) for m in range(nm)])
+    ref = logsumexp(phi, axis=1) - np.log(nt)
+    for vloud in (1.234, 1.236):
+        assert np.abs(single.ln_merger_at(lq, ln_u, s, vloud=vloud) - ref).max() < 2e-5
+
+
+def test_ln_evidence_steep_columns_below_vloud():
+    """accuracy of ln_evidence of the amplitude bins for rows whose arrival times are all below vloud, where the
+    histogram route interpolates T linearly in v (less its curvature term): the reference is the quadrature of the
+    columns themselves (single._ln_bin) at the v of every time.  Up to rho = 12.2 (the bins that are used) the worst
+    error of ln E is 1.2e-5 (the last of these bins, times piled at v = 1.995), growing like rho^4 for the steeper
+    bins (1e-3 at rho ~ 35, 1e-2 at 60, 0.33 at 140) which weigh exp(-450) and less in the sums over the bins; the
+    fiducial sum G = sum_k pi_k E_k is right to 3e-7 in ln G"""
+    e = single.RHO_EDGES
+    nb = int(np.searchsorted(e, 12.2 + 1e-9)) - 1
+    assert nb == 19 and e[nb] < 12.2
+    pk = single.amplitude_weights()
+    rng = np.random.default_rng(2)
+    nt = 4096
+    errs = []
+    for v in (np.sqrt(np.minimum(rng.exponential(size=nt), 3.9)), rng.uniform(0.0, 2.0, nt), np.full(nt, 1.995)):
+        lq = np.log(v).astype(np.float32)[None]
+        v = np.exp(lq[0].astype(float))
+        got = single.ln_evidence(lq, np.zeros(1), single.glitch_columns())[0]
+        ref = np.empty(e.size - 1)
+        for k, (a, b) in enumerate(zip(e[:-1], e[1:])):
+            c = np.linspace(a, b, int(np.ceil((b - a) / 2.0)) + 1)
+            p = np.stack([single._ln_bin(v, c0, c1) for c0, c1 in zip(c[:-1], c[1:])])
+            ref[k] = logsumexp(logsumexp(p, axis=0) - np.log(b - a)) - np.log(nt)
+        errs.append(np.abs(got[:nb] - ref[:nb]).max())
+        print("rows below vloud: worst |d ln E| of the bins up to rho = 12.2: %.1e; of all bins %.1e; ln G error %.1e"
+              % (errs[-1], np.abs(got - ref).max(), logsumexp(got, b=pk) - logsumexp(ref, b=pk)))
+        assert errs[-1] < 5e-5
+        assert abs(logsumexp(got, b=pk) - logsumexp(ref, b=pk)) < 1e-6

@@ -271,7 +271,8 @@ def fit(lam, lam_gH, lam_gL, E_H, E_L, rho_edges, start=None, fixed=('rho_min_H'
                          law (lambda_I = glitch_evidence(Y_I, pi_k) / glitch_evidence(E_I, pi_k))
     E_H, E_L             (n_segment, n_template, n_rho) or (n_segment, n_rho): E_I[m, k]
     rho_edges            (n_rho + 1,) edges of the amplitude bins
-    start                dict of starting values (default nbar 0.01, eps 0.01, gamma 3, rho_min rho_edges[0])
+    start                dict of starting values (default nbar 0.01, eps 0.01, gamma 3, rho_min the lower
+                         bound below: rho_edges[0], or 1e-3 rho_edges[1] when that is 0)
     fixed                names held at their start value; rho_min is fixed by default, ln L has kinks in it at
                          the edges
     bounds               dict name: (lo, hi) (default nbar, eps in [0, 1], gamma in [-10, 20], rho_min between
@@ -297,9 +298,9 @@ def fit(lam, lam_gH, lam_gL, E_H, E_L, rho_edges, start=None, fixed=('rho_min_H'
                    {I: None if v is None else np.asarray(v, float) for I, v in pk.items()}, rho_max, veto)
     fixed = tuple(fixed) + tuple(p + '_' + I for I in 'HL' if pk[I] is not None for p in ('gamma', 'rho_min'))
     e = model.edges
-    th0 = dict(nbar=0.01, eps_H=0.01, eps_L=0.01, gamma_H=3.0, gamma_L=3.0, rho_min_H=e[0], rho_min_L=e[0])
-    th0.update(start or {})
     rmin = e[0] if e[0] > 0 else 1e-3 * e[1]
+    th0 = dict(nbar=0.01, eps_H=0.01, eps_L=0.01, gamma_H=3.0, gamma_L=3.0, rho_min_H=rmin, rho_min_L=rmin)
+    th0.update(start or {})
     top = e[-2] if rho_max is None else min(e[-2], e[e < rho_max].max())
     box = dict(nbar=(0.0, 1.0), eps_H=(0.0, 1.0), eps_L=(0.0, 1.0), gamma_H=(-10.0, 20.0), gamma_L=(-10.0, 20.0),
                rho_min_H=(rmin, top), rho_min_L=(rmin, top))

@@ -740,3 +740,23 @@ def test_two_stage_mergers_ignored(eps_free):
         _stage_msg('loud'), j['nbar'], d, 100 * d / j['nbar'], d / r['err']['nbar'])
     print('\n' + msg)
     assert abs(d) < 0.25 * r['err']['nbar'], msg
+
+
+def test_fit_default_start_with_pe_bins():
+    """fit with the bins of pe (single.RHO_EDGES, first edge 0) and no start: rho_min starts at the lower end of its
+    bounds, the smallest positive value the law allows (1e-3 of the second edge, as for any bins from 0), where the
+    law covers every bin, as it does from the first edge for bins that start above 0; rho_min is held there by default
+    and the fit runs"""
+    from exmarg.search import single
+    e = single.RHO_EDGES
+    n, nr = 50, e.size - 1
+    rng = np.random.default_rng(0)
+    E = rng.normal(0.0, 1.0, (n, 2, nr))
+    lam = rng.normal(0.0, 0.1, n)
+    out = mixture.fit(lam, lam, lam, E, E, e, log=True)
+    assert out['rho_min_H'] == out['rho_min_L'] == 1e-3 * e[1] > 0.0
+    assert np.isfinite(out['lnl']) and out['free'] == ['nbar', 'eps_H', 'eps_L', 'gamma_H', 'gamma_L']
+    pk = mixture.amplitude_weights(e, out['gamma_H'], out['rho_min_H'])
+    assert np.all(pk > 0.0) and abs(pk.sum() - 1.0) < 1e-12
+    out2 = mixture.fit(lam, lam, lam, E, E, e, log=True, start=dict(rho_min_H=4.0, rho_min_L=4.0))   # as before
+    assert out2['rho_min_H'] == 4.0

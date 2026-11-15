@@ -137,16 +137,20 @@ def _offsets(lna, beta):
     return (np.ascontiguousarray(lna, np.float64) - float(beta[0])) / float(beta[1] - beta[0])
 
 
-def _weights(time_weights, n_time, xp):
-    """(lkH, lkL) as float32 (n_time,) arrays of xp clipped at LK_MIN, or (None, None)"""
+def _weights(time_weights, n_time, xp, dtype):
+    """(lkH, lkL) as (n_time,) arrays of xp and dtype clipped at LK_MIN (-inf is a zero weight), or (None, None);
+    a NaN is an error.  The CPU takes float64 (float32 rounds ln kbar near -3000 by 1e-4), the GPU float32"""
     if time_weights is None:
         return None, None
     lk = []
-    for w in time_weights:
-        w = xp.asarray(w, xp.float32)
+    for name, w in zip(("lkH", "lkL"), time_weights):
+        w = xp.asarray(w, dtype)
         if w.shape != (n_time,):
             raise ValueError("time weights of shape %s, not (%d,)" % (w.shape, n_time))
-        lk.append(xp.ascontiguousarray(xp.maximum(w, xp.float32(LK_MIN))))
+        bad = xp.flatnonzero(xp.isnan(w))
+        if bad.size:
+            raise ValueError("%s has %d NaN time weights, at t = %s" % (name, bad.size, [int(i) for i in bad[:10]]))
+        lk.append(xp.ascontiguousarray(xp.maximum(w, dtype(LK_MIN))))
     return tuple(lk)
 
 
@@ -168,7 +172,8 @@ def gather_cpu(traj, tables, mass_ids, lna, tab_ids, times=None, time_weights=No
     times     None (every arrival time) or select_times(...): (sel, lw)
     time_weights  None or (lkH, lkL), each (n_time,): log weights of the H
               arrival time t + tau and of the L arrival time t, the same for
-              every template, clipped at LK_MIN
+              every template, clipped at LK_MIN (-inf is a zero weight; a NaN
+              raises ValueError); kept in float64
 
     returns (NS, nsel) float64; with time_weights (4, NS, nsel), the sums of
     exp lnS, exp(lnS + lkH(t + tau)), exp(lnS + lkL(t)) and
@@ -179,7 +184,7 @@ def gather_cpu(traj, tables, mass_ids, lna, tab_ids, times=None, time_weights=No
     ns = tab.shape[1]
     ntau = int(np.asarray(tables["tau"]).size)
     n_time = traj["lqH"].shape[1]
-    lkH, lkL = _weights(time_weights, n_time, np)
+    lkH, lkL = _weights(time_weights, n_time, np, np.float64)
     nv = 1 if lkH is None else 4
     om = np.empty((nv * ns, ntau, ids.size)); os_ = np.empty((nv * ns, ntau, ids.size))
     T = numba.typed.List([np.ascontiguousarray(Ti, np.float32) for Ti in tables["T"]])
@@ -436,7 +441,7 @@ def gather_gpu(traj, tables, mass_ids, lna, tab_ids, block=256, times=None, time
     n_time = int(traj["lqH"].shape[1])
     ns = int(np.asarray(lna).shape[1])
     ks = 0 if times is None else int(times[0].shape[1])
-    lkH, lkL = _weights(time_weights, n_time, cp)
+    lkH, lkL = _weights(time_weights, n_time, cp, cp.float32)
     nv = 1 if lkH is None else 4
     fn, shm = _compile(nb, nd, nphi, n_time, ns, _chunk(nphi, _static(ns, nv)), block, ks, nv)
     sel, lw = times if times is not None else (cp.zeros(1, cp.int32), cp.zeros(1, cp.float32))

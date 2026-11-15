@@ -343,9 +343,20 @@ def ln_evidence(lq, ln_u, lnT, weights=None, xp=np, block=256, vloud=VLOUD, log_
                        exactly as without weights
 
     below vloud T is interpolated linearly in v, E = (H @ T - D @ Q) / n_time with the histogram H and the
-    curvature term D @ Q of the interpolation; above vloud ln T is interpolated linearly in v, one arrival time
-    at a time, the sum taken in the log domain.  returns (n_template, n_col), or (n_w, n_template, n_col),
-    float64 on the device."""
+    curvature term D @ Q of the interpolation; above vloud (the grid point DV (J - 2), J = round(vloud / DV) + 2,
+    nearest to it, so that every arrival time is in exactly one of the two sets) ln T is interpolated linearly in
+    v, one arrival time at a time, the sum taken in the log domain.  returns (n_template, n_col), or
+    (n_w, n_template, n_col), float64 on the device.
+
+    Accuracy of the part below vloud for steep columns (the amplitude bins of glitch_columns, which grow by
+    exp(sqrt(2) rho DV) per cell of the grid, and any column that grows as fast): the curvature-corrected linear
+    interpolation errs by about (sqrt(2) rho DV)^4 / 70 in relative terms (within a factor 1.5 of the measurements).
+    ln E of a row whose times are all below vloud is too small by 1e-5 at the last bin up to rho = 12.2 (and by less
+    than 3e-7 in ln of the fiducial sum over the bins, amplitude_weights()), by 1e-3 at rho ~ 35, 1e-2 at 60 and
+    0.3 at 140 (measured against the quadrature of the columns at each time, tests/test_single.py).  The bins above
+    rho ~ 30 weigh exp(-450) and less next to the others in every sum over the bins that is used (pi_k E_k, pi_k ~
+    rho^-3 or steeper), so those sums are unaffected; only the per-bin outputs of these bins are not to be read.  A
+    row with times above vloud has the same relative error on the share of its sum that comes from below it."""
     nm, nt = lq.shape
     J = int(round(vloud / DV)) + 2
     B, Q, top = _quiet_columns(lnT, J, xp)              # every column spans less than 600 nats below vloud
@@ -362,7 +373,7 @@ def ln_evidence(lq, ln_u, lnT, weights=None, xp=np, block=256, vloud=VLOUD, log_
         j, f = _cic(v, xp)
         jm, fm = _cic(v.max(axis=1), xp)                # the loudest time of each template sets its scale
         shift = (1.0 - fm)[:, None] * lnT[jm] + fm[:, None] * lnT[jm + 1]
-        r, t = xp.nonzero(v > vloud)
+        r, t = xp.nonzero(v > DV * (J - 2))
         val = (1.0 - f[r, t])[:, None] * lnT[j[r, t]] + f[r, t][:, None] * lnT[j[r, t] + 1]
         for i, u in enumerate(unit):
             if u:
@@ -409,7 +420,7 @@ def ln_merger_at(lq, ln_u, s, weights=None, xp=np, block=256, vloud=VLOUD, log_w
         H, D = _quiet(v, j, f, xp.ones(nt), xp, J)     # the grid points and cells the times reach
         rq, cq = xp.nonzero(H)
         rd, cd = xp.nonzero(D)
-        rl, tl = xp.nonzero(v > vloud)
+        rl, tl = xp.nonzero(v > DV * (J - 2))
         jl = j[rl, tl]
         # Phi once per (template, grid point) needed; it grows with v, so the template's last point sets its scale
         rows = xp.arange(b - a)
@@ -483,14 +494,16 @@ def glitch_time_series(lq, ln_u, pi_k, pi_m=None, xp=np, edges=RHO_EDGES, block=
         jq = xp.minimum(j, J - 2)
         with np.errstate(divide="ignore", invalid="ignore"):
             val = A + xp.log((1.0 - f) * P[jq] + f * P[jq + 1] - f * (1.0 - f) * Qp[jq])
-        r, t = xp.nonzero(v > vloud)
+        r, t = xp.nonzero(v > DV * (J - 2))
         if r.size:
             x = (1.0 - f[r, t])[:, None] * lnTd[j[r, t]] + f[r, t][:, None] * lnTd[j[r, t] + 1] + lpkd[None, :]
             mx = x.max(axis=1)
             val[r, t] = mx + xp.log(xp.exp(x - mx[:, None]).sum(axis=1))
         val += xp.asarray(lpm[a:b])[:, None]
         mx = val.max(axis=0)
-        out = _logaddexp(out, mx + xp.log(xp.exp(val - mx[None, :]).sum(axis=0)), xp)
+        mx = xp.where(mx > -np.inf, mx, 0.0)             # a block of templates of weight 0
+        with np.errstate(divide="ignore"):
+            out = _logaddexp(out, mx + xp.log(xp.exp(val - mx[None, :]).sum(axis=0)), xp)
     return out
 
 
@@ -526,6 +539,10 @@ def glitch_time_weights(ln_lg, half_window, xp=np):
     ln_lg        (n_time,) glitch_time_series(...)
     half_window  in samples; < 0: an empty window, kbar = 1
 
+    Where the glitch evidence is zero at every time (ln_lg = -inf throughout: no glitch can have produced the
+    data) the weights are those of a flat l_g, kbar = 1 - (2 half_window + 1) / n_time: no time is preferred, and
+    the glitch hypothesis then carries no weight where they are used.
+
     returns ln kbar and ln(1 - kbar), each (n_time,) and <= 0."""
     n = ln_lg.size
     hw = int(half_window)
@@ -533,6 +550,7 @@ def glitch_time_weights(ln_lg, half_window, xp=np):
         return xp.zeros(n), xp.full(n, -np.inf)
     if 2 * hw + 1 >= n:
         return xp.full(n, -np.inf), xp.zeros(n)
+    ln_lg = xp.where(ln_lg.max() > -np.inf, ln_lg, 0.0)                         # zero evidence everywhere: flat
     m = ln_lg.max()
     total = m + xp.log(xp.exp(ln_lg - m).sum())
     away = xp.roll(_ln_arcs(ln_lg, n - 2 * hw - 1, xp), -(hw + 1)) - total       # from t' + hw + 1 round to t' - hw - 1
