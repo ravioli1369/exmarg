@@ -470,11 +470,14 @@ def select_times(traj, tau_idx, n_loud, n_random, seed, xp=np, block=256, shared
     traj      dict with lqH, lqL (n_template, n_time) on the device of xp
     tau_idx   the lags of the tables (contiguous integers)
     block     templates ranked at once (bounds the temporary memory)
-    shared    one random draw for every template instead of one per template.
-              The estimate of each template stays unbiased, and neighbouring
-              templates then err together: ln Lambda is interpolated between
-              templates, and the interpolation of two estimates with
-              independent errors, a geometric mean, is biased low.
+    shared    the same random times for every template instead of a draw
+              per template: n_random times drawn from all n_time with the log
+              weight ln(n_time / n_random), and no weight (LK_MIN) for a
+              template on whose n_loud times a draw falls.  The estimate of
+              each template stays unbiased, and neighbouring templates then
+              err together: ln Lambda is interpolated between templates, and
+              the interpolation of two estimates with independent errors, a
+              geometric mean, is biased low.
 
     returns (sel, lw): (n_template, n_loud + n_random) int32 times, sorted,
     and float32 log weights, on the device of xp."""
@@ -485,10 +488,13 @@ def select_times(traj, tau_idx, n_loud, n_random, seed, xp=np, block=256, shared
     if not np.array_equal(np.sort(lags), np.arange(lo, hi + 1)):
         raise ValueError("lags are not contiguous")
     k = int(np.floor(np.log2(hi - lo + 1)))
-    pick = np.random.default_rng(seed).integers(0, nt - K, size=(1 if shared else nm, S))
+    rng = np.random.default_rng(seed)
     if shared:
-        pick = np.broadcast_to(pick, (nm, S))
+        pick = xp.asarray(rng.integers(0, nt, size=S))               # times
+    else:
+        pick = rng.integers(0, nt - K, size=(nm, S))                 # ranks among each template's other times
     sel = xp.empty((nm, K + S), xp.int32)
+    lw = xp.zeros((nm, K + S), xp.float32)
     for a in range(0, nm, block):
         b = min(a + block, nm)
         # max over the lags lo..hi of |z_H(t + tau)|^2: a sliding maximum built by doubling (ln|z| is monotone)
@@ -503,11 +509,14 @@ def select_times(traj, tau_idx, n_loud, n_random, seed, xp=np, block=256, shared
         del score
         rest = xp.ones((b - a, nt), bool)
         rest[xp.arange(b - a)[:, None], top] = False
-        rest = xp.nonzero(rest)[1].reshape(b - a, nt - K)          # the other times, in time order
-        sel[a:b] = xp.concatenate([top, xp.take_along_axis(rest, xp.asarray(pick[a:b]), axis=1)], axis=1)
+        if shared:
+            sel[a:b] = xp.concatenate([top, xp.broadcast_to(pick.astype(top.dtype), (b - a, S))], axis=1)
+            lw[a:b, K:] = xp.where(rest[:, pick], np.log(nt / S), LK_MIN)
+        else:
+            rest = xp.nonzero(rest)[1].reshape(b - a, nt - K)      # the other times, in time order
+            sel[a:b] = xp.concatenate([top, xp.take_along_axis(rest, xp.asarray(pick[a:b]), axis=1)], axis=1)
+            lw[a:b, K:] = np.log((nt - K) / S)
         del top, rest
-    lw = xp.zeros((nm, K + S), xp.float32)
-    lw[:, K:] = np.log((nt - K) / S)
     order = xp.argsort(sel, axis=1)
     return (xp.ascontiguousarray(xp.take_along_axis(sel, order, axis=1)),
             xp.ascontiguousarray(xp.take_along_axis(lw, order, axis=1)))

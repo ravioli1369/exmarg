@@ -163,10 +163,12 @@ def test_both(case):
     assert np.all(got[3] < np.minimum(got[1], got[2]) - 0.05)    # variant 3 carries both weights
 
 
-def test_selected_times(case):
+@pytest.mark.parametrize("shared", [False, True])
+def test_selected_times(case, shared):
     a, lkH, lkL = case
-    times = select_times(a["traj"], a["tables"]["tau"], 24, 40, seed=3)
+    times = select_times(a["traj"], a["tables"]["tau"], 24, 40, seed=3, shared=shared)
     assert np.any(times[1] != 0)                         # the random draw carries a weight
+    assert not shared or np.any(times[1] == np.float32(LK_MIN))    # and none where it falls on a loud time
     _close(gather_cpu(**a, times=times), reference(**a, times=times)[0])
     got = gather_cpu(**a, times=times, time_weights=(lkH, lkL))
     np.testing.assert_array_equal(got[0], gather_cpu(**a, times=times))
@@ -197,23 +199,50 @@ def test_extreme_weights(case):
     _close(got, reference(**a, lkH=wH, lkL=wL))
 
 
+def _correlated_trajectories(rng, nm, nt, rho):
+    """ln|z| of nm templates whose complex series are correlated at rho with a common one: their loud times differ"""
+    c = lambda *sh: (rng.standard_normal(sh) + 1j * rng.standard_normal(sh)) / np.sqrt(2.0)
+    out = {}
+    for I in "HL":
+        common = c(1, nt)
+        out["lq" + I] = np.log(np.abs(rho * common + np.sqrt(1.0 - rho ** 2) * c(nm, nt))).astype(np.float32)
+    return out
+
+
 def test_select_times_shared():
-    """shared=True: one random draw for every template.  Two templates with the same trajectory then visit the same
-    times, which the default (one draw per template) does not; the selection stays an unbiased estimate of the sum."""
+    """shared=True: the random arrival times are the same times for every template, also when the templates differ
+    in their loudest times (a draw that falls on one of a template's loudest times, which are summed exactly,
+    carries no weight for that template); the selection stays an unbiased estimate of the sum over all times."""
     rng = np.random.default_rng(5)
-    nt, K, S = 512, 32, 64
-    one = rng.standard_normal((1, nt)).astype(np.float32)
-    traj = dict(lqH=np.repeat(one, 3, axis=0), lqL=np.repeat(rng.standard_normal((1, nt)).astype(np.float32), 3, axis=0))
+    nm, nt, K, S = 3, 512, 32, 64
+    traj = _correlated_trajectories(rng, nm, nt, 0.9)
     lags = np.arange(-3, 4)
     sel, lw = select_times(traj, lags, K, S, 11, shared=True)
-    assert np.array_equal(sel[0], sel[1]) and np.array_equal(sel[0], sel[2]) and np.array_equal(lw[0], lw[1])
-    sel0, _ = select_times(traj, lags, K, S, 11)
-    assert not np.array_equal(sel0[0], sel0[1]), 'the default draws once per template'
-    f = np.exp(0.3 * rng.standard_normal(nt))                       # any positive function of the arrival time
-    est = []
-    for seed in range(400):
-        sel, lw = select_times(traj, lags, K, S, seed, shared=True)
-        est.append((f[sel[0]] * np.exp(lw[0])).sum())
-    est = np.array(est)
-    assert abs(est.mean() - f.sum()) < 4 * est.std(ddof=1) / np.sqrt(est.size), \
-        'selected sum %.3f +- %.3f, full sum %.3f' % (est.mean(), est.std(ddof=1) / np.sqrt(est.size), f.sum())
+    loud = [np.sort(sel[m][lw[m] == 0.0]) for m in range(nm)]
+    assert all(x.size == K for x in loud)
+    assert not np.array_equal(loud[0], loud[1]), "the fixture needs templates with different loudest times"
+    drawn = [np.sort(sel[m][lw[m] != 0.0]) for m in range(nm)]
+    assert np.array_equal(drawn[0], drawn[1]) and np.array_equal(drawn[0], drawn[2]), "the random times differ"
+    hits = 0
+    for m in range(nm):                                  # no weight on a loud time, ln(n_time / n_random) elsewhere
+        r = lw[m] != 0.0
+        on_loud = np.isin(sel[m][r], loud[m])
+        hits += on_loud.sum()
+        np.testing.assert_array_equal(lw[m][r][on_loud], np.float32(LK_MIN))
+        np.testing.assert_allclose(lw[m][r][~on_loud], np.log(nt / S), rtol=1e-6)
+    assert hits > 0, "the fixture needs a draw that falls on a loud time"
+    sel0, lw0 = select_times(traj, lags, K, S, 11)
+    assert not np.array_equal(np.sort(sel0[0][lw0[0] != 0.0]), np.sort(sel0[1][lw0[1] != 0.0])), \
+        "the default draws once per template"
+    f = np.exp(0.3 * rng.standard_normal((nm, nt)))                 # any positive function of the arrival time
+    f[0, loud[0][:8]] *= 50.0                                       # with weight on the loudest times
+    for shared in (True, False):
+        est = []
+        for seed in range(400):
+            sel, lw = select_times(traj, lags, K, S, seed, shared=shared)
+            est.append((np.take_along_axis(f, sel.astype(np.int64), axis=1) * np.exp(lw.astype(np.float64))).sum(axis=1))
+        est = np.array(est)
+        err = est.std(axis=0, ddof=1) / np.sqrt(est.shape[0])
+        assert np.all(np.abs(est.mean(axis=0) - f.sum(axis=1)) < 4 * err), \
+            "shared %s: selected sum %s +- %s, full sum %s" % (shared, est.mean(axis=0), err, f.sum(axis=1))
+        assert np.all(err < 0.02 * f.sum(axis=1)), "the test resolves a bias of a few percent"
