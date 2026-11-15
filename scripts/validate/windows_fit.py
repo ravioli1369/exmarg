@@ -1,7 +1,7 @@
 """Stage 1 of the model with many glitches per segment (docs/glitch_likelihood.md, Sec. 4a): the glitch model of each
 detector, fitted to the window evidences of one campaign of plant.py or one variant of analyse.py (--stage windows), and
 written to <folder>/glitch_model.json for the merger stage (--glitch-model).  On the CPU.  Exit status 1, and no file,
-when a fit does not converge.
+when a fit of the model written does not converge (the fits with other numbers of states are a record).
 
     python scripts/validate/windows_fit.py runs/states [--n-state 2] [--basis bins|power] [--rho-min 4] [--rho-max 12.2]
                                            [--veto-w 72] [--zone 1]
@@ -190,7 +190,7 @@ def describe(cfg):
 def fit(folder, n_state=N_STATE, basis='bins', rho_min=RHO[0], rho_max=RHO[1], veto_w=VETO_W, zone=ZONE,
         record=RECORD):
     """the fits and the model of the folder: dict lines (the report), model (the content of glitch_model.json without
-    its sha256), ok (every fit converged), fits {I: {K: fit_windows result}}, keep (n,), cols, data"""
+    its sha256), ok (the fits of the model written converged), fits {I: {K: fit_windows result}}, keep (n,), cols, data"""
     if basis not in ('bins', 'power'):
         raise ValueError("basis must be 'bins' or 'power'")
     if n_state < 1 or zone < 0:
@@ -219,7 +219,7 @@ def fit(folder, n_state=N_STATE, basis='bins', rho_min=RHO[0], rho_max=RHO[1], v
         E = evidences(paths, I, keep, cols)
         R[I] = {K: mixture.fit_windows(E, n_state=K, basis=B) for K in Ks}
         del E
-    ok = all(R[I][K]['converged'] for I in 'HL' for K in Ks)
+    ok = all(R[I][n_state]['converged'] for I in 'HL')            # of the model written; the others are a record
 
     L = ['glitch model of the window evidences of %s (docs/glitch_likelihood.md, Sec. 4a)' % folder, describe(cfg),
          '%d segments in %d files, k %d to %d; %d windows%s; evidences stored on rho %.4g to %.4g'
@@ -291,9 +291,12 @@ def fit(folder, n_state=N_STATE, basis='bins', rho_min=RHO[0], rho_max=RHO[1], v
                                set_aside_L=int(loud['L'].sum())),
                  campaign=plant.campaign_key(cfg))
     model = json.loads(json.dumps(model))
+    slow = ['%s with %d states' % (I, K) for I in 'HL' for K in Ks if not R[I][K]['converged']]
     if not ok:
-        L.append('\nNOT CONVERGED: %s; no model written' % ', '.join(
-            '%s with %d states' % (I, K) for I in 'HL' for K in Ks if not R[I][K]['converged']))
+        L.append('\nNOT CONVERGED: %s; no model written' % ', '.join(slow))
+    elif slow:
+        L.append('\nnot converged, among the fits kept for the record only: %s (their ln L is a lower bound)'
+                 % ', '.join(slow))
     return dict(lines=L, model=model, ok=ok, fits=R, keep=keep, cols=cols, data=d, cfg=cfg)
 
 
