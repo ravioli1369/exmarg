@@ -540,6 +540,9 @@ def _tangent(free, blocks):
     return np.array(Z).T if Z else np.zeros((free.size, 0))
 
 
+STALL_TOL = 1e-5            # nats: the predicted gain below which a fit that cannot raise ln L any more has converged
+
+
 def fit_windows(ln_E, n_state=2, basis=None, start=None, tol=1e-9, max_iter=500, chunk=1024):
     """the glitch model of one detector, Sec. 4a, from its window evidences (no mergers): the maximum of
 
@@ -564,7 +567,9 @@ def fit_windows(ln_E, n_state=2, basis=None, start=None, tol=1e-9, max_iter=500,
     kept on its simplex (the eigenvalues of minus the Hessian taken in absolute value, so the step rises where ln L
     is not concave), a step kept only when it raises ln L (an EM cycle otherwise), so ln L never decreases.
     Converged when the gain the Newton step predicts, g . dx / 2, is below tol (nats; the distance to the maximum
-    is then about sqrt(2 tol) standard errors), the entries of empty states (f_s = 0) aside.
+    is then about sqrt(2 tol) standard errors), the entries of empty states (f_s = 0) aside.  Also when neither a Newton
+    step nor an EM step raises ln L any more (the sum has reached its rounding, in a direction the data do not
+    constrain) and the predicted gain is below STALL_TOL.
 
     returns dict: f (K,), q (K,), pi (K, n_k), a (K, n_basis), lnl, n_iter (updates), converged, trace (ln L after
     every update), cov (covariance of x from the Hessian on the entries above zero, the same order), err_f, err_q,
@@ -674,6 +679,7 @@ def fit_windows(ln_E, n_state=2, basis=None, start=None, tol=1e-9, max_iter=500,
             t *= 0.5
         if not moved:
             if not squarem():
+                converged = dec < STALL_TOL                                # no step raises ln L any more: its rounding
                 break
             ev = model(x, K, hess=True)
     H = model.hessian(ev)
