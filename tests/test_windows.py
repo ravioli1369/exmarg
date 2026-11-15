@@ -599,3 +599,67 @@ def test_recovery_wrong_weights():
     msg = 'prior f for the posterior: nbar %.4f +- %.4f (%+.1f sigma)' % (nb, err, (nb - NBAR) / err)
     print('\n' + msg)
     assert abs(nb - NBAR) > 5 * err, msg
+
+
+def stall_data():
+    """ln E_w[k] (600, 8, 4): quiet windows ln E ~ N(-0.8, 0.4) (a ramp over the bins); in 30 percent of the segments
+    a window holds a glitch with probability 0.3, in the others 0.03, adding exp(N(2, 0.7)) in one bin"""
+    rng = np.random.default_rng(3)
+    n, nw, nk = 600, 8, 4
+    q = np.where(rng.random(n) < 0.3, 0.3, 0.03)
+    has = rng.random((n, nw)) < q[:, None]
+    base = rng.normal(-0.8, 0.4, (n, nw, 1)) + np.linspace(-0.3, 0.3, nk)[None, None]
+    boost = np.zeros((n, nw, nk))
+    np.put_along_axis(boost, rng.integers(nk, size=(n, nw, 1)), rng.normal(2.0, 0.7, (n, nw, 1)), axis=2)
+    return np.where(has[..., None], np.logaddexp(base, boost), base)
+
+
+def stall_start(E, r, eps):
+    """the maximum r of a fit moved off by a relative eps in q and in the weights of the states: start dict"""
+    f = r['f'] * (1.0 + eps * np.array([1.0, -1.0]))
+    return dict(f=f / f.sum(), q=r['q'] * (1.0 + eps), a=r['a'])
+
+
+def test_fit_windows_stall_converged(monkeypatch):
+    """fit_windows counts a fit as converged when neither a Newton step nor an EM step can raise ln L (here: the model
+    evaluation is capped at its value at the start, so no step does) and the gain the Newton step predicts is below
+    mixture.STALL_TOL.  Start a little off the maximum of a small data set, where the gain to the maximum (the real fit
+    from there, the Newton prediction to first order) is 1e-7 to 1e-6 nats, between tol = 1e-9 and STALL_TOL = 1e-5: the
+    capped fit stops at once with converged True, no update, ln L unchanged; with STALL_TOL set to 1e-12 the same fit is
+    not converged, and so is the capped fit from a start 1e-2 nats or more from the maximum (gain above STALL_TOL); the
+    uncapped fit from the near start converges by the ordinary rule, to the maximum"""
+    E = stall_data()
+    r = mixture.fit_windows(E, start=dict(f=[0.7, 0.3], q=[0.02, 0.2]))
+    assert r['converged'] and mixture.STALL_TOL == 1e-5
+    gain = lambda eps: r['lnl'] - mixture.fit_windows(E, start=stall_start(E, r, eps), max_iter=0)['lnl']
+    near = next(eps for eps in np.geomspace(1e-5, 0.3, 80) if gain(eps) > 1e-7)
+    far = next(eps for eps in np.geomspace(near, 0.3, 80) if gain(eps) > 1e-2)
+    g_near, g_far = gain(near), gain(far)
+    assert 1e-7 < g_near < 1e-6 and g_far > 1e-2, (near, g_near, far, g_far)
+    real, cap = mixture._Windows.__call__, {}
+
+    def capped(self, x, K, hess=False):
+        out = real(self, x, K, hess)
+        out['lnl'] = min(out['lnl'], cap.setdefault('lnl', out['lnl']))
+        return out
+    stuck = {}
+    for tag, eps in (('near', near), ('far', far)):
+        cap.clear()
+        monkeypatch.setattr(mixture._Windows, '__call__', capped)
+        stuck[tag] = mixture.fit_windows(E, start=stall_start(E, r, eps))
+        monkeypatch.setattr(mixture._Windows, '__call__', real)
+    start_lnl = r['lnl'] - g_near
+    print('\nnear start: gain to the maximum %.3g nats, capped fit converged %s after %d updates; far start: gain %.3g, '
+          'converged %s' % (g_near, stuck['near']['converged'], stuck['near']['n_iter'], g_far,
+                            stuck['far']['converged']))
+    assert stuck['near']['converged'] is True and stuck['near']['n_iter'] == 0
+    assert abs(stuck['near']['lnl'] - start_lnl) < 1e-9 and len(stuck['near']['trace']) == 1
+    assert stuck['far']['converged'] is False and stuck['far']['n_iter'] == 0
+    cap.clear()
+    monkeypatch.setattr(mixture._Windows, '__call__', capped)
+    monkeypatch.setattr(mixture, 'STALL_TOL', 1e-12)
+    assert mixture.fit_windows(E, start=stall_start(E, r, near))['converged'] is False
+    monkeypatch.setattr(mixture, 'STALL_TOL', 1e-5)
+    monkeypatch.setattr(mixture._Windows, '__call__', real)
+    free = mixture.fit_windows(E, start=stall_start(E, r, near))
+    assert free['converged'] and free['n_iter'] > 0 and abs(free['lnl'] - r['lnl']) < 1e-6

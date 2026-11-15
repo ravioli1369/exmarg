@@ -6,6 +6,8 @@ import glob
 import importlib.util
 import json
 import os
+import re
+import shutil
 
 import numpy as np
 import pytest
@@ -834,3 +836,491 @@ def test_summarize_window_model_table(week, tmp_path, capsys):
         assert '%s+-%s' % (plant_fit._f(W['nbar'], '%.3g'), plant_fit._f(W['err']['nbar'], '%.2g')) in line, (v, line)
         assert line.split()[1] == str(int(r['keep'].sum())) and 'PASS' in line, line
     assert code == 0 and 'is not opened' in text and not any(l.startswith('zero ') for l in text.splitlines())
+
+
+# ----------------------------------------------------------------------------------------------- more time slides
+
+slides_mean = _script('slides_mean', 'real_data')
+EXTRA = ('slide+2.25', 'slide-3.0')
+EXTRA_SAMPLES = {'slide+2.25': 9216, 'slide-3.0': -12288}            # shift x 4096 matched-filter samples per second
+EVERY = analyse.VARIANTS + EXTRA
+
+
+def sampler():
+    return plant.Sampler(plant.population(analyse.ZMIN), plant.MDET)
+
+
+def test_generic_slide_is_time_slide(week):
+    """a slide named slide<signed number> is controls.time_slide by that many seconds, whatever else is asked: H as it
+    is, L moved by exactly the matched-filter samples of the shift (9216 and -12288 for +2.25 and -3.0 s, the series
+    rolled), array for array equal to controls.time_slide of the recorded data; the two built-in slides and inj are bit
+    for bit what they are without the extra slides, and equal to controls.time_slide by their shifts; the name as typed
+    (slide-3.0) is the key"""
+    ep = strain.read_epoch(os.path.join(week, 'epoch_1266934296.npz'))
+    params = dict(seed=7, nbar_inj=0.5)
+    var, rows, _ = analyse.variants(params, ep, EVERY, sampler())
+    plain, _, _ = analyse.variants(params, ep, analyse.VARIANTS, sampler())
+    alone = analyse.variants(params, ep, ('slide-3.0',), sampler())[0]
+    zero = var['zero']
+    assert list(var) == list(EVERY) and set(alone) == {'slide-3.0'}
+    for v, shift in dict(analyse.SHIFTS, **{'slide+2.25': 2.25, 'slide-3.0': -3.0}).items():
+        ref = controls.time_slide(zero, shift)
+        for I in 'HL':
+            assert np.array_equal(var[v]['d_' + I], ref['d_' + I]), (v, I)
+        assert np.array_equal(var[v]['d_H'], zero['d_H'])
+    for v, samples in EXTRA_SAMPLES.items():
+        assert analyse.whole_samples(zero, analyse.slide_shift(v)) == samples
+        x, _ = series(zero, 'L')
+        xs, _ = series(var[v], 'L')
+        assert np.max(np.abs(xs - np.roll(x, samples, axis=1))) < 1e-12 * np.abs(x).max(), v
+    assert np.array_equal(alone['slide-3.0']['d_L'], var['slide-3.0']['d_L'])
+    for v in analyse.VARIANTS:
+        for key in ('d_H', 'd_L'):
+            assert np.array_equal(var[v][key], plain[v][key]), (v, key)
+    assert analyse.slide_shift('slide-3.0') == -3.0 and analyse.slide_shift('slide+0.5') == 0.5
+
+
+def test_slide_names_and_shifts_refused(week, tmp_path):
+    """names that are not slide, a sign and digits[.digits] are refused by the command line (no exponent, no inf, no
+    missing sign, no other case, no non-ASCII digit); the names as typed are kept (slide+2.250 is not slide+2.25) and
+    repeated names merged; a name with the shift of another (as written: slide+0.50 and the built-in slide+0.5, or
+    modulo the 8 s segment: slide+8.5, slide+10.5 and slide+2.5) is refused, naming both; a shift that is not a whole
+    number of samples, within 0.02 s of zero or of T, stops the run with the variant's name before any call; a folder of
+    another shift under the same name (the files of slide+2.25 in slide+2.5) is refused as another campaign"""
+    for bad in ('slide', 'slide+', 'slide2.25', 'slide+1e3', 'slide+2.', 'slide+.5', 'slide++2', 'Slide+2.25',
+                'slide+2.25s', 'slide+nan', 'slide+inf', 'slide+ 2', 'slide+0x10', 'sliding', 'slide+٣',
+                'slide+' + '9' * 400):
+        with pytest.raises(SystemExit):
+            analyse.parse(['x', 'cpu', 'segs', '--out', 'o', '--variants', 'zero,' + bad])
+    a = analyse.parse(['x', 'cpu', 'segs', '--out', 'o', '--variants', 'slide+2.250, slide-3.0,slide-3.0,pr'])[1]
+    assert a.variants == ['slide+2.250', 'slide-3.0', 'pr']
+    for names in ('slide+0.50', 'slide+2.25,slide+2.250', 'slide-1.750'):
+        with pytest.raises(SystemExit):
+            analyse.parse(['x', 'cpu', 'segs', '--out', 'o', '--variants', names])
+    ep = strain.read_epoch(os.path.join(week, 'epoch_1266934296.npz'))
+    params = dict(seed=7, nbar_inj=0.5)
+    for names, match in ((('slide+0.0001',), r'slide\+0\.0001.*whole number'),
+                         (('zero', 'slide+0.015625'), r'slide\+0\.015625.*within'),
+                         (('slide+8.0',), r'slide\+8\.0.*within'), (('slide-0.0',), r'slide-0\.0.*within'),
+                         (('slide+8.5',), r'slide\+0\.5 and slide\+8\.5 are the same shift modulo'),
+                         (('slide+2.5', 'slide+10.5'), r'slide\+2\.5 and slide\+10\.5 are the same shift modulo'),
+                         (('slide+2.5', 'slide-5.5'), r'slide\+2\.5 and slide-5\.5 are the same shift modulo')):
+        with pytest.raises(ValueError, match=match):
+            analyse.variants(params, ep, names, sampler())
+    stub = Stub()
+    out = tmp_path / 'out'
+    with pytest.raises(ValueError, match=r'slide\+0\.0001.*whole number'):
+        drive(week, out, '--variants', 'zero,slide+0.0001', stub=stub)
+    assert stub.calls == [] and not glob.glob(str(out / '*' / 'plant_*.npz'))
+    drive(week, out, '--epochs-per-file', '2', '--variants', 'slide+2.25')
+    import shutil
+    shutil.copytree(out / 'slide+2.25', out / 'slide+2.5')
+    stub = Stub()
+    with pytest.raises(SystemExit, match='another campaign.*shift'):
+        drive(week, out, '--epochs-per-file', '2', '--variants', 'slide+2.5', stub=stub)
+    assert stub.calls == []
+
+
+def same_data(a, b):
+    """the campaign and every per-segment array of two folders of plant files equal, bit for bit"""
+    ca, _, da, _, _ = plant_fit.load(str(a))
+    cb, _, db, _, _ = plant_fit.load(str(b))
+    assert ca == cb, (a, b)
+    assert set(da) == set(db)
+    for key in da:
+        assert np.array_equal(da[key], db[key], equal_nan=da[key].dtype.kind == 'f'), (a, key)
+
+
+def test_extra_slides_driver(week, tmp_path):
+    """analyse.main with extra slides and the stub: the built-in variants are one call per epoch exactly as without the
+    extras (same rows, seed, and files bit for bit) and each extra slide a call of its own on the epoch's rows with the
+    seed stream(seed, GPS + 2^24 c, 'pe') (c = 2 |m| - [m < 0] = 18432 for +2.25 s, 24575 for -3.0 s) -- distinct from
+    each other and from the built-ins' --; an extra slide's files are the same alone, in another order, in another
+    part split and with the built-ins (so they do not depend on the other variants asked for), and hold k and gps of the
+    other variants, control = its name, nbar 0, shift as typed, no merger, other data than slide+0.5 (another seed)"""
+    gps = [1266933768, 1266934296, 1266934560]
+    sel = {1266933768: np.setdiff1d(np.arange(NSEG), [3, 30]), 1266934296: np.setdiff1d(np.arange(NSEG), [8, 9, 20]),
+           1266934560: np.arange(NSEG)}
+    one, base = tmp_path / 'one', tmp_path / 'base'
+    s_all = drive(week, one, '--epochs-per-file', '1', '--variants', ','.join(EVERY))
+    drive(week, base, '--epochs-per-file', '1')
+    code = {'slide+2.25': 18432, 'slide-3.0': 24575}
+    want = []
+    for g in gps:
+        want.append((plant.stream(7, g, 'pe'), np.concatenate([i * NSEG + sel[g] for i in range(6)])))
+        want += [(plant.stream(7, g + code[v] * 2 ** 24, 'pe'), sel[g]) for v in EXTRA]
+    assert len(s_all.calls) == len(want) == 9
+    for (seed, rows), (seed_e, rows_e) in zip(s_all.calls, want):
+        assert seed == seed_e and np.array_equal(rows, rows_e)
+    assert len({seed for seed, _ in s_all.calls}) == 9
+    for v in analyse.VARIANTS:
+        same_data(one / v, base / v)
+    n_sel = sum(v.size for v in sel.values())
+    a0 = plant_fit.load(str(one / 'slide+0.5'))[2]
+    for v in ('slide-3.0', 'slide+2.25'):                                                  # each alone
+        alone = tmp_path / ('alone_' + v)
+        drive(week, alone, '--epochs-per-file', '1', '--variants', v)
+        same_data(one / v, alone / v)
+    other = tmp_path / 'other'
+    drive(week, other, '--epochs-per-file', '1', '--part', '0/2', '--variants', 'slide-3.0,pr,slide+2.25')
+    drive(week, other, '--epochs-per-file', '1', '--part', '1/2', '--variants', 'slide+2.25,slide-3.0')
+    drive(week, other, '--epochs-per-file', '1', '--part', '0/2', '--variants', 'slide+2.25,slide-3.0')
+    for v in EXTRA:
+        same_data(one / v, other / v)
+        cfg, _, d, _, _ = plant_fit.load(str(one / v))
+        assert cfg['control'] == cfg['variant'] == v and cfg['nbar'] == 0.0 and cfg['shift'] == float(v[5:])
+        assert cfg['merger_truth'] == 'none' and plant_fit.truth(cfg)[1] == 'control'
+        assert np.array_equal(d['k'], np.arange(n_sel)) and np.array_equal(d['gps'], a0['gps']) and not d['merger'].any()
+        assert not np.array_equal(d['ln_lambda_bar'], a0['ln_lambda_bar'])
+
+
+def test_extra_slides_windows_and_model_stage(week, tmp_path):
+    """the windows stage with extra slides: one call per epoch holding the rows of every variant (the extras' slots after
+    the six of the built-ins), win files of the extras named like the others' with the stub's window evidences of the
+    slid data, those of the built-ins unchanged by the extras; the model stage (--glitch-model auto, a model per
+    variant) gives each variant a call of its own in the order of the variants, the built-ins' with their slots and
+    seed as before, each extra slide's with the epoch's rows and the seed of the merger stage, and files with ln_B_bar,
+    the SHA-256 of its model and its shift"""
+    out, base = tmp_path / 'w', tmp_path / 'base'
+    win = drive(week, out, '--epochs-per-file', '2', '--stage', 'windows', '--variants', ','.join(EVERY), stub=WinStub())
+    drive(week, base, '--epochs-per-file', '2', '--stage', 'windows', stub=WinStub())
+    assert [c.size for c in win.calls] == [8 * 31, 8 * 30, 8 * 33]
+    ep = strain.read_epoch(os.path.join(week, 'epoch_1266933768.npz'))
+    var, rows, _ = analyse.variants(dict(seed=7, nbar_inj=0.3), ep, EXTRA, sampler())
+    bins = plant.window_bins(3.0, 12.2)
+    for v in EXTRA:
+        ref = window_stub(var[v], np.arange(rows.size), 64)
+        f = sorted(glob.glob(str(out / v / 'win_*.npz')))[0]
+        assert os.path.basename(f) == os.path.basename(sorted(glob.glob(str(out / 'pr' / 'win_*.npz')))[0])
+        with np.load(f) as fw:
+            for I in 'HL':
+                assert np.array_equal(fw['ln_window_' + I][:rows.size],
+                                      ref['ln_window_' + I][:, :, bins].astype(np.float32)), (v, I)
+    for v in analyse.VARIANTS:
+        for f in glob.glob(str(base / v / 'win_*.npz')):
+            with np.load(f) as x, np.load(out / v / os.path.basename(f)) as y:
+                for key in x.files:
+                    if key != 'meta':
+                        assert np.array_equal(x[key], y[key], equal_nan=x[key].dtype.kind == 'f'), (v, key)
+    shas = {}
+    for i, v in enumerate(EVERY):
+        meta = plant.read_meta(sorted(glob.glob(str(out / v / 'win_*.npz')))[0])
+        shas[v] = make_model(out / v / 'glitch_model.json', plant.campaign_key(meta), q_scale=1.0 + i)
+    stub = drive(week, out, '--epochs-per-file', '2', '--glitch-model', 'auto', '--variants', ','.join(EVERY))
+    sel = {1266933768: np.setdiff1d(np.arange(NSEG), [3, 30]), 1266934296: np.setdiff1d(np.arange(NSEG), [8, 9, 20]),
+           1266934560: np.arange(NSEG)}
+    code = {'slide+2.25': 18432, 'slide-3.0': 24575}
+    expect = []
+    for g in sel:
+        for v in analyse.VARIANTS:
+            expect.append((v, plant.stream(7, g, 'pe'), analyse.VARIANTS.index(v) * NSEG + sel[g]))
+        expect += [(v, plant.stream(7, g + code[v] * 2 ** 24, 'pe'), sel[g]) for v in EXTRA]
+    assert len(stub.calls) == len(expect) == 24
+    for (seed, rows), glitch, (v, seed_e, rows_e) in zip(stub.calls, stub.glitches, expect):
+        model = plant.read_model(str(out / v / 'glitch_model.json'))[0]
+        assert seed == seed_e and np.array_equal(rows, rows_e) and glitch['model'] == 'windows', v
+        assert all(np.array_equal(glitch[I][p], model[I][p]) for I in 'HL' for p in ('f', 'q', 'pi_k')), v
+    for v in EXTRA:
+        files = glob.glob(str(out / v / 'plant_*.npz'))
+        assert len(files) == 2
+        for f in files:
+            meta = plant.read_meta(f)
+            assert meta['glitch_model_sha256'] == shas[v] and meta['shift'] == float(v[5:]) and meta['n_window'] == 64
+            with np.load(f) as x:
+                assert {'ln_B_bar', 'ln_c_H', 'state_L'} <= set(x.files)
+
+
+def guard_extra(root, week, names, files=None, change=None):
+    """next to guard_week: folders of the slides names with files covering k 0 .. n_selected - 1 in two halves (files:
+    {name: [(first, end)]}) and the meta of analyse.campaign (change: {name: entries replaced}); k only"""
+    n = sum(e['n_selected'] for e in analyse.selection(week))
+    args = analyse.parse(['x', 'cpu', week, '--out', 'x', '--seed', '7'])[1]
+    for v in names:
+        os.makedirs(os.path.join(root, v), exist_ok=True)
+        for first, end in (files or {}).get(v, [(0, n // 2), (n // 2, n)]):
+            plant.write_batch(os.path.join(root, v, 'plant_%010d_%010d.npz' % (first, end)),
+                              dict(analyse.campaign(args, week, v), **(change or {}).get(v, {})),
+                              dict(first=first, end=end), dict(k=np.arange(first, end)))
+    return n
+
+
+def frozen_rows(text):
+    return [l for l in text.splitlines() if l.split(' ')[0] in summarize.ORDER]
+
+
+def test_summarize_extra_slides(week, tmp_path, monkeypatch, capsys):
+    """summarize --extra-slides: the other slide* folders are fitted after the frozen five, by shift, as rows marked
+    (extra), and the recorded week is not opened; the frozen rows, their verdicts and the exit status of the frozen set
+    are the same with and without the option when the extras pass, and without it the extras are not looked at; an
+    extra that fails gives exit status 1 and is named, and with --recorded keeps the week closed; passing extras let it
+    open"""
+    guard_week(tmp_path, week)
+    guard_extra(tmp_path, week, EXTRA)
+    args = analyse.parse(['x', 'cpu', week, '--out', 'x', '--seed', '7'])[1]
+    cfgs = {v: analyse.campaign(args, week, v) for v in EVERY}
+    order, extra = list(summarize.ORDER), ['slide-3.0', 'slide+2.25']                 # by shift
+    log = []
+    monkeypatch.setattr(summarize.plant_fit, 'report', fake_report(log, (), cfgs))
+    assert summarize.main([str(tmp_path)]) == 0 and log == order
+    plain = capsys.readouterr().out
+    assert 'extra' not in plain
+    for argv, failing, opened, code, says in (
+            (['--extra-slides'], (), order + extra, 0, 'all pass'),
+            (['--extra-slides', '--recorded'], (), order + extra + ['zero'], 0, 'all pass: opening the week'),
+            (['--extra-slides'], ('slide+2.25',), order + extra, 1, 'extra slides that FAIL: slide+2.25: FAIL'),
+            (['--extra-slides', '--recorded'], ('slide-3.0',), order + extra, 1, 'and extra slides checked again'),
+            (['--extra-slides'], ('rev',), order + extra, 1, 'NOT all pass')):
+        log = []
+        monkeypatch.setattr(summarize.plant_fit, 'report', fake_report(log, failing, cfgs))
+        assert summarize.main([str(tmp_path)] + argv) == code, (argv, failing)
+        text = capsys.readouterr().out
+        assert log == opened and says in text, (argv, failing, log, text)
+        for v in extra:
+            line = [l for l in text.splitlines() if l.startswith(v + ' (extra) ')]
+            assert len(line) == 1 and ('FAIL' in line[0]) == (v in failing), (v, line)
+        if not [v for v in failing if v in order]:
+            assert frozen_rows(text) == frozen_rows(plain)
+        assert any(l.startswith('zero ') for l in text.splitlines()) == ('zero' in log)
+    # a folder without extra slides: said, and the frozen set as before
+    plain_root = tmp_path / 'plain'
+    guard_week(plain_root, week)
+    log = []
+    monkeypatch.setattr(summarize.plant_fit, 'report', fake_report(log, (), cfgs))
+    assert summarize.main([str(plain_root), '--extra-slides']) == 0 and log == order
+    assert 'none: no slide* folder besides those above' in capsys.readouterr().out
+
+
+def test_summarize_extra_slides_refused(week, tmp_path, monkeypatch):
+    """an extra slide that is incomplete (the second half missing), of another campaign (seed), whose files say they are
+    another variant, or a folder slide_old, is an error that names it, before any fit, and only with --extra-slides
+    (without it the frozen set is fitted and the folder not opened); the recorded folder is not opened for the extras
+    (its files here are empty)"""
+    n = guard_week(tmp_path / 'ok', week)
+    h = n // 2
+    for name, kw, match in (
+            ('partial', dict(files={'slide+2.25': [(0, h)]}), r'slide\+2\.25: .*missing.*k %d to %d' % (h, n - 1)),
+            ('seed', dict(change={'slide-3.0': dict(seed=8)}), r'slide-3\.0: .* another campaign.*seed'),
+            ('variant', dict(change={'slide-3.0': dict(variant='slide+2.25', control='slide+2.25')}),
+             r"slide-3\.0: .* says it is variant 'slide\+2\.25'")):
+        root = tmp_path / name
+        guard_week(root, week)
+        guard_extra(root, week, EXTRA, **kw)
+        refused(root, monkeypatch, '--extra-slides', '--recorded')
+        msg = refused(root, monkeypatch, '--extra-slides')
+        assert re.search(match, msg), (name, msg)
+        log = []
+        monkeypatch.setattr(summarize.plant_fit, 'report', fake_report(log))
+        assert summarize.main([str(root)]) == 0 and log == list(summarize.ORDER) and 'zero' not in log
+    old = tmp_path / 'old'
+    guard_week(old, week)
+    os.makedirs(old / 'slide_old')
+    assert 'slide_old' in refused(old, monkeypatch, '--extra-slides')
+    log = []
+    monkeypatch.setattr(summarize.plant_fit, 'report', fake_report(log))
+    assert summarize.main([str(old)]) == 0 and 'zero' not in log
+
+
+def test_summarize_extra_slide_criteria_real_fit(week, toy_week, tmp_path, capsys):
+    """with the real fits on toy evidences (no mergers): an extra slide of the same null passes the criteria of the
+    slid weeks, its row has the numbers of plant_fit.report, the frozen rows are the same lines as without the option;
+    an extra slide whose data hold mergers (nbar 0.05 but the meta of a control) fails the criterion of nbar consistent
+    with 0 and gives exit status 1, naming it"""
+    out, _ = toy_week
+    root = str(tmp_path / 'toy')
+    shutil.copytree(out, root, ignore=shutil.ignore_patterns('zero', 'inj_wrong_rate'))
+    write_toy_variant(os.path.join(root, 'slide+2.25'), week, 'slide+2.25', 0.0, 0.10, seed=20261201)
+    assert summarize.main([root, '--rho-min', '5']) == 0
+    plain = capsys.readouterr().out
+    assert summarize.main([root, '--rho-min', '5', '--extra-slides']) == 0
+    text = capsys.readouterr().out
+    assert frozen_rows(text) == frozen_rows(plain)
+    r = plant_fit.report(os.path.join(root, 'slide+2.25'), rho_mins=[5.0])
+    line = [l for l in text.splitlines() if l.startswith('slide+2.25 (extra) ')][0]
+    J = r['fits']['joint']
+    assert '%s+-%s' % (plant_fit._f(J['nbar'], '%.3g'), plant_fit._f(J['err']['nbar'], '%.2g')) in line and 'PASS' in line
+    write_toy_variant(os.path.join(root, 'slide-3.0'), week, 'slide-3.0', 0.05, 0.10, seed=20261202)
+    assert summarize.main([root, '--rho-min', '5', '--extra-slides']) == 1
+    text = capsys.readouterr().out
+    assert 'extra slides that FAIL: slide-3.0: FAIL' in text and 'NOT all pass' in text
+    assert frozen_rows(text) == frozen_rows(plain)
+    print('\n' + text)
+
+
+# ----------------------------------------------------------------------------------------------- slides_mean
+
+SLIDES = ('slide+0.5', 'slide-1.75') + EXTRA
+N_SLIDE, S_LN, RHO_SLIDE, DELTA = 6400, 0.5, 0.9, 0.02
+
+
+def slide_lnB(n, seed, n_slide=len(SLIDES), s=S_LN, rho=RHO_SLIDE, delta=DELTA):
+    """ln Bbar (n_slide, n) of slides that share the single-detector data: B_ij = (1 + delta) exp(s z_ij - s^2 / 2),
+    z_ij = rho z_i + sqrt(1 - rho^2) e_ij (z_i common to the slides of segment i), so that E(B - 1) = delta and two slides
+    of one segment have the log-correlation rho^2"""
+    rng = np.random.default_rng(seed)
+    z = rho * rng.standard_normal(n)[None] + np.sqrt(1 - rho ** 2) * rng.standard_normal((n_slide, n))
+    return s * z - 0.5 * s ** 2 + np.log1p(delta)
+
+
+def analytic_se(n, n_slide=len(SLIDES), s=S_LN, rho=RHO_SLIDE):
+    """the standard error of the mean of B - 1 over the n_slide n pairs: the segments are independent; the pairs of one
+    segment have variance (1 + delta)^2 (exp(s^2) - 1) and covariance (1 + delta)^2 (exp(s^2 rho^2) - 1)"""
+    v, c = [(1 + DELTA) ** 2 * (np.exp(s ** 2 * r) - 1.0) for r in (1.0, rho ** 2)]
+    return float(np.sqrt((v + (n_slide - 1) * c) / n_slide / n))
+
+
+def write_slides(root, week, lnB, names=SLIDES, stat='window', veto=None, others=(), halves=2):
+    """selection.txt of the n segments and a folder per slide with ln_B_bar (or ln_lambda_bar: stat 'gauss') of lnB[i], k,
+    wmax_H and wmax_L (veto {name: {k: wmax}} raised above 72 at those k), in `halves` files, with the meta of
+    analyse.campaign; folders of `others` (pr, rev, inj, zero) with unreadable files"""
+    n = lnB.shape[1]
+    os.makedirs(root, exist_ok=True)
+    with open(os.path.join(root, 'selection.txt'), 'w') as fh:
+        fh.write('epoch_1266933768.npz 1266933768 %d %d 0\n' % (n, n))
+    args = analyse.parse(['x', 'cpu', week, '--out', 'x', '--seed', '7'])[1]
+    rng = np.random.default_rng(5)
+    cuts = np.linspace(0, n, halves + 1).astype(int)
+    for i, v in enumerate(names):
+        os.makedirs(os.path.join(root, v), exist_ok=True)
+        w = {I: rng.exponential(5.0, n) for I in 'HL'}
+        for k, x in (veto or {}).get(v, {}).items():
+            w['H'][k] = x
+        for a, b in zip(cuts[:-1], cuts[1:]):
+            per = dict(k=np.arange(a, b), wmax_H=w['H'][a:b], wmax_L=w['L'][a:b],
+                       **{'ln_B_bar' if stat == 'window' else 'ln_lambda_bar': lnB[i, a:b]})
+            plant.write_batch(os.path.join(root, v, 'plant_%010d_%010d.npz' % (a, b)),
+                              analyse.campaign(args, week, v, '%064x' % (i + 1) if stat == 'window' else None),
+                              dict(first=int(a), end=int(b)), per)
+    for v in others:
+        os.makedirs(os.path.join(root, v), exist_ok=True)
+        with open(os.path.join(root, v, 'plant_%010d_%010d.npz' % (0, n)), 'wb') as fh:
+            fh.write(b'not an npz file')
+
+
+def block_jackknife(x_by_slide, k_by_slide, n, G):
+    """the delete-one-block jackknife of the mean over the pairs, by hand: (mean, se)"""
+    pairs = np.concatenate(x_by_slide)
+    blk = np.concatenate([(k * G) // n for k in k_by_slide])
+    reps = np.array([pairs[blk != b].mean() for b in range(G)])
+    return pairs.mean(), np.sqrt((G - 1) / G * np.sum((reps - reps.mean()) ** 2))
+
+
+def test_slides_mean_numbers(week, tmp_path, capsys):
+    """slides_mean on 4 slides of 6400 segments that share a common component (log-correlation 0.81 between the pairs of a
+    segment; B has the known mean 1.02): per slide the kept segments (those with wmax above 72 in H set aside at known k),
+    mean of B - 1, standard error, the half-sum count, the largest ln B with its k and nbar with its error are those of
+    the direct computation and plant_fit.nbar_fit; for all slides the mean of B - 1 over the 25600 pairs and its block
+    jackknife error equal a hand-written jackknife (32 blocks of consecutive k, the same blocks in every slide);
+    the mean is within 3 jackknife errors of 0.02, and the jackknife error is within 30 percent of the exact one of the
+    correlated pairs (analytic_se) and at least 1.4 times the naive error of the pairs; the pooled nbar is the nbar_fit of
+    every B of every slide with a jackknife error within 30 percent of the spread of the pooled nbar over 200 replicas;
+    the mixture's files (no ln_B_bar) give the same on ln_lambda_bar, saying so; the output prints each number"""
+    lnB = slide_lnB(N_SLIDE, 11)
+    veto = {'slide+0.5': {10: 100.0, 4000: 100.0}, 'slide+2.25': {7: 90.0}}
+    root = tmp_path / 'week'
+    write_slides(root, week, lnB, veto=veto)
+    r = slides_mean.analyse(str(root))
+    capsys.readouterr()
+    xs, ks = [], []
+    lines = []
+    for i, v in enumerate(SLIDES):
+        keep = np.ones(N_SLIDE, bool)
+        keep[list(veto.get(v, {}))] = False
+        ln, k = lnB[i][keep], np.arange(N_SLIDE)[keep]
+        x = np.exp(ln) - 1.0
+        s = r['slides'][v]
+        fit = plant_fit.nbar_fit(ln)
+        j = int(np.argmax(ln))
+        assert s['kept'] == keep.sum() and s['aside'] == (~keep).sum()
+        assert abs(s['mean'] - x.mean()) < 1e-12 and abs(s['se'] - x.std(ddof=1) / np.sqrt(x.size)) < 1e-12
+        assert s['half'] == plant_fit.heavy_tail(ln) and s['max'] == ln[j] and s['k_max'] == k[j]
+        assert abs(s['nbar'] - fit['nbar']) < 1e-12 and abs(s['err'] - fit['err']['nbar']) < 1e-12
+        xs.append(x)
+        ks.append(k)
+        lines.append('%s: %d kept, mean %+.4f +- %.4f, half-sum %d, max ln B %.3f at k %d, nbar %.4f +- %.4f' % (
+            v, s['kept'], s['mean'], s['se'], s['half'], s['max'], s['k_max'], s['nbar'], s['err']))
+    P = r['pooled']
+    mean, jse = block_jackknife(xs, ks, N_SLIDE, 32)
+    assert P['pairs'] == sum(x.size for x in xs) and P['blocks'] == 32
+    assert abs(P['mean'] - mean) < 1e-12 and abs(P['jack_mean'] - jse) < 1e-10 * jse
+    naive = np.concatenate(xs).std(ddof=1) / np.sqrt(P['pairs'])
+    exact = analytic_se(N_SLIDE)
+    lines.append('pooled: mean %+.4f +- %.4f (jackknife), naive %.4f, exact %.4f; nbar %.4f +- %.4f (jackknife), '
+                 '%.4f (curvature)' % (P['mean'], P['jack_mean'], naive, exact, P['nbar'], P['jack_nbar'], P['curv_nbar']))
+    print('\n' + '\n'.join(lines))
+    assert abs(P['mean'] - DELTA) < 3 * P['jack_mean'], lines[-1]
+    assert 0.7 < P['jack_mean'] / exact < 1.3 and P['jack_mean'] > 1.4 * naive, lines[-1]
+    pooled = np.concatenate([lnB[i][[k for k in range(N_SLIDE) if k not in veto.get(v, {})]] for i, v in enumerate(SLIDES)])
+    assert abs(P['nbar'] - plant_fit.nbar_fit(pooled)['nbar']) < 1e-12
+    reps = [plant_fit.nbar_fit(slide_lnB(N_SLIDE, 1000 + i).ravel())['nbar'] for i in range(200)]
+    assert 0.7 < P['jack_nbar'] / np.std(reps, ddof=1) < 1.3, (P['jack_nbar'], np.std(reps, ddof=1))
+    assert P['curv_nbar'] < 0.7 * P['jack_nbar']                 # the curvature error ignores the shared data
+    text = '\n'.join(r['lines'])
+    for v in SLIDES:
+        assert v in text
+    assert 'Bbar of the window model (ln_B_bar)' in text and 'jackknife over 32 blocks' in text
+    assert slides_mean.main([str(root), '--blocks', '16']) == 0
+    assert 'jackknife over 16 blocks' in capsys.readouterr().out
+    gauss = tmp_path / 'gauss'
+    write_slides(gauss, week, lnB, stat='gauss', veto=veto)
+    g = slides_mean.analyse(str(gauss))
+    assert g['stat'] == 'gauss' and 'only the Gaussian likelihood is used' in '\n'.join(g['lines'])
+    assert abs(g['pooled']['mean'] - P['mean']) < 1e-12 and g['slides']['slide+0.5']['kept'] == N_SLIDE - 2
+
+
+def test_slides_mean_reads_only_slides_and_refuses_the_rest(week, tmp_path, monkeypatch):
+    """the recorded week, pr, rev and inj are never opened (their files here are not even npz, and np.load is watched);
+    refused, naming it and before any number: the folder of one variant given as the week, a folder slide_old, a folder
+    without slide*, an incomplete slide, a slide of another campaign, a slide that is an injection run (nbar 0.3), slides
+    of the window model with slides of the mixture; the slide folders of an earlier good run are untouched"""
+    lnB = slide_lnB(N_SLIDE, 12)
+    root = tmp_path / 'week'
+    write_slides(root, week, lnB, others=('zero', 'pr', 'rev', 'inj'))
+    opened = []
+    real = np.load
+    monkeypatch.setattr(np, 'load', lambda path, *a, **kw: opened.append(str(path)) or real(path, *a, **kw))
+    r = slides_mean.analyse(str(root))
+    assert set(r['slides']) == set(SLIDES) and opened
+    assert not [p for p in opened if re.search(r'/(zero|pr|rev|inj)/', p)], opened
+    with pytest.raises(SystemExit, match='give the folder of the week'):
+        slides_mean.analyse(str(root / 'slide+0.5'))
+    cases = []
+    bad = tmp_path / 'old'
+    shutil.copytree(root, bad)
+    os.makedirs(bad / 'slide_old')
+    cases.append((bad, 'slide_old'))
+    empty = tmp_path / 'empty'
+    write_slides(empty, week, lnB[:0].reshape(0, N_SLIDE), names=(), others=('pr',))
+    cases.append((empty, 'no folder slide'))
+    part = tmp_path / 'part'
+    shutil.copytree(root, part)
+    os.remove(sorted(glob.glob(str(part / 'slide-3.0' / 'plant_*.npz')))[1])
+    cases.append((part, r'slide-3\.0: .*missing.*k 3200 to 6399'))
+    args = analyse.parse(['x', 'cpu', week, '--out', 'x', '--seed', '7'])[1]
+    for tag, change, match in (('seed', dict(seed=8), r'slide\+2\.25: .*another campaign.*seed'),
+                               ('inj', dict(nbar=0.3, merger_truth='injections'), r'not a time slide control')):
+        d = tmp_path / tag
+        shutil.copytree(root, d)
+        for f in glob.glob(str(d / 'slide+2.25' / 'plant_*.npz')):
+            with real(f) as z:
+                arrays = {key: z[key] for key in z.files}
+            meta = json.loads(str(arrays.pop('meta')))
+            np.savez(f, meta=np.array(json.dumps(dict(meta, **change))), **arrays)
+        cases.append((d, match))
+    mixed = tmp_path / 'mixed'
+    shutil.copytree(root, mixed)
+    for f in glob.glob(str(mixed / 'slide-3.0' / 'plant_*.npz')):
+        with real(f) as z:
+            arrays = {key: z[key] for key in z.files if key != 'ln_B_bar'}
+        arrays['ln_lambda_bar'] = arrays['wmax_H']
+        np.savez(f, **arrays)
+    cases.append((mixed, r'window model \(.*\) and of the mixture \(slide-3\.0\) cannot be pooled'))
+    for d, match in cases:
+        with pytest.raises(SystemExit, match=match):
+            slides_mean.analyse(str(d))
+    assert slides_mean.analyse(str(root))['pooled']['pairs'] == 4 * N_SLIDE
+
+
+def test_slide_names_agree():
+    """the form of a slide name is the same in analyse.py and summarize.py (slides_mean.py uses summarize's)"""
+    assert summarize.SLIDE.pattern == analyse.SLIDE.pattern
+    assert slides_mean.summarize.SLIDE.pattern == analyse.SLIDE.pattern

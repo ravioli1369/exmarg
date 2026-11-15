@@ -2,7 +2,8 @@
 and its criteria"), into files that scripts/validate/plant_fit.py fits.  Needs the redshift tables; meant for a GPU.
 
     python scripts/real_data/analyse.py tables/redshift gpu data/segments/O3b_v2 --out runs/week [--part 3/9]
-                                        [--variants zero,pr,rev,slide+0.5,slide-1.75,inj] [--nbar-inj 0.3] [--seed 1]
+                                        [--variants zero,pr,rev,slide+0.5,slide-1.75,inj[,slide+2.25,..]]
+                                        [--nbar-inj 0.3] [--seed 1]
                                         [--epochs-per-file 8] [--chunk 4096] [--resident]
     python scripts/real_data/summarize.py runs/week                   # the controls first; --recorded for the week
 
@@ -17,6 +18,14 @@ epoch (they share the noise curve; the bank of plant.MASSES is built on it):
     pr           controls.phase_randomize, seed [seed, GPS of the epoch, 1]
     rev          controls.time_reverse
     slide+0.5    controls.time_slide by +0.5 s, slide-1.75 by -1.75 s (2048 and -7168 matched-filter samples)
+    slide<+-s>   any other time slide, named by its signed shift in seconds as typed (slide+2.25, slide-3.0): more
+                 null data of the same week (summarize.py --extra-slides, slides_mean.py), not in the default
+                 --variants.  The name must be slide, a sign and digits[.digits]; the shift a whole number of
+                 matched-filter samples at least controls.MIN_SHIFT from a multiple of T (the error names the variant),
+                 and no two slides, these two included, the same shift (as written or modulo T).  Merger stage: its own
+                 pe_redshift call per epoch on the epoch's rows with the seed stream(seed, GPS of the epoch + 2^24 c,
+                 'pe'), c = 2 |m| - [m < 0] for m samples of the shift modulo T (c = 0 for the variants above), so
+                 its files do not depend on the other variants asked for; windows stage: in the one call
     inj          slide+0.5 plus mergers injected with probability --nbar-inj per segment, from the population of the
                  plant (plant.population(0.99119), plant.Sampler, plant.mergers, equal masses, no spin), the signal of
                  pp.simulate as the difference of two calls with the same seed, with y and with y = 0.  The injection
@@ -58,6 +67,7 @@ import glob
 import hashlib
 import json
 import os
+import re
 import socket
 import sys
 import time
@@ -76,6 +86,7 @@ from exmarg.search import controls
 VARIANTS = ('zero', 'pr', 'rev', 'slide+0.5', 'slide-1.75', 'inj')
 CONTROLS = ('pr', 'rev', 'slide+0.5', 'slide-1.75')
 SHIFTS = {'slide+0.5': 0.5, 'slide-1.75': -1.75}
+SLIDE = re.compile(r'^slide([+-])([0-9]+(?:\.[0-9]+)?)$')
 ZMIN = 0.99119
 CHUNK = 4096
 VERSION = 1
@@ -165,6 +176,65 @@ def whole_samples(seg, shift):
     return int(round(m))
 
 
+def slide_shift(name):
+    """the shift in s of a variant named slide<+ or ->digits[.digits] (ValueError otherwise); the built-in names too"""
+    m = SLIDE.match(name)
+    shift = float(m.group(1) + m.group(2)) if m else np.nan
+    if not np.isfinite(shift):
+        raise ValueError("%r is not a time slide: the form is slide<+ or -><seconds>, as slide+2.25 or slide-3.0" % name)
+    return shift
+
+
+def is_slide(name):
+    return name in SHIFTS or SLIDE.match(name) is not None
+
+
+def slide(seg, name):
+    """the time slide of the variant `name` of seg; the error of a shift that is not whole samples or too close to a
+    multiple of T names the variant"""
+    shift = slide_shift(name)
+    try:
+        whole_samples(seg, shift)
+        return controls.time_slide(seg, shift)
+    except ValueError as err:
+        raise ValueError('%s: %s' % (name, err)) from None
+
+
+def slide_samples(seg, names):
+    """{name: the shift in matched-filter samples modulo the segment} of the slides names (and the built-in ones); a
+    shift equal to another's modulo T (the same data under two names) is a ValueError naming both"""
+    n = int(round(float(seg['T']) / controls.time_step(seg)))
+    out = {}
+    for v in list(SHIFTS) + [v for v in names if v not in SHIFTS and is_slide(v)]:
+        try:
+            m = whole_samples(seg, slide_shift(v)) % n
+        except ValueError as err:
+            raise ValueError('%s: %s' % (v, err)) from None
+        twin = next((u for u, x in out.items() if x == m), None)
+        if twin is not None:
+            raise ValueError('%s and %s are the same shift modulo the %g s segment' % (twin, v, float(seg['T'])))
+        out[v] = m
+    return out
+
+
+def slide_samples_names(names):
+    """ValueError when two slides of names (or one and a built-in one) have the same shift, as written (the segment
+    length is not known yet: slide_samples checks the shifts modulo T)"""
+    seen = {SHIFTS[v]: v for v in SHIFTS}
+    for v in names:
+        if is_slide(v) and seen.setdefault(slide_shift(v), v) != v:
+            raise ValueError('%s and %s are the same shift' % (seen[slide_shift(v)], v))
+
+
+def extra_seed(seed, gps_epoch, seg, name):
+    """the seed of pe_redshift for a slide that is not a built-in one: stream(seed, GPS + 2^24 c, 'pe'), c = 2 |m| - [m < 0]
+    for its m matched-filter samples modulo T, in -T / 2 .. T / 2 (never the built-ins' seeds, c = 0, nor that of another
+    shift, for epochs less than 2^24 s apart); the row of a segment is added by pe_redshift"""
+    n = int(round(float(seg['T']) / controls.time_step(seg)))
+    m = (whole_samples(seg, slide_shift(name)) + n // 2) % n - n // 2
+    return plant.stream(seed, int(round(gps_epoch)) + (2 * abs(m) - (m < 0)) * 2 ** 24, 'pe')
+
+
 def injections(cfg, ep, rows, sampler):
     """the mergers injected into the segments rows of the epoch ep: (signal {I: (n, n_freq) complex}, truth dict of
     (n,) arrays merger, m1, z, y, snr), presence and (m1, z) from plant.mergers keyed by the GPS second, the signal of
@@ -201,6 +271,8 @@ def variants(cfg, ep, names, sampler):
     base = dict(d_H=np.asarray(ep['d_H'])[rows].astype(complex), d_L=np.asarray(ep['d_L'])[rows].astype(complex),
                 f=ep['f'], nu=ep['nu'], sig2=ep['sig2'], T=ep['T'], fmin=ep['fmin'], fmax=ep['fmax'])
     out, inj = {}, None
+    if any(v not in VARIANTS and is_slide(v) for v in names):
+        slide_samples(base, names)
     for v in names:
         if v == 'zero':
             out[v] = base
@@ -208,9 +280,8 @@ def variants(cfg, ep, names, sampler):
             out[v] = controls.phase_randomize(base, [int(cfg['seed']), int(round(float(ep['gps_epoch']))), 1])
         elif v == 'rev':
             out[v] = controls.time_reverse(base)
-        elif v in SHIFTS:
-            whole_samples(base, SHIFTS[v])
-            out[v] = controls.time_slide(base, SHIFTS[v])
+        elif is_slide(v):
+            out[v] = slide(base, v)
         elif v == 'inj':
             whole_samples(base, SHIFTS['slide+0.5'])
             slid = controls.time_slide(base, SHIFTS['slide+0.5'])
@@ -273,8 +344,8 @@ def campaign(a, seg_dir, variant, sha=None):
     nbar = None if variant == 'zero' else a.nbar_inj if variant == 'inj' else 0.0
     cfg = dict(version=VERSION, source='strain', segments=os.path.basename(os.path.normpath(seg_dir)),
                manifest_sha256=digest, selection='usable epoch, analysable, no catalogued event', variant=variant,
-               control=variant, seed=a.seed, nbar=nbar, nbar_inj=a.nbar_inj, shift=SHIFTS.get(
-                   variant, SHIFTS['slide+0.5'] if variant == 'inj' else None),
+               control=variant, seed=a.seed, nbar=nbar, nbar_inj=a.nbar_inj, shift=SHIFTS['slide+0.5'] if variant ==
+               'inj' else slide_shift(variant) if is_slide(variant) else None,
                glitch_truth=False, merger_truth='injections' if variant == 'inj' else 'none',
                truth_note='real data: no merger and no glitch is known; merger, glitch_I False, rho_I, t0_I NaN'
                           + (' except the injected mergers' if variant == 'inj' else ''),
@@ -325,7 +396,7 @@ def merger_shared(res):
 
 def run(a, factory, log=print):
     """the groups of epochs of this part, every requested variant; returns the paths written"""
-    names = [v for v in VARIANTS if v in a.variants]
+    names = [v for v in VARIANTS if v in a.variants] + [v for v in a.variants if v not in VARIANTS]
     sel = selection(a.segments)
     os.makedirs(a.out, exist_ok=True)
     record_selection(a.out, sel)
@@ -361,16 +432,28 @@ def run(a, factory, log=print):
             ep = strain.read_epoch(os.path.join(a.segments, sel[e]['name']))
             var, rows, inj = variants(params, ep, need, sampler)
             n, ns = rows.size, int(np.asarray(ep['gps']).size)
-            slots = {v: VARIANTS.index(v) * ns + rows for v in need}
-            stack = {I: np.zeros((len(VARIANTS) * ns, np.size(ep['nu'])), complex) for I in 'HL'}
-            for v in need:
+            extra = [v for v in need if v not in VARIANTS]
+            # the variants of VARIANTS at the fixed slots VARIANTS.index(v) ns + row of one stack; the windows stage has
+            # no random numbers and puts the others after them; the merger stage gives each its own call (alone)
+            slots = {v: (VARIANTS.index(v) if v in VARIANTS else len(VARIANTS) + extra.index(v)) * ns + rows
+                     for v in need if windows or v in VARIANTS}
+            stack = {I: np.zeros(((len(VARIANTS) + (len(extra) if windows else 0)) * ns, np.size(ep['nu'])), complex)
+                     for I in 'HL'}
+            for v in slots:
                 for I in 'HL':
                     stack[I][slots[v]] = var[v]['d_' + I]
             seg = dict(var[need[0]], d_H=stack['H'], d_L=stack['L'])
-            take = np.concatenate([slots[v] for v in need])
+            take = np.concatenate([slots[v] for v in slots]) if slots else rows
             seed = plant.stream(a.seed, int(round(float(ep['gps_epoch']))), 'pe')
             t1 = time.time()
             pe = factory(seg)
+
+            def alone(v):
+                """(segments, seed) of a variant that has no slot: its rows of an epoch-sized stack"""
+                pad = {I: np.zeros((ns, np.size(ep['nu'])), complex) for I in 'HL'}
+                for I in 'HL':
+                    pad[I][rows] = var[v]['d_' + I]
+                return dict(var[v], d_H=pad['H'], d_L=pad['L']), extra_seed(a.seed, float(ep['gps_epoch']), var[v], v)
             if windows:                                 # every variant in one call, sliced
                 res = pe(seg, take)
                 arrays = {v: plant.reduce_windows(dict(rho_edges=res['rho_edges'], **{
@@ -380,14 +463,24 @@ def run(a, factory, log=print):
             elif models:                                # a model per variant: a call per variant, the same rows
                 arrays = {}
                 for v in need:
-                    res = pe(seg, seed, slots[v], models[v][0])
+                    if v in slots:
+                        res = pe(seg, seed, slots[v], models[v][0])
+                    else:
+                        one, seed_v = alone(v)
+                        res = pe(one, seed_v, rows, models[v][0])
                     arrays[v] = plant.reduce(res, pop, plant.MDET)
                 shared = merger_shared(res)
             else:
-                res = pe(seg, seed, take)
-                arrays = {v: plant.reduce(dict(m1=res['m1'], z=res['z'], **{
-                    key: np.asarray(res[key])[j * n:(j + 1) * n] for key in PER_SEGMENT}), pop, plant.MDET)
-                    for j, v in enumerate(need)}
+                arrays = {}
+                if slots:
+                    res = pe(seg, seed, take)
+                    arrays = {v: plant.reduce(dict(m1=res['m1'], z=res['z'], **{
+                        key: np.asarray(res[key])[j * n:(j + 1) * n] for key in PER_SEGMENT}), pop, plant.MDET)
+                        for j, v in enumerate(slots)}
+                for v in extra:
+                    one, seed_v = alone(v)
+                    res = pe(one, seed_v, rows)
+                    arrays[v] = plant.reduce(res, pop, plant.MDET)
                 shared = merger_shared(res)
             del res
             t2 = time.time()
@@ -424,7 +517,9 @@ def parser():
     p.add_argument('device', choices=('gpu', 'cpu'))
     p.add_argument('segments', help='folder of the conditioned epochs, with manifest.txt')
     p.add_argument('--out', required=True, help='output folder: <out>/<variant>/plant_*.npz')
-    p.add_argument('--variants', default=','.join(VARIANTS), help='comma-separated subset of %s' % ','.join(VARIANTS))
+    p.add_argument('--variants', default=','.join(VARIANTS),
+                   help='comma-separated subset of %s, and any other slide<+ or ->seconds (slide+2.25, slide-3.0)'
+                        % ','.join(VARIANTS))
     p.add_argument('--nbar-inj', dest='nbar_inj', type=float, default=0.3, help='injection probability per segment')
     p.add_argument('--seed', type=int, default=1, help='0 <= seed < 2^20')
     p.add_argument('--part', default='0/1', help='i/n: the i-th of n contiguous ranges of epoch groups')
@@ -449,9 +544,15 @@ def parser():
 def parse(argv=None):
     p = parser()
     a = p.parse_args(argv)
-    a.variants = [v.strip() for v in a.variants.split(',') if v.strip()]
-    if not a.variants or set(a.variants) - set(VARIANTS):
-        p.error('--variants: a subset of %s' % ','.join(VARIANTS))
+    a.variants = list(dict.fromkeys(v.strip() for v in a.variants.split(',') if v.strip()))
+    bad = [v for v in a.variants if v not in VARIANTS and SLIDE.match(v) is None]
+    if not a.variants or bad:
+        p.error('--variants: a subset of %s, and slides named slide<+ or ->seconds (slide+2.25); not %s'
+                % (','.join(VARIANTS), ','.join(bad)))
+    try:
+        slide_samples_names(a.variants)
+    except ValueError as err:
+        p.error('--variants: %s' % err)
     if a.chunk is None:
         a.chunk = plant.WINDOW_CHUNK if a.stage == 'windows' else CHUNK
     if a.stage == 'windows' and (a.glitch_model or a.ymin is not None):

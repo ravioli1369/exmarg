@@ -5,6 +5,7 @@ again here, pass.
 
     python scripts/real_data/summarize.py runs/week [--rho-min 5 4.5 6] [--veto-w 72] [--w-inf-max 5e-4]
     python scripts/real_data/summarize.py runs/week --recorded
+    python scripts/real_data/summarize.py runs/week --extra-slides      # also the other time slides of the folder
 
 One row per variant (plant_fit.report on <out>/<variant>): segments kept and set aside by the loudness veto, nbar and
 its error with the Gaussian likelihood and with the mixture (joint power-law fit, the first --rho-min), the fitted
@@ -14,6 +15,13 @@ ln 100, for the mixture and, on the phase-randomized week only, for the Gaussian
 reversed weeks the Gaussian likelihood is expected to fail: a control of the test); on the injections the mixture nbar
 within 2.5 sigma of the injected rate.  Without --recorded the directory of the recorded week is not opened.  Exit
 status 1 when a control fails.
+
+--extra-slides: every other folder slide* of <out> (analyse.py --variants slide+2.25, ...) is checked like a control
+(coverage, one campaign with the others; an incomplete one, a folder whose name is not slide<+ or ->number, or files
+of another variant are errors that name it, and nothing is fitted) and fitted with the same criteria as the slid weeks
+of ORDER, and printed after the frozen rows as rows marked (extra).  The frozen set, its order and its criteria are
+unchanged, and so is its exit status; an extra slide that fails a criterion gives exit status 1 (and keeps the week as
+recorded closed with --recorded), the failing slides named.  The recorded folder is never opened for this.
 
 Variants analysed with the window model (analyse.py --glitch-model; their files carry ln_B_bar) are fitted with it in
 place of the mixture (plant_fit.py): the row then shows nbar of the window model, the glitches per segment of each
@@ -57,6 +65,7 @@ WIDTH_W = (11, 7, 6, 20, 20, 15, 15, 13, 21, 21, 0)
 # the meta entries that belong to a variant: the others must be the same in every variant of the week
 VARIANT_KEYS = ('variant', 'control', 'nbar', 'shift', 'merger_truth', 'truth_note', 'glitch_model_sha256')
 FILE = re.compile(r'^plant_(\d+)_(\d+)\.npz$')
+SLIDE = re.compile(r'^slide([+-])([0-9]+(?:\.[0-9]+)?)$')        # analyse.SLIDE
 
 
 def selected_total(out):
@@ -199,8 +208,21 @@ def row(variant, r):
             '%+.2f/%+.2f' % (cg[-1], cg.max()), '%+.2f/%+.2f' % (cm[-1], cm.max()), verdict(r))
 
 
-def table(rows, windows=False):
+def extra_slides(out):
+    """the folders slide* of out that are not in ORDER, by shift (the sign and number of the name); SystemExit naming a
+    folder whose name is not slide<+ or ->number"""
+    names = sorted(os.path.basename(p) for p in glob.glob(os.path.join(out, 'slide*')) if os.path.isdir(p))
+    bad = [v for v in names if v not in ORDER and not SLIDE.match(v)]
+    if bad:
+        raise SystemExit('%s: %s: not a time slide folder (slide<+ or ->seconds); not fitted' % (out, ', '.join(bad)))
+    return sorted((v for v in names if v not in ORDER), key=lambda v: float(v[5:]))
+
+
+def table(rows, windows=False, first=None):
+    """first: the width of the first column (default that of the frozen rows)"""
     width = WIDTH_W if windows else WIDTH
+    if first:
+        width = (first,) + tuple(width[1:])
     fmt = lambda cells: ' '.join(('%-*s' % (w, c)) if w else c for w, c in zip(width, cells))
     return [fmt(HEAD_W if windows else HEAD)] + [fmt(c) for c in rows]
 
@@ -222,10 +244,13 @@ def main(argv=None):
     p.add_argument('--w-inf-max', type=float, default=plant_fit.W_INF_MAX)
     p.add_argument('--monitor-cut', type=float, default=None, help='as plant_fit.py: set aside segments with a band '
                    'power this many widths above the median')
+    p.add_argument('--extra-slides', action='store_true', help='also fit every other slide* folder of <out>, with the '
+                   'criteria of the slid weeks, as rows marked (extra) after the frozen ones')
     a = p.parse_args(argv)
-    n_selected, campaign = check_week(a.out, ORDER, (RECORDED,) if a.recorded else ())
+    extra = extra_slides(a.out) if a.extra_slides else []
+    n_selected, campaign = check_week(a.out, ORDER + tuple(extra), (RECORDED,) if a.recorded else ())
     results = {}
-    for v in ORDER:
+    for v in ORDER + tuple(extra):
         results[v] = fit(a.out, v, a, n_selected)
         print('fitted %s' % v if results[v] is not None else 'no files in %s' % os.path.join(a.out, v), flush=True)
     rho = next((r['rho_min'] for r in results.values() if r is not None), None)
@@ -237,12 +262,22 @@ def main(argv=None):
              'glitch law from rho_min %s' % plant_fit._f(rho, '%g'), plant_fit.PRIOR[0], plant_fit.PRIOR[1]))
     print('\n'.join(table([row(v, results[v]) for v in ORDER], windows)), flush=True)
     passed = all(results[v] is not None and results[v]['ok'] for v in ORDER)
+    failed_extra = [v for v in extra if not results[v]['ok']]
+    if a.extra_slides:
+        print('\nextra time slides (null controls beyond the frozen set, the criteria of the slid weeks; %s):' % (
+            ', '.join(extra) if extra else 'none: no slide* folder besides those above'))
+        if extra:
+            print('\n'.join(table([row(v + ' (extra)', results[v]) for v in extra], windows,
+                                  max(WIDTH[0], max(len(v) for v in extra) + 8))), flush=True)
+        if failed_extra:
+            print('\nextra slides that FAIL: %s' % '; '.join('%s: %s' % (v, verdict(results[v])) for v in failed_extra))
     if not a.recorded:
         print('\ncontrols and injections: %s.  The week as recorded (%s) is not opened; run with --recorded once every '
-              'row above passes.' % ('all pass' if passed else 'NOT all pass', RECORDED))
-        return 0 if passed else 1
-    if not passed:
-        print('\n--recorded: controls and injections checked again, NOT all pass: the week as recorded stays closed.')
+              'row above passes.' % ('all pass' if passed and not failed_extra else 'NOT all pass', RECORDED))
+        return 0 if passed and not failed_extra else 1
+    if not passed or failed_extra:
+        print('\n--recorded: controls and injections%s checked again, NOT all pass: the week as recorded stays closed.'
+              % (' and extra slides' if extra else ''))
         return 1
     print('\n--recorded: controls and injections checked again, all pass: opening the week as recorded.', flush=True)
     r = fit(a.out, RECORDED, a, n_selected)

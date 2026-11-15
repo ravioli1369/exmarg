@@ -9,6 +9,7 @@ the law of the campaign, between bin edges), adding sqrt(rho^2 / 2) e^{i phi}.  
 l_k the glitch ratio of bin k (test_mixture.Toy, exact), wmax = max_t |z|^2.  Nothing here uses mixture.py or single.py
 to build the data.
 """
+import glob
 import importlib.util
 import json
 import os
@@ -288,3 +289,104 @@ def test_windows_fit_refuses(small, tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert 'NOT CONVERGED' in out and 'no model written' in out
     assert not os.path.exists(os.path.join(folder, 'glitch_model.json'))
+
+
+def week_folder(small, tmp_path):
+    """the toy of `small` as one variant of a week: files of analyse.py --stage windows (its campaign meta, which has no
+    segment length T, source 'strain'), <out>/slide+0.5/win_*.npz and the selection.txt of <out> that windows_fit reads
+    for a week.  returns (the variant's folder, the campaign)"""
+    spec = importlib.util.spec_from_file_location('analyse', os.path.join(ROOT, 'scripts', 'real_data', 'analyse.py'))
+    analyse = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(analyse)
+    segs = tmp_path / 'segments'
+    os.makedirs(segs)
+    with open(segs / 'manifest.txt', 'w') as fh:
+        fh.write('# toy week\nepoch_1266933768.npz 1266933768 600 127 127 0 0 0 33 33 1 0.8\n')
+    a = analyse.parse(['x', 'cpu', str(segs), '--out', 'x', '--stage', 'windows', '--n-window', str(NW)])[1]
+    cfg = analyse.campaign(a, str(segs), 'slide+0.5')
+    out = tmp_path / 'week_w'
+    folder = out / 'slide+0.5'
+    os.makedirs(folder)
+    with open(out / 'selection.txt', 'w') as fh:
+        fh.write('epoch_1266933768.npz 1266933768 600 600 0\n')
+    for path in sorted(glob.glob(os.path.join(small[0], 'win_*.npz'))):
+        with np.load(path) as z:
+            arrays = {key: z[key] for key in z.files if key != 'meta'}
+        first, end = (int(x) for x in os.path.basename(path)[4:-4].split('_'))
+        plant.write_batch(str(folder / os.path.basename(path)), cfg, dict(first=first, end=end), arrays)
+    return str(folder), cfg
+
+
+def test_windows_fit_week_folder_has_no_segment_length(small, tmp_path, capsys):
+    """the campaign meta of a week (analyse.py --stage windows) has no T, a plant's has: windows_fit fits the folder of a
+    week (the report line of the segments has no window length, and says everything else, and the files are those of
+    source 'strain'), writes the model of the campaign key of the files and exits 0; the same toy with a plant's meta
+    gives the line with the window length T / n_window = 0.25 s"""
+    folder, cfg = week_folder(small, tmp_path)
+    assert 'T' not in cfg and cfg['source'] == 'strain' and cfg['variant'] == 'slide+0.5'
+    capsys.readouterr()
+    r = windows_fit.fit(folder, record=(1,))
+    assert r['ok'] and 'T' not in r['cfg']
+    line = [l for l in r['lines'] if 'segments in' in l][0]
+    assert line == '600 segments in 3 files, k 0 to 599; 32 windows; evidences stored on rho 3 to 14', line
+    assert r['lines'][1].startswith('recorded strain segments (manifest sha256 ') and 'variant slide+0.5' in r['lines'][1]
+    assert windows_fit.main([folder, '--record', '1']) == 0
+    out = capsys.readouterr().out
+    model, sha = plant.read_model(os.path.join(folder, 'glitch_model.json'))
+    assert 'written %s' % os.path.join(folder, 'glitch_model.json') in out and sha in out
+    assert model['campaign'] == plant.campaign_key(cfg) and model['n_window'] == NW and model['segments']['total'] == 600
+    plain = windows_fit.fit(small[0], record=(1,))
+    assert '600 segments in 3 files, k 0 to 599; 32 windows of 0.25 s; evidences stored on rho 3 to 14' in plain['lines']
+
+
+REAL_FIT_WINDOWS = mixture.fit_windows
+
+
+def count_fits(monkeypatch, unconverged=()):
+    """mixture.fit_windows as windows_fit calls it, at most 3 updates, reporting no convergence for the numbers of
+    states in `unconverged`; the numbers of states of its calls are appended to the returned list"""
+    real, calls = REAL_FIT_WINDOWS, []
+
+    def fit_windows(E, n_state=2, basis=None):
+        calls.append(n_state)
+        return dict(real(E, n_state=n_state, basis=basis, max_iter=3), converged=n_state not in unconverged)
+    monkeypatch.setattr(windows_fit.mixture, 'fit_windows', fit_windows)
+    return calls
+
+
+def test_windows_fit_record_and_convergence(small, tmp_path, monkeypatch, capsys):
+    """--record lists the numbers of states fitted besides --n-state (default 1,2,3), and nothing else is fitted (one
+    call per detector and number): --record 1 --n-state 2 fits 1 and 2, --record '' only 2, --record 1,3 --n-state 2
+    fits 1, 2 and 3, --record 2 --n-state 3 fits 2 and 3.  A fit of a number of states that is only a record that does
+    not converge does not stop the model (written, exit 0, said in the report as for the record only), a fit of the
+    model written that does not converge does (exit 1, NOT CONVERGED naming the detectors and the number of states, no
+    file, and an existing file is left as it was)"""
+    folder = broken(small, tmp_path, 'record')
+    model_path = os.path.join(folder, 'glitch_model.json')
+    for argv, fitted in ((['--record', '1', '--n-state', '2'], [1, 2]), (['--record', '', '--n-state', '2'], [2]),
+                         (['--record', '1,3', '--n-state', '2'], [1, 2, 3]), (['--record', '2', '--n-state', '3'], [2, 3]),
+                         ([], [1, 2, 3])):
+        calls = count_fits(monkeypatch)
+        capsys.readouterr()
+        assert windows_fit.main([folder] + argv) == 0, argv
+        assert sorted(calls) == sorted(fitted * 2) and os.path.exists(model_path), (argv, calls)
+        assert [f['n_state'] for f in json.loads(open(model_path).read())['fits']['H']] == fitted
+        os.remove(model_path)
+    count_fits(monkeypatch, unconverged=(1, 3))                  # the record fits do not converge: the model is written
+    capsys.readouterr()
+    assert windows_fit.main([folder]) == 0
+    out = capsys.readouterr().out
+    assert 'among the fits kept for the record only: H with 1 states, H with 3 states, L with 1 states, L with 3 states' \
+        in out and 'NOT CONVERGED' not in out and os.path.exists(model_path)
+    sha = plant.read_model(model_path)[1]
+    count_fits(monkeypatch, unconverged=(2,))                    # the model's own does not: no model, the old one stays
+    assert windows_fit.main([folder]) == 1
+    out = capsys.readouterr().out
+    assert 'NOT CONVERGED: H with 2 states, L with 2 states; no model written' in out and 'written %s' % model_path not in out
+    assert plant.read_model(model_path)[1] == sha
+    os.remove(model_path)
+    count_fits(monkeypatch, unconverged=(2,))
+    assert windows_fit.main([folder, '--n-state', '3']) == 0 and os.path.exists(model_path)   # 2 is a record now
+    os.remove(model_path)
+    count_fits(monkeypatch, unconverged=(3,))
+    assert windows_fit.main([folder, '--n-state', '3']) == 1 and not os.path.exists(model_path)
