@@ -563,6 +563,31 @@ def unequalized(epoch):
     return out
 
 
+def own_curves(epoch):
+    """the segments of an epoch on the noise curve of each detector (no step 5; docs/2026-11-15_unequal_noise_design.md):
+    {I: (d_I (n_segment, n_freq) complex128, sig2_I (n_freq,))}.  Off the notches d_I = unequalized(epoch)[I] and
+    sig2_I = sig2_ref_I, its variance (the curve each detector was handed over on); in the notched bins, where
+    unequalized gives 0 and sig2_ref is 0, the data and variance of the file (noise drawn with variance
+    notch_factor max sig2, independent of the rest), so that E|d_I|^2 = sig2_I in every bin and neither the data nor the
+    templates carry weight there.  An epoch conditioned with equal_noise=False is its own data and curves."""
+    sig2 = own_sig2(epoch)
+    if not epoch["equal_noise"]:
+        return {I: (np.asarray(epoch["d_" + I]).astype(complex), sig2[I]) for I in "HL"}
+    notched = np.asarray(epoch["notched"], bool)
+    pre = unequalized(epoch)
+    return {I: (np.where(notched, np.asarray(epoch["d_" + I]).astype(complex), pre[I]), sig2[I]) for I in "HL"}
+
+
+def own_sig2(epoch):
+    """{I: (n_freq,)} the noise curves of own_curves: sig2_ref_I off the notches and the file's sig2 in them (sig2_I
+    of an epoch conditioned with equal_noise=False)"""
+    if not epoch["equal_noise"]:
+        return {I: np.asarray(epoch["sig2_" + I], float) for I in "HL"}
+    notched = np.asarray(epoch["notched"], bool)
+    return {I: np.where(notched, np.asarray(epoch["sig2"], float), np.asarray(epoch["sig2_ref_" + I], float))
+            for I in "HL"}
+
+
 def write_epoch(path, epoch):
     """one epoch (a dict of condition) to an uncompressed .npz, so that read_segments maps only the rows it uses.
     The data are complex64: their rounding (6e-8 relative) is far below the noise, but at |d| ~ 1e-23 their squares

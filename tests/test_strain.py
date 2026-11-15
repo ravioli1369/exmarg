@@ -607,3 +607,50 @@ def test_unequalized_regenerates_the_data_before_step_5(run):
         for I in "HL":
             err = np.abs(pre[I][:, keep] - b["d_" + I][:, keep].astype(complex)) / np.sqrt(a["sig2_ref_" + I][keep])
             assert err.max() < 1e-5, (I, err.max())
+
+
+@pytest.mark.parametrize("name", ["mean eq", "median eq", "known eq"])
+def test_own_curves_have_the_power_of_their_data(run, name):
+    """strain.own_curves of an equalized run (the data of each detector before step 5, the notched bins of the file):
+    the curve of detector I is sig2_ref_I off the notches and the file's notch variance in them; |d_I|^2 / sig2_I has
+    mean 1 in every band and in the notched bins, in both detectors; the matched-filter power E_0|z_I|^2 / u_I with the
+    bank built on the two curves is 1 for each detector (what the search needs).  Control: L, the quieter detector
+    below 100 Hz, against the equalized curve has power 1/1.44 there (fails)"""
+    eps = run(name)
+    notched = eps[0]["notched"]
+    own = [strain.own_curves(e) for e in eps]
+    for e, o in zip(eps, own):
+        for I in "HL":
+            assert np.array_equal(o[I][1][~notched], e["sig2_ref_" + I][~notched])
+            assert np.array_equal(o[I][1][notched], e["sig2"][notched]) and np.all(o[I][1] > 0)
+    as_eps = [dict(e, d_H=o["H"][0], d_L=o["L"][0], sig2_H=o["H"][1], sig2_L=o["L"][1]) for e, o in zip(eps, own)]
+    for e in as_eps:
+        del e["sig2"]
+    for I in "HL":
+        table = power_table(as_eps, I)
+        z = np.concatenate([e["d_" + I][:, notched] / np.sqrt(e["sig2_" + I][notched]) for e in as_eps])
+        table["notched bins"] = (np.mean(np.abs(z) ** 2), np.sqrt(V / z.size))
+        report("%s own curve %s, |d|^2 / sig2_%s" % (name, I, I), table)
+        for band, (m, s) in table.items():
+            assert abs(m - 1.0) < NSIG * s, (I, band, m, s)
+    out, neff = {}, None
+    for e in as_eps:
+        bank = mass_bank(np.array([20.0, 60.0, 200.0]), e, "cpu")
+        for i in range(e["d_H"].shape[0]):
+            tr = bank.trajectories({I: e["d_" + I][i] for I in "HL"}, {I: e["sig2_" + I] for I in "HL"})
+            for I in "HL":
+                out.setdefault(I, []).append(np.mean(np.exp(2.0 * tr["lq" + I].astype(float)), axis=1)
+                                             / getattr(bank, "u_" + I))
+        W2 = np.abs(bank.W.astype(complex)) ** 2
+        neff = {I: (W2 / e["sig2_" + I]).sum(1) ** 2 / ((W2 / e["sig2_" + I]) ** 2).sum(1) for I in "HL"}
+    for I in "HL":
+        r = np.array(out[I])
+        s = np.sqrt(V / neff[I] / r.shape[0])
+        print("%s %s on its own curve: E|z|^2 / u_I for M = 20, 60, 200: %s +- %s; u_H/u_L %s"
+              % (name, I, np.round(r.mean(0), 4), np.round(s, 4), np.round(bank.u_H / bank.u_L, 3)))
+        assert np.all(np.abs(r.mean(0) - 1.0) < NSIG * s)
+    f = eps[0]["f"]
+    m = ~notched & (f > 22.0) & (f < 100.0)
+    p = np.concatenate([np.abs(o["L"][0][:, m]) ** 2 / e["sig2"][m] for e, o in zip(eps, own)])
+    print("control: L before step 5 against the equalized curve, 22-100 Hz: %.4f" % p.mean())
+    assert abs(p.mean() - 1.0) > NSIG * np.sqrt(V / p.size)

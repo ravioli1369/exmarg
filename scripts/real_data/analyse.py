@@ -61,6 +61,21 @@ variant); --glitch-model <file>: that model for every variant (fitted on any var
 VARIANT_KEYS aside).  A model that was modified or has another n_window than --n-window is refused.  Each variant is
 then one pe_redshift call per epoch (same seed and rows as above, so the same arrival times), and its files hold
 plant.py's members of the window model; the meta records glitch_model 'windows', glitch_model_sha256 and n_window.
+
+Unequal noise curves (docs/2026-11-15_unequal_noise_design.md):
+    python scripts/real_data/analyse.py tables/w-0.60,tables/redshift_cache,tables/w-0.30 gpu data/segments/O3b_v2
+        --out runs/week_u --unequal --glitch-model auto [--mmap] [--zmin-cut] [--zmin 0] [--asym-tol 0.05]
+--unequal: every variant from the data of each detector on its own curve (strain.own_curves: the noise of step 5
+regenerated and subtracted, the notched bins of the file), with sig2_H, sig2_L; the injections' SNR on those curves.
+Both stages; recorded as noise 'own curves', a setting of the data (a glitch model fitted on equalized data is refused).
+The store argument may list several folders (stores of distinct asym, or their unbiased caches with --mmap,
+scripts/real_data/store_cache.py): pe_redshift mixes the two that bracket each template's asymmetry; recorded as
+tables_asym.  --asym-tol (default plant.ASYM_TOL = 0.05, with --unequal or several stores): a template outside the
+stores' range by at most that is read from the end store (recorded as asym_tol; the number of such templates of each
+segment's epoch in asym_outside).  --zmin (default 0.99119; 0: the whole population): the population of the reduction
+and of the injections; for every variant but inj (whose injections are drawn from it) a setting of the merger stage
+only, so the window models of a windows stage serve merger stages of any --zmin.  --zmin-cut: pe_redshift(zmin=--zmin),
+the nodes that z >= zmin needs alone (the same results there).  Without these options nothing changes.
 """
 import argparse
 import glob
@@ -235,11 +250,12 @@ def extra_seed(seed, gps_epoch, seg, name):
     return plant.stream(seed, int(round(gps_epoch)) + (2 * abs(m) - (m < 0)) * 2 ** 24, 'pe')
 
 
-def injections(cfg, ep, rows, sampler):
+def injections(cfg, ep, rows, sampler, sig2=None):
     """the mergers injected into the segments rows of the epoch ep: (signal {I: (n, n_freq) complex}, truth dict of
     (n,) arrays merger, m1, z, y, snr), presence and (m1, z) from plant.mergers keyed by the GPS second, the signal of
     pp.simulate (seed plant.stream(seed, gps, 'noise')) with y less that with y = 0, snr the optimal network SNR with
-    the epoch's sig2"""
+    the noise curve of each detector, sig2 {I: (n_freq,)} (default the epoch's sig2 for both)"""
+    sig2 = {I: ep['sig2'] for I in 'HL'} if sig2 is None else sig2
     gps = [int(round(float(ep['gps'][i]))) for i in rows]
     present, m1, z, y = plant.mergers(dict(seed=cfg['seed'], nbar=cfg['nbar_inj']), gps, sampler)
     n, nu = len(rows), np.asarray(ep['nu'])
@@ -257,19 +273,26 @@ def injections(cfg, ep, rows, sampler):
         a, b = one(y[j]), one(0.0)
         for I in 'HL':
             h[I][j] = a['d_' + I][0] - b['d_' + I][0]
-        snr[j] = np.sqrt(sum(2.0 * np.sum(np.abs(h[I][j]) ** 2 / ep['sig2']) for I in 'HL'))
+        snr[j] = np.sqrt(sum(2.0 * np.sum(np.abs(h[I][j]) ** 2 / sig2[I]) for I in 'HL'))
     truth = dict(merger=present, m1=np.where(present, m1, np.nan), z=np.where(present, z, np.nan), y=y, snr=snr)
     return h, truth
 
 
-def variants(cfg, ep, names, sampler):
+def variants(cfg, ep, names, sampler, own=False):
     """the selected segments of the epoch ep in each variant of names: ({variant: segments dict}, rows (n,) their
-    indices in the epoch, injection truth or None)"""
-    if 'sig2' not in ep:
-        raise ValueError('the epoch has sig2_H and sig2_L: the tables need one noise curve (equal_noise)')
+    indices in the epoch, injection truth or None).  own: the data of each detector on its own curve (strain.own_curves,
+    sig2_H and sig2_L), else the equalized data on the epoch's one curve sig2"""
     rows = np.flatnonzero(selected(ep))
-    base = dict(d_H=np.asarray(ep['d_H'])[rows].astype(complex), d_L=np.asarray(ep['d_L'])[rows].astype(complex),
-                f=ep['f'], nu=ep['nu'], sig2=ep['sig2'], T=ep['T'], fmin=ep['fmin'], fmax=ep['fmax'])
+    base = dict(f=ep['f'], nu=ep['nu'], T=ep['T'], fmin=ep['fmin'], fmax=ep['fmax'])
+    if own:
+        o = strain.own_curves(ep)
+        base.update(d_H=o['H'][0][rows], d_L=o['L'][0][rows], sig2_H=o['H'][1], sig2_L=o['L'][1])
+    elif 'sig2' not in ep:
+        raise ValueError('the epoch has sig2_H and sig2_L: the published tables need one noise curve (equal_noise), '
+                         'or analyse it with --unequal')
+    else:
+        base.update(d_H=np.asarray(ep['d_H'])[rows].astype(complex), d_L=np.asarray(ep['d_L'])[rows].astype(complex),
+                    sig2=ep['sig2'])
     out, inj = {}, None
     if any(v not in VARIANTS and is_slide(v) for v in names):
         slide_samples(base, names)
@@ -285,25 +308,27 @@ def variants(cfg, ep, names, sampler):
         elif v == 'inj':
             whole_samples(base, SHIFTS['slide+0.5'])
             slid = controls.time_slide(base, SHIFTS['slide+0.5'])
-            h, inj = injections(cfg, ep, rows, sampler)
+            h, inj = injections(cfg, ep, rows, sampler, {I: base.get('sig2_' + I, base.get('sig2')) for I in 'HL'})
             out[v] = dict(slid, d_H=slid['d_H'] + h['H'], d_L=slid['d_L'] + h['L'])
         else:
             raise ValueError('unknown variant %r' % v)
     return out, rows, inj
 
 
-def make_analysis(store, device, resident=False, chunk=CHUNK, ymin=None):
-    """factory(segments) builds the bank of plant.MASSES on the epoch's noise curve and returns pe(segments, seed, rows,
+def make_analysis(store, device, resident=False, chunk=CHUNK, ymin=None, zmin=None, asym_tol=None):
+    """factory(segments) builds the bank of plant.MASSES on the epoch's noise curves and returns pe(segments, seed, rows,
     glitch=True) -> the pe_redshift dict (glitch=True, or the dict of the window model) of those rows of the segments,
-    on plant.GRID"""
+    on plant.GRID; store one store or a list (the mixture), zmin and asym_tol those of pe_redshift (each given only when
+    not None)"""
     from exmarg.search import mass_bank, pe_redshift
+    cut = {k: v for k, v in (('zmin', zmin), ('asym_tol', asym_tol)) if v is not None}
 
     def factory(seg0):
         bank = mass_bank(plant.MASSES, seg0, device)
 
         def pe(seg, seed, rows, glitch=True):
             return pe_redshift(seg, bank, store, rows=rows, chunk=chunk, resident=resident, seed=seed, ymin=ymin,
-                               mdet_range=plant.MDET, glitch=glitch, **plant.GRID)
+                               mdet_range=plant.MDET, glitch=glitch, **cut, **plant.GRID)
         return pe
     return factory
 
@@ -327,14 +352,23 @@ PER_SEGMENT = plant.KEYS + ('ln_glitch_H', 'ln_glitch_L', 'wmax_H', 'wmax_L')
 WINDOW_KEYS = ('ln_window_H', 'ln_window_L', 'wmax_H', 'wmax_L')
 
 
+def merger_only(variant):
+    """the campaign keys of a variant that are settings of the merger stage although both stages record them: zmin, the
+    population of the analysis (the data of every variant but inj, whose injections are drawn from it, do not depend
+    on it)"""
+    return () if variant == 'inj' else ('zmin',)
+
+
 def load_models(a, cfgs):
     """{variant: (the glitch settings of pe_redshift, the model's SHA-256)} of --glitch-model for the variants of cfgs
     (their campaigns without the model): 'auto', each variant's own <out>/<variant>/glitch_model.json fitted on its
-    campaign; a file, that model for every variant, fitted on a variant of the same campaign (VARIANT_KEYS aside).
-    plant.glitch_model refuses a modified file, another n_window or another campaign"""
+    campaign (merger_only aside); a file, that model for every variant, fitted on a variant of the same campaign
+    (VARIANT_KEYS and zmin aside).  plant.glitch_model refuses a modified file, another n_window or another campaign"""
     if a.glitch_model == 'auto':
-        return {v: plant.glitch_model(os.path.join(a.out, v, MODEL), cfg, a.n_window) for v, cfg in cfgs.items()}
-    return {v: plant.glitch_model(a.glitch_model, cfg, a.n_window, ignore=VARIANT_KEYS) for v, cfg in cfgs.items()}
+        return {v: plant.glitch_model(os.path.join(a.out, v, MODEL), cfg, a.n_window, ignore=merger_only(v))
+                for v, cfg in cfgs.items()}
+    return {v: plant.glitch_model(a.glitch_model, cfg, a.n_window, ignore=VARIANT_KEYS + ('zmin',))
+            for v, cfg in cfgs.items()}
 
 
 def campaign(a, seg_dir, variant, sha=None):
@@ -350,10 +384,13 @@ def campaign(a, seg_dir, variant, sha=None):
                truth_note='real data: no merger and no glitch is known; merger, glitch_I False, rho_I, t0_I NaN'
                           + (' except the injected mergers' if variant == 'inj' else ''),
                eps_H=None, eps_L=None, glitch_kind=None, gamma=None, rho_min=None, rho_max=None,
-               epochs_per_file=a.epochs_per_file, zmin=ZMIN, mdet_range=plant.MDET,
+               epochs_per_file=a.epochs_per_file, zmin=a.zmin, mdet_range=plant.MDET,
                bank=(float(plant.MASSES[0]), float(plant.MASSES[-1]), plant.MASSES.size), grid=plant.GRID,
                ymin=plant.default_ymin() if a.ymin is None else float(a.ymin), n_loud=1024, n_random=1024,
                glitch_settings='pe default')
+    if a.unequal:
+        cfg['noise'] = 'own curves'
+    cfg.update(plant.store_settings(a))
     cfg = plant.stage_settings(cfg, a)
     if sha is not None:
         cfg = plant.with_model(cfg, sha, a.n_window)
@@ -408,9 +445,9 @@ def run(a, factory, log=print):
         cfgs = {v: campaign(a, a.segments, v, models[v][1]) for v in names}
     for v in names:
         os.makedirs(os.path.join(a.out, v), exist_ok=True)
-        plant.check_folder(os.path.join(a.out, v), cfgs[v])
+        plant.check_folder(os.path.join(a.out, v), cfgs[v], ignore=merger_only(v))
     bins = plant.window_bins(a.window_rho_min, a.window_rho_max) if windows else None
-    pop = plant.population(ZMIN)
+    pop = plant.population(a.zmin)
     sampler = plant.Sampler(pop, plant.MDET)
     params = dict(seed=a.seed, nbar_inj=a.nbar_inj)
     written, began, rows_done = [], time.time(), 0
@@ -430,7 +467,7 @@ def run(a, factory, log=print):
                 continue
             t0 = time.time()
             ep = strain.read_epoch(os.path.join(a.segments, sel[e]['name']))
-            var, rows, inj = variants(params, ep, need, sampler)
+            var, rows, inj = variants(params, ep, need, sampler, a.unequal)
             n, ns = rows.size, int(np.asarray(ep['gps']).size)
             extra = [v for v in need if v not in VARIANTS]
             # the variants of VARIANTS at the fixed slots VARIANTS.index(v) ns + row of one stack; the windows stage has
@@ -474,7 +511,8 @@ def run(a, factory, log=print):
                 arrays = {}
                 if slots:
                     res = pe(seg, seed, take)
-                    arrays = {v: plant.reduce(dict(m1=res['m1'], z=res['z'], **{
+                    per_call = {k: res[k] for k in ('asym_outside',) if k in res}
+                    arrays = {v: plant.reduce(dict(m1=res['m1'], z=res['z'], **per_call, **{
                         key: np.asarray(res[key])[j * n:(j + 1) * n] for key in PER_SEGMENT}), pop, plant.MDET)
                         for j, v in enumerate(slots)}
                 for v in extra:
@@ -513,7 +551,8 @@ def run(a, factory, log=print):
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('store', help='folder of the redshift tables (bd_*.npz)')
+    p.add_argument('store', help='folder of the redshift tables (bd_*.npz) or its unbiased cache; or several, comma '
+                                 'separated, of distinct asym: the mixture of the two that bracket each template')
     p.add_argument('device', choices=('gpu', 'cpu'))
     p.add_argument('segments', help='folder of the conditioned epochs, with manifest.txt')
     p.add_argument('--out', required=True, help='output folder: <out>/<variant>/plant_*.npz')
@@ -538,6 +577,21 @@ def parser():
     p.add_argument('--glitch-model', default=None, metavar='auto|JSON',
                    help='merger stage with the window model: auto, <out>/<variant>/glitch_model.json for each variant; '
                         'or one file for every variant')
+    p.add_argument('--zmin', type=float, default=ZMIN,
+                   help='smallest redshift of the population of the analysis and of the injections (default %g; 0: the '
+                        'whole population); a setting of the merger stage except for inj' % ZMIN)
+    p.add_argument('--zmin-cut', action='store_true',
+                   help='pe_redshift reads only the nodes the redshifts z >= --zmin need (the same results there)')
+    p.add_argument('--unequal', action='store_true',
+                   help='each detector on its own noise curve (strain.own_curves: no step 5); needs stores that cover '
+                        'the u_H/u_L of the templates')
+    p.add_argument('--asym-tol', type=float, default=plant.ASYM_TOL,
+                   help='with --unequal or several stores: a template whose asymmetry lies outside the stores\' range by at '
+                        'most this is read from the end store (default %g; recorded, and the number of such templates '
+                        'per segment in asym_outside)' % plant.ASYM_TOL)
+    p.add_argument('--mmap', action='store_true',
+                   help='map the tables from disk instead of reading them (the store folders must be unbiased caches, '
+                        'store.write_unbiased_cache): the jobs of a machine share them')
     return p
 
 
@@ -555,8 +609,12 @@ def parse(argv=None):
         p.error('--variants: %s' % err)
     if a.chunk is None:
         a.chunk = plant.WINDOW_CHUNK if a.stage == 'windows' else CHUNK
-    if a.stage == 'windows' and (a.glitch_model or a.ymin is not None):
-        p.error('--glitch-model and --ymin are of the merger stage')
+    if a.stage == 'windows' and (a.glitch_model or a.ymin is not None or a.zmin_cut or a.mmap):
+        p.error('--glitch-model, --ymin, --zmin-cut and --mmap are of the merger stage')
+    if not a.zmin >= 0:
+        p.error('need zmin >= 0')
+    if not a.asym_tol >= 0:
+        p.error('need asym-tol >= 0')
     if not (0 <= a.window_rho_min < a.window_rho_max):
         p.error('need 0 <= window-rho-min < window-rho-max')
     if a.n_window < 1:
@@ -579,22 +637,21 @@ def main(argv=None, factory=None):
     if factory is None and a.stage == 'windows':
         factory = make_windows(a.device, a.n_window, a.chunk)
     elif factory is None:
-        if not glob.glob(os.path.join(a.store, 'bd_*.npz')):
-            p.error('no bd_*.npz in %s' % a.store)
+        for d in a.store.split(','):
+            if not glob.glob(os.path.join(d, 'bd_*.npz')) and not plant.is_cache(d):
+                p.error('no bd_*.npz (or unbiased cache) in %s' % d)
         loaded = {}
 
         def factory(seg):
             if 'store' not in loaded:
-                from exmarg.search import load_redshift_store
-                t = time.time()
-                loaded['store'] = load_redshift_store(a.store, pinned=(a.device == 'gpu'), unbiased=True)
-                print('%s  store loaded, %d nodes (%.0f s)' % (stamp(), loaded['store'].s.size, time.time() - t),
-                      flush=True)
+                loaded['store'] = plant.load_stores(a)
             return make_analysis(loaded['store'], a.device, a.resident, a.chunk,
-                                 plant.default_ymin() if a.ymin is None else a.ymin)(seg)
-    print('%s  %s, part %d/%d, variants %s, into %s; stage %s%s' % (
+                                 plant.default_ymin() if a.ymin is None else a.ymin,
+                                 a.zmin if a.zmin_cut else None, plant.asym_tol(a))(seg)
+    print('%s  %s, part %d/%d, variants %s, into %s; stage %s%s%s, zmin %g%s' % (
         stamp(), a.segments, a.part[0], a.part[1], ','.join(a.variants), a.out, a.stage,
-        ', glitch model %s' % a.glitch_model if a.glitch_model else ''), flush=True)
+        ', glitch model %s' % a.glitch_model if a.glitch_model else '', ', own noise curves' if a.unequal else '',
+        a.zmin, ' (cut)' if a.zmin_cut else ''), flush=True)
     run(a, factory)
     return 0
 

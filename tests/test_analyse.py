@@ -1324,3 +1324,163 @@ def test_slide_names_agree():
     """the form of a slide name is the same in analyse.py and summarize.py (slides_mean.py uses summarize's)"""
     assert summarize.SLIDE.pattern == analyse.SLIDE.pattern
     assert slides_mean.summarize.SLIDE.pattern == analyse.SLIDE.pattern
+
+
+# ----------------------------------------------------------------------------------------------- own noise curves
+
+
+def make_unequal_epoch(gps_epoch, seed, cond_seed=11, **flags):
+    """an epoch as strain.condition writes it with step 5: data on the curves sig2_ref_H (1.7 times the H design curve)
+    and sig2_ref_L (L better below 100 Hz), equalized by strain.equalize with the draws of condition, then the notch
+    noise; returns (epoch, the data before step 5)"""
+    ep = make_epoch(gps_epoch, seed, **flags)
+    f, notched = ep['f'], ep['notched']
+    ref = {'H': np.where(notched, 0.0, 1.7 * T * S('H', f) / 2.0)}
+    ref['L'] = np.where(notched, 0.0, ref['H'] * np.where(f < 100.0, 0.55, 1.1))
+    rng = np.random.default_rng(seed + 1)
+    pre = {I: np.sqrt(ref[I] / 2) * (rng.standard_normal((NSEG, f.size)) + 1j * rng.standard_normal((NSEG, f.size)))
+           for I in 'HL'}
+    cond = np.random.default_rng([cond_seed, int(round(gps_epoch * 1000))])
+    d_H, d_L, sig2 = strain.equalize(pre['H'], pre['L'], ref['H'], ref['L'], cond)
+    big = 1e10 * sig2.max()
+    sig2 = np.where(notched, big, sig2)
+    d = {'H': d_H, 'L': d_L}
+    for I in 'HL':
+        g = cond.standard_normal((2, NSEG, int(notched.sum())))
+        d[I][:, notched] = np.sqrt(0.5 * big) * (g[0] + 1j * g[1])
+    ep.update(d_H=d['H'].astype(np.complex64), d_L=d['L'].astype(np.complex64), sig2=sig2, sig2_ref_H=ref['H'],
+              sig2_ref_L=ref['L'], seed=cond_seed, equal_noise=True)
+    return ep, pre
+
+
+def write_unequal_week(folder):
+    """the four epochs of write_week, conditioned with step 5 (make_unequal_epoch)"""
+    os.makedirs(folder, exist_ok=True)
+    lines = ['# synthetic week, unequal curves\n']
+    for i, e in enumerate(EPOCHS[::-1]):
+        ep, _ = make_unequal_epoch(e['gps'], 100 + i, loud_H=e.get('loud_H', ()), loud_L=e.get('loud_L', ()),
+                                   event=e.get('event', ()), usable=e.get('usable', True))
+        name = 'epoch_%d.npz' % e['gps']
+        strain.write_epoch(os.path.join(folder, name), ep)
+        lines.append('%s %d %d 127 127 %d 0 0 33 33 %d 0.8\n' % (name, e['gps'], NSEG, ep['event'].sum(),
+                                                                 int(ep['usable'])))
+    with open(os.path.join(folder, 'manifest.txt'), 'w') as fh:
+        fh.writelines(lines)
+    return folder
+
+
+@pytest.fixture(scope='module')
+def uweek(tmp_path_factory):
+    return write_unequal_week(str(tmp_path_factory.mktemp('uweek') / 'segments'))
+
+
+class UStub(Stub):
+    """the Stub for segments on two curves: the same arrays with sig2_I in place of sig2; records the curves"""
+
+    def __init__(self):
+        super().__init__()
+        self.curves = []
+
+    def pe(self, seg, seed, rows, glitch=True):
+        self.curves.append({I: np.asarray(seg['sig2_' + I]).copy() for I in 'HL'})
+        one = {I: dict(seg, sig2=seg['sig2_' + I]) for I in 'HL'}
+        res = {I: Stub.pe(self, one[I], seed, rows, glitch) for I in 'HL'}
+        del self.calls[-1], self.glitches[-1]
+        out = dict(res['H'], asym_outside=2)
+        for key in ('ln_glitch_L', 'wmax_L') + (('ln_c_L', 'state_L') if isinstance(glitch, dict) else ()):
+            out[key] = res['L'][key]
+        return out
+
+
+def test_unequal_variants(uweek):
+    """variants with own curves: every variant's data are those of strain.own_curves on the selected rows, the data
+    before step 5 to the complex64 rounding of the file off the notches, the file's notch noise in them; sig2_H, sig2_L
+    the curves of own_curves (sig2_ref_I off the notches) and no sig2; the controls keep them; the injections' optimal
+    SNR uses the curve of each detector; without own curves the variants are those of the equalized data"""
+    ep = strain.read_epoch(os.path.join(uweek, 'epoch_1266934296.npz'))
+    s = plant.Sampler(plant.population(analyse.ZMIN), plant.MDET)
+    var, rows, inj = analyse.variants(dict(seed=7, nbar_inj=0.5), ep, analyse.VARIANTS, s, own=True)
+    _, pre = make_unequal_epoch(1266934296, 101, loud_H=(20,), event=(8, 9))
+    own = strain.own_curves(ep)
+    keep = ~ep['notched']
+    for I in 'HL':
+        assert np.array_equal(var['zero']['d_' + I], own[I][0][rows]) and 'sig2' not in var['zero']
+        err = np.abs(var['zero']['d_' + I][:, keep] - pre[I][rows][:, keep]) / np.sqrt(ep['sig2_ref_' + I][keep])
+        assert err.max() < 1e-5, err.max()
+        assert np.array_equal(var['zero']['d_' + I][:, ~keep], np.asarray(ep['d_' + I])[rows][:, ~keep].astype(complex))
+        assert np.array_equal(var['zero']['sig2_' + I][keep], ep['sig2_ref_' + I][keep])
+        for v in analyse.VARIANTS:
+            assert np.array_equal(var[v]['sig2_' + I], own[I][1]), v
+    h = {I: var['inj']['d_' + I] - var['slide+0.5']['d_' + I] for I in 'HL'}
+    snr = np.sqrt(sum(2.0 * np.sum(np.abs(h[I]) ** 2 / own[I][1], axis=1) for I in 'HL'))
+    assert inj['merger'].any() and np.allclose(inj['snr'], snr, rtol=1e-12, atol=0)
+    eq, rows_eq, _ = analyse.variants(dict(seed=7, nbar_inj=0.5), ep, ('zero',), s)
+    assert np.array_equal(rows_eq, rows) and np.array_equal(eq['zero']['sig2'], ep['sig2'])
+
+
+def test_unequal_driver(uweek, tmp_path):
+    """--unequal with two store folders (asym 0 and -0.6), --zmin 0 and --zmin-cut: pe gets each epoch's own-curve
+    data and curves; the files record noise 'own curves', tables_asym, zmin 0, zmin_cut and asym_tol 0.05 (the
+    default), and per segment the number of templates pe read from an end store (asym_outside); plant_fit reads them;
+    the injections are drawn from the whole population (some below z = 0.99); a run of the equalized data into the
+    same folder stops; the campaign of the equalized data with one store records none of these"""
+    from test_store import write_store
+    stores = '%s,%s' % (write_store(str(tmp_path / 's0')), write_store(str(tmp_path / 's6'), asym=-0.6))
+    out = tmp_path / 'u'
+    stub = UStub()
+    assert analyse.main([stores, 'cpu', uweek, '--out', str(out), '--seed', '7', '--unequal', '--zmin', '0',
+                         '--zmin-cut', '--epochs-per-file', '2'], factory=stub.factory) == 0
+    gps = [1266933768, 1266934296, 1266934560]
+    assert len(stub.calls) == 3
+    for curves, g in zip(stub.curves, gps):
+        want = strain.own_sig2(strain.read_epoch(os.path.join(uweek, 'epoch_%d.npz' % g)))
+        assert all(np.array_equal(curves[I], want[I]) for I in 'HL')
+    for v in analyse.VARIANTS:
+        cfg, _, a, _, _ = plant_fit.load(str(out / v))
+        assert cfg['noise'] == 'own curves' and cfg['tables_asym'] == [-0.6, 0.0] and cfg['zmin'] == 0.0
+        assert cfg['zmin_cut'] is True and cfg['asym_tol'] == 0.05 and a['k'].size == 94
+        assert np.array_equal(a['asym_outside'], np.full(94, 2))
+        if v == 'inj':
+            assert a['merger'].any() and np.nanmin(a['z']) < analyse.ZMIN
+    with pytest.raises(SystemExit, match='another campaign.*noise'):
+        analyse.main([stores, 'cpu', uweek, '--out', str(out), '--seed', '7', '--zmin', '0', '--zmin-cut',
+                      '--epochs-per-file', '2'], factory=Stub().factory)
+    plain = analyse.campaign(analyse.parse(['x', 'cpu', uweek, '--out', 'x'])[1], uweek, 'pr')
+    assert not {'noise', 'tables_asym', 'asym_tol', 'zmin_cut'} & set(plain)
+
+
+def test_zmin_reuses_the_window_model(week, tmp_path):
+    """the window models of a windows stage at the default --zmin serve a merger stage at --zmin 0: with auto for every
+    variant but inj (whose injections are drawn from the population, so its data change with zmin: refused), with a
+    given file for every variant; the merger files record zmin 0 and lie next to the window files of the other zmin"""
+    out = tmp_path / 'm'
+    shas = windows_week(week, out)
+    controls_ = 'pr,rev,slide+0.5,slide-1.75,zero'
+    stub = drive(week, out, '--epochs-per-file', '2', '--glitch-model', 'auto', '--zmin', '0', '--variants', controls_)
+    assert len(stub.calls) == 15
+    for v in controls_.split(','):
+        for f in glob.glob(str(out / v / 'plant_*.npz')):
+            meta = plant.read_meta(f)
+            assert meta['zmin'] == 0.0 and meta['glitch_model_sha256'] == shas[v]
+        assert glob.glob(str(out / v / 'win_*.npz'))
+    with pytest.raises(SystemExit, match='inj/glitch_model.json: the model was fitted on another campaign.*zmin'):
+        drive(week, out, '--epochs-per-file', '2', '--glitch-model', 'auto', '--zmin', '0', '--variants', 'inj')
+    given = tmp_path / 'given'
+    drive(week, given, '--epochs-per-file', '2', '--glitch-model', str(out / 'slide+0.5' / 'glitch_model.json'),
+          '--zmin', '0.5')
+    assert {plant.read_meta(f)['zmin'] for f in glob.glob(str(given / '*' / 'plant_*.npz'))} == {0.5}
+
+
+def test_analysis_wiring_stores_and_zmin(week, monkeypatch):
+    """make_analysis passes the store (one, or the list) and, only when given, zmin and asym_tol to pe_redshift"""
+    import exmarg.search as search
+    seen = []
+    monkeypatch.setattr(search, 'pe_redshift', lambda seg, bank, store, **kw: seen.append((store, kw)))
+    ep = strain.read_epoch(os.path.join(week, 'epoch_1266934560.npz'))
+    seg = analyse.variants(dict(seed=7, nbar_inj=0.0), ep, ('pr',), None)[0]['pr']
+    analyse.make_analysis(['a', 'b'], 'cpu', zmin=0.5, asym_tol=0.05)(seg)(seg, 17, [0, 1])
+    analyse.make_analysis('a', 'cpu')(seg)(seg, 17, [0, 1])
+    (st1, kw1), (st2, kw2) = seen
+    assert st1 == ['a', 'b'] and kw1['zmin'] == 0.5 and kw1['asym_tol'] == 0.05 and st2 == 'a'
+    assert 'zmin' not in kw2 and 'asym_tol' not in kw2
+    assert {k: v for k, v in kw1.items() if k not in ('zmin', 'asym_tol')} == kw2
