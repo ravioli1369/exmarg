@@ -70,6 +70,13 @@ glitch in window order.  Noise and mergers are those of the campaign with the sa
     glitch_state_I, n_glitches_I         its state (index into the f:q pairs) and number of glitches
 The campaign records glitch_states = {H, L: [[f, q], ...], n_window}.
 
+Unequal noise curves (docs/2026-11-15_unequal_noise_design.md): --asym W puts the noise of detector I on sig2_I =
+sig2 / (1 +- W) (the same random numbers: every template then has w = W), --curves EPOCH on the two curves of a
+conditioned epoch file (strain.own_sig2); mergers and glitches keep their signals and SNR on those curves.  Recorded as
+noise {asym} or {curves, sha256}.  The store argument may list several folders (the mixture of pe_redshift, recorded as
+tables_asym), --asym-tol (default 0.05, with unequal curves or several stores; recorded, and asym_outside per segment),
+--zmin-cut (pe_redshift(zmin=--zmin)), --mmap (unbiased caches mapped).
+
 Stage 1 of the window model, --stage windows (no tables; the store argument is not read): the same segments, batches
 and controls, through pe.window_evidences(n_window=--n-window) on the bank of the analysis, into
 win_<first>_<end>.npz next to the plant files of the campaign, with meta (the campaign without the settings of the
@@ -105,12 +112,14 @@ from exmarg.search import controls, population as popavg
 from exmarg.search.pe import _dl_of_z
 from exmarg.search.segments import D0
 from exmarg.search.single import RHO_EDGES
+from exmarg.search.store import is_cache, read_header
 
 T, FMIN, FMAX = 8.0, 20.0, 512.0
 MASSES = np.geomspace(20.0, 400.0, 120)
 MDET = (20.0, 400.0)
 GRID = dict(m1_range=(4.0, 200.0), nm1=150, zmax=10.0, nz=150)
 ZMIN = 1.0
+ASYM_TOL = 0.05                             # how far outside the stores' asym a template may be read from the end store
 SHIFT = 0.5
 CHUNK = 128
 KINDS = ('template',) + tuple(BURSTS)
@@ -125,7 +134,7 @@ WINDOW_RHO = (3.0, 12.2)
 WINDOW_CHUNK = 8                            # segments filtered at once by window_evidences (its default)
 # the campaign settings of the merger stage alone, and those of the stages: campaign_key leaves them out
 MERGER_KEYS = ('grid', 'ymin', 'n_loud', 'n_random', 'glitch_settings', 'tables', 'shared_times', 'glitch_model',
-               'glitch_model_sha256')
+               'glitch_model_sha256', 'tables_asym', 'zmin_cut', 'asym_tol')
 STAGE_KEYS = ('stage', 'n_window', 'window_rho')
 PREFIX = dict(merger='plant', windows='win')
 
@@ -194,11 +203,49 @@ def kinds(cfg, ks):
     return np.array([[KINDS[j] for j in p] for p in pick], dtype='<U16').reshape(len(ks), 2)
 
 
+def curve(seg, I):
+    """the noise curve of detector I of a segments dict (sig2_I, or the one sig2)"""
+    return seg['sig2_' + I] if 'sig2_' + I in seg else seg['sig2']
+
+
+_CURVES = {}
+
+
+def noise_curves(cfg):
+    """{I: sig2_I} of the campaign's noise (None: the H design curve in both detectors, pp.simulate): asym W gives
+    sig2_H = sig2 / (1 + W), sig2_L = sig2 / (1 - W) (every template has w = W); curves the two curves of a conditioned
+    epoch file (strain.own_sig2), checked against the SHA-256 recorded"""
+    noise = cfg.get('noise')
+    if noise is None:
+        return None
+    nu = np.arange(int(np.ceil(cfg['fmin'] * cfg['T'])), int(np.floor(cfg['fmax'] * cfg['T'])) + 1)
+    if 'asym' in noise:
+        from exmarg.detectors import S
+        sig2, W = cfg['T'] * S('H', nu / cfg['T']) / 2.0, noise['asym']
+        return dict(H=sig2 / (1.0 + W), L=sig2 / (1.0 - W))
+    if noise['curves'] not in _CURVES:
+        _CURVES[noise['curves']] = epoch_curves(noise['curves'], nu)
+    sig2, sha = _CURVES[noise['curves']]
+    if sha != noise['sha256']:
+        raise SystemExit('%s: the noise curves changed since the campaign recorded them' % noise['curves'])
+    return sig2
+
+
+def epoch_curves(path, nu):
+    """({I: sig2_I}, SHA-256 of the two arrays) of a conditioned epoch file, whose bins must be nu"""
+    from exmarg import strain
+    ep = strain.read_epoch(path)
+    if not np.array_equal(np.asarray(ep['nu']), nu):
+        raise SystemExit('%s: the bins of the epoch are not those of the plant' % path)
+    sig2 = strain.own_sig2(ep)
+    return sig2, hashlib.sha256(np.concatenate([sig2['H'], sig2['L']]).astype('<f8').tobytes()).hexdigest()
+
+
 def glitch(seg, i, k, I, cfg, kind, draw_rho, dt):
     """the data of detector I in row i (segment k) with its glitch, and the record (present, kind, rho, t0): drawn as
     the first detector of its own exmarg.glitches call, from the stream 'glitch_I' of segment k"""
     row = seg['d_' + I][i:i + 1]
-    one = dict(d_H=row, d_L=row, nu=seg['nu'], sig2=seg['sig2'], T=seg['T'], fmin=seg['fmin'], fmax=seg['fmax'])
+    one = dict(d_H=row, d_L=row, nu=seg['nu'], sig2=curve(seg, I), T=seg['T'], fmin=seg['fmin'], fmax=seg['fmax'])
     eps, seed = {'H': cfg['eps_' + I], 'L': 0.0}, stream(cfg['seed'], k, 'glitch_' + I)
     if kind == 'template':
         new, rec = add_template_glitches(one, eps, draw_rho, MASSES, seed, time_step=dt)
@@ -241,7 +288,7 @@ def window_glitches(seg, i, k, I, cfg, draw_rho, dt):
     s = min(int(np.searchsorted(np.cumsum(f) / f.sum(), u, side='right')), f.size - 1)
     on = np.flatnonzero(u_on < q[s])
     shape = np.random.default_rng(np.random.SeedSequence(root, spawn_key=(2 + j,)))
-    one = dict(nu=seg['nu'], sig2=seg['sig2'], T=seg['T'], fmin=seg['fmin'], fmax=seg['fmax'])
+    one = dict(nu=seg['nu'], sig2=curve(seg, I), T=seg['T'], fmin=seg['fmin'], fmax=seg['fmax'])
     h, kinds_ = np.zeros(np.size(seg['nu']), complex), []
     for w in on:
         kind = KINDS[shape.integers(len(KINDS))] if cfg['glitch_kind'] == 'mixed' else cfg['glitch_kind']
@@ -269,7 +316,7 @@ def simulate_batch(cfg, first, end, sampler):
         return mdet[cur[0]], 1.0, 0.0
 
     seg, sim, snr = simulate(n, stream(cfg['seed'], first, 'noise'), draw, lambda rng: y[cur[0]], cfg['T'], cfg['fmin'],
-                             cfg['fmax'])
+                             cfg['fmax'], sig2=noise_curves(cfg))
     if not (np.array_equal(sim[:, 0], mdet) and np.array_equal(sim[:, 3], y)):
         raise RuntimeError('pp.simulate did not take the draws in segment order')
     dt = controls.time_step(seg)
@@ -329,7 +376,8 @@ def reduce(res, pop, mdet_range=MDET):
     """the per-segment arrays kept from a pe_redshift result (glitch=True): ln Lbar of the six ln_lambda grids on the
     population pop, w_inf and w_inf_cells, ln of the template average of E_I (n, n_rho) and the largest w.  With the
     window model (ln_B in res): ln Lbar of the grids KEYS_W, w_inf over the cells where ln_lambda or ln_B is not
-    finite, and ln_c_I (n,), state_I (n, K) as given"""
+    finite, and ln_c_I (n,), state_I (n, K) as given.  With asym_outside in res (pe_redshift with asym_tol) that number
+    for every segment"""
     m1, z = res['m1'], res['z']
     windows = 'ln_B' in res
     out = {key + '_bar': np.atleast_1d(popavg.ln_lambda_bar(res[key], m1, z, mdet_range, pop))
@@ -339,6 +387,8 @@ def reduce(res, pop, mdet_range=MDET):
     if windows:
         bad |= ~np.isfinite(np.asarray(res['ln_B'])) & (w > 0)[None]
     out['w_inf'] = np.array([w[b].sum() for b in bad])
+    if 'asym_outside' in res:                         # templates read from an end store (pe_redshift asym_tol), per call
+        out['asym_outside'] = np.full(bad.shape[0], int(res['asym_outside']))
     out['w_inf_cells'] = np.argwhere(bad.any(axis=0)).astype(np.int32)
     for I in 'HL':
         lnE = np.asarray(res['ln_glitch_' + I], float)
@@ -376,11 +426,13 @@ def window_shared(bins):
     return dict(window_rho_edges=RHO_EDGES[b[0]:b[-1] + 2].copy(), window_bin0=np.array(b[0]))
 
 
-def make_analysis(store, device, resident=False, chunk=CHUNK, ymin=None, shared_times=False):
+def make_analysis(store, device, resident=False, chunk=CHUNK, ymin=None, shared_times=False, zmin=None, asym_tol=None):
     """the analysis behind a narrow interface: factory(segments) builds the bank on these segments (every batch has the
-    same frequency grid and noise curve) and returns pe(segments, seed, glitch) -> the pe_redshift dict on GRID, with
-    glitch=True or None, or the dict of the window model (glitch_model)"""
+    same frequency grid and noise curves) and returns pe(segments, seed, glitch) -> the pe_redshift dict on GRID, with
+    glitch=True or None, or the dict of the window model (glitch_model); store one store or a list (the mixture), zmin
+    and asym_tol those of pe_redshift (each given only when not None)"""
     from exmarg.search import mass_bank, pe_redshift
+    cut = {k: v for k, v in (('zmin', zmin), ('asym_tol', asym_tol)) if v is not None}
 
     def factory(seg0):
         bank = mass_bank(MASSES, seg0, device)
@@ -388,7 +440,7 @@ def make_analysis(store, device, resident=False, chunk=CHUNK, ymin=None, shared_
         def pe(seg, seed, glitch):
             g = glitch if isinstance(glitch, dict) else (True if glitch else None)
             return pe_redshift(seg, bank, store, chunk=chunk, resident=resident, seed=seed, ymin=ymin,
-                               mdet_range=MDET, glitch=g, shared_times=shared_times, **GRID)
+                               mdet_range=MDET, glitch=g, shared_times=shared_times, **cut, **GRID)
         return pe
     return factory
 
@@ -431,10 +483,58 @@ def campaign(args):
         cfg['tables'] = 'published'
     if getattr(args, 'shared_times', False):
         cfg['shared_times'] = True
+    if getattr(args, 'asym', None) is not None:
+        cfg['noise'] = dict(asym=args.asym)
+    elif getattr(args, 'curves', None) is not None:
+        path = os.path.abspath(args.curves)
+        nu = np.arange(int(np.ceil(FMIN * T)), int(np.floor(FMAX * T)) + 1)
+        cfg['noise'] = dict(curves=path, sha256=epoch_curves(path, nu)[1])
+    cfg.update(store_settings(args))
     states = glitch_states(args)
     if states:
         cfg['glitch_states'] = dict(states, n_window=args.n_window)
     return json.loads(json.dumps(stage_settings(cfg, args)))
+
+
+def asym_tol(args):
+    """the asym_tol of pe_redshift for the run: args.asym_tol when the noise curves differ (analyse.py --unequal,
+    plant.py --asym or --curves) or several stores are given, None (not passed, not recorded) otherwise: with equal
+    curves and one store it changes nothing"""
+    several = len([d for d in args.store.split(',') if d]) > 1
+    unequal = getattr(args, 'unequal', False) or getattr(args, 'asym', None) is not None or getattr(args, 'curves', None)
+    return float(args.asym_tol) if several or unequal else None
+
+
+def store_settings(args):
+    """the campaign entries of the tables of a merger-stage run: tables_asym, the sorted asym of the store folders, when
+    several are given (one store must have the asym of every template, which the noise settings fix); asym_tol when it
+    is passed (asym_tol()); zmin_cut when pe_redshift reads only the nodes of z >= zmin"""
+    if getattr(args, 'stage', 'merger') == 'windows':
+        return {}
+    out = {}
+    dirs = [d for d in args.store.split(',') if d]
+    if len(dirs) > 1:
+        out['tables_asym'] = sorted(float(read_header(d)['asym']) for d in dirs)
+    if asym_tol(args) is not None:
+        out['asym_tol'] = asym_tol(args)
+    if getattr(args, 'zmin_cut', False):
+        out['zmin_cut'] = True
+    return out
+
+
+def load_stores(args):
+    """the store folders of args.store (comma separated): one store, or the list of them; page-locked on the GPU unless
+    mapped (args.mmap: the folders must be unbiased caches), unbiased unless args.published_tables"""
+    from exmarg.search import load_redshift_store
+    out = []
+    for d in args.store.split(','):
+        t = time.time()
+        out.append(load_redshift_store(d, pinned=(args.device == 'gpu' and not args.mmap), mmap=args.mmap,
+                                       unbiased=not getattr(args, 'published_tables', False)))
+        print('%s  store %s loaded, %d nodes, asym %g%s (%.0f s)' % (stamp(), d, out[-1].s.size, out[-1].asym,
+                                                                     ', mapped' if args.mmap else '', time.time() - t),
+              flush=True)
+    return out[0] if len(out) == 1 else out
 
 
 def glitch_states(args):
@@ -523,18 +623,18 @@ def check_campaign(path, cfg):
         raise SystemExit('%s belongs to another campaign (differs in %s)' % (path, ', '.join(diff)))
 
 
-def check_folder(out, cfg):
+def check_folder(out, cfg, ignore=()):
     """every result file of the folder out against the run of campaign cfg: the files of its stage must be of the
-    same campaign, those of the other stage of the same campaign_key"""
+    same campaign, those of the other stage of the same campaign_key (the keys of ignore aside)"""
     mine = PREFIX[cfg.get('stage', 'merger')]
+    key = lambda c: {k: v for k, v in campaign_key(c).items() if k not in ignore}
     for path in sorted(glob.glob(os.path.join(out, 'plant_*.npz')) + glob.glob(os.path.join(out, 'win_*.npz'))):
         if os.path.basename(path).startswith(mine + '_'):
             check_campaign(path, cfg)
             continue
         meta = read_meta(path)
-        if campaign_key(meta) != campaign_key(cfg):
-            raise SystemExit('%s belongs to another campaign (differs in %s)'
-                             % (path, _differ(campaign_key(meta), campaign_key(cfg))))
+        if key(meta) != key(cfg):
+            raise SystemExit('%s belongs to another campaign (differs in %s)' % (path, _differ(key(meta), key(cfg))))
 
 
 def write_batch(path, cfg, run, arrays):
@@ -613,7 +713,8 @@ def run(cfg, out, start, n, batch, factory, plain=False, info=None, log=print, g
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('store', help='folder of the redshift tables (bd_*.npz)')
+    p.add_argument('store', help='folder of the redshift tables (bd_*.npz) or its unbiased cache; or several, comma '
+                                 'separated, of distinct asym: the mixture of the two that bracket each template')
     p.add_argument('device', choices=('gpu', 'cpu'))
     p.add_argument('--n', type=int, required=True, help='number of segments of this run')
     p.add_argument('--start', type=int, default=0, help='index of the first segment')
@@ -653,6 +754,18 @@ def parser():
     p.add_argument('--window-rho-max', type=float, default=WINDOW_RHO[1])
     p.add_argument('--glitch-model', default=None, metavar='JSON',
                    help='merger stage with the window model of this file of windows_fit.py (same campaign)')
+    p.add_argument('--asym', type=float, default=None, metavar='W',
+                   help='unequal noise: sig2_H = sig2 / (1 + W), sig2_L = sig2 / (1 - W), every template at w = W')
+    p.add_argument('--curves', default=None, metavar='EPOCH',
+                   help='unequal noise: the curves of each detector of this conditioned epoch file (strain.own_sig2)')
+    p.add_argument('--zmin-cut', action='store_true',
+                   help='pe_redshift reads only the nodes the redshifts z >= --zmin need (the same results there)')
+    p.add_argument('--asym-tol', type=float, default=ASYM_TOL,
+                   help='unequal curves or several stores: a template whose asymmetry lies outside the stores\' range by '
+                        'at most this is read from the end store (default %g; recorded)' % ASYM_TOL)
+    p.add_argument('--mmap', action='store_true',
+                   help='map the tables from disk (the store folders must be unbiased caches, '
+                        'store.write_unbiased_cache): the jobs of a machine share them')
     p.add_argument('--out', required=True, help='directory of the result files')
     return p
 
@@ -675,8 +788,18 @@ def main(argv=None, factory=None):
     windows = a.stage == 'windows'
     if a.chunk is None:
         a.chunk = WINDOW_CHUNK if windows else CHUNK
-    if windows and (a.glitch_model or a.plain or a.published_tables or a.shared_times or a.ymin is not None):
-        p.error('--glitch-model, --plain, --published-tables, --shared-times and --ymin are of the merger stage')
+    if windows and (a.glitch_model or a.plain or a.published_tables or a.shared_times or a.ymin is not None
+                    or a.zmin_cut or a.mmap):
+        p.error('--glitch-model, --plain, --published-tables, --shared-times, --ymin, --zmin-cut and --mmap are of the '
+                'merger stage')
+    if a.asym is not None and a.curves is not None:
+        p.error('--asym or --curves, not both')
+    if not a.asym_tol >= 0:
+        p.error('need asym-tol >= 0')
+    if a.asym is not None and not -1.0 < a.asym < 1.0:
+        p.error('need -1 < asym < 1')
+    if a.mmap and a.published_tables:
+        p.error('--mmap maps unbiased caches: not with --published-tables')
     if windows and not (0 <= a.window_rho_min < a.window_rho_max):
         p.error('need 0 <= window-rho-min < window-rho-max')
     try:
@@ -693,15 +816,13 @@ def main(argv=None, factory=None):
     if factory is None and windows:
         factory = make_windows(a.device, a.n_window, a.chunk)
     elif factory is None:
-        if not glob.glob(os.path.join(a.store, 'bd_*.npz')):
-            p.error('no bd_*.npz in %s' % a.store)
+        for d in a.store.split(','):
+            if not glob.glob(os.path.join(d, 'bd_*.npz')) and not is_cache(d):
+                p.error('no bd_*.npz (or unbiased cache) in %s' % d)
 
         def factory(seg):
-            from exmarg.search import load_redshift_store
-            t = time.time()
-            store = load_redshift_store(a.store, pinned=(a.device == 'gpu'), unbiased=not a.published_tables)
-            print('%s  store loaded, %d nodes (%.0f s)' % (stamp(), store.s.size, time.time() - t), flush=True)
-            return make_analysis(store, a.device, a.resident, a.chunk, cfg['ymin'], a.shared_times)(seg)
+            return make_analysis(load_stores(a), a.device, a.resident, a.chunk, cfg['ymin'], a.shared_times,
+                                 cfg['zmin'] if a.zmin_cut else None, asym_tol(a))(seg)
     print('%s  campaign %s; segments %d to %d in batches of %d into %s'
           % (stamp(), json.dumps(cfg), a.start, a.start + a.n - 1, a.batch, a.out), flush=True)
     run(cfg, a.out, a.start, a.n, a.batch, factory, a.plain,

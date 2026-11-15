@@ -35,14 +35,17 @@ def draw_y(rng, prior, ymin):
     return float(np.exp(np.interp(rng.uniform() * cdf[-1], cdf, lny)))
 
 
-def simulate(n_events, seed, draw, draw_distance, T, fmin, fmax):
+def simulate(n_events, seed, draw, draw_distance, T, fmin, fmax, sig2=None):
     """n_events segments, each with one injection, in Gaussian noise with the H noise curve in both detectors.
     draw(rng) gives the intrinsic parameters (M_det, q, chi) of an injection and draw_distance(rng) its
     y = D0 / D_L.  returns the segments (the dict read_segments takes), the injected (M_det, q, chi, y) and the
-    optimal network SNR of each injection."""
+    optimal network SNR of each injection.  sig2 = {'H': (n_freq,), 'L': (n_freq,)}: the noise of each detector on its
+    own curve instead (the same random numbers and signals; the segments then hold sig2_H, sig2_L)."""
     nu = np.arange(int(np.ceil(fmin * T)), int(np.floor(fmax * T)) + 1)
     f = nu / T
+    own = sig2
     sig2 = T * S('H', f) / 2.0
+    var = {I: sig2 if own is None else np.asarray(own[I], float) for I in 'HL'}
     d = {'H': np.empty((n_events, nu.size), complex), 'L': np.empty((n_events, nu.size), complex)}
     truth = np.empty((n_events, 4))
     snr = np.empty(n_events)
@@ -64,11 +67,12 @@ def simulate(n_events, seed, draw, draw_distance, T, fmin, fmax):
             tau = n_hat @ (x[I] - x['L']) / c
             signal = y * R * np.exp(-1j * phase) * h * np.exp(-2j * np.pi * f * (t_arrival + tau))
             g = rng.standard_normal((2, nu.size))
-            d[I][k] = np.sqrt(sig2 / 2.0) * (g[0] + 1j * g[1]) + signal
-            rho2 += 2.0 * np.sum(np.abs(signal) ** 2 / sig2)
+            d[I][k] = np.sqrt(var[I] / 2.0) * (g[0] + 1j * g[1]) + signal
+            rho2 += 2.0 * np.sum(np.abs(signal) ** 2 / var[I])
         truth[k] = M, q, chi, y
         snr[k] = np.sqrt(rho2)
-    segments = dict(d_H=d['H'], d_L=d['L'], f=f, nu=nu, sig2=sig2, T=T, fmin=fmin, fmax=fmax)
+    curves = dict(sig2=sig2) if own is None else dict(sig2_H=var['H'], sig2_L=var['L'])
+    segments = dict(d_H=d['H'], d_L=d['L'], f=f, nu=nu, **curves, T=T, fmin=fmin, fmax=fmax)
     return segments, truth, snr
 
 

@@ -1041,3 +1041,92 @@ def test_plant_fit_window_model(windows_dirs, capsys):
     assert crit['window model: nbar consistent with 0'] == (True, True) and crit[
         'window model: evidence below ln 100'] == (True, True), r['lines'][-6:]
     assert plant_fit.main([windows_dirs['null'][0]]) == 0
+
+
+# ----------------------------------------------------------------------------------------------- unequal noise curves
+
+
+def test_unequal_noise_plant(tmp_path):
+    """--asym W: the noise of detector I is that of the campaign without it times sqrt(sig2_I / sig2) (the same random
+    numbers), sig2_H = sig2 / (1 + W), sig2_L = sig2 / (1 - W), the mergers the same signals with their optimal SNR on
+    those curves, the template glitches scaled to their recorded SNR on the curve of their detector, and every template
+    of the bank at w = W.  --curves: the curves of a conditioned epoch file (strain.own_sig2), refused once the file
+    changes"""
+    from exmarg.search import mass_bank
+    from test_analyse import make_unequal_epoch
+    s = plant.Sampler(plant.population())
+    W = -0.3
+    base = ('--nbar', '1', '--seed', '3')
+    seg0, tr0 = plant.simulate_batch(config(*base), 0, 4, s)
+    seg1, tr1 = plant.simulate_batch(config(*base, '--asym', str(W)), 0, 4, s)
+    k = {'H': 1.0 / (1.0 + W), 'L': 1.0 / (1.0 - W)}
+    assert 'sig2' not in seg1 and np.allclose(seg1['sig2_H'], seg0['sig2'] * k['H'], rtol=1e-15, atol=0)
+    snr = 0.0
+    for I in 'HL':                                    # d1 = h + sqrt(k) n, d0 = h + n
+        h = (seg1['d_' + I] - np.sqrt(k[I]) * seg0['d_' + I]) / (1.0 - np.sqrt(k[I]))
+        snr = snr + np.sum(2.0 * np.abs(h) ** 2 / seg1['sig2_' + I], axis=1)
+    assert tr0['merger'].all() and np.allclose(np.sqrt(snr), tr1['snr'], rtol=1e-8)
+    assert np.array_equal(tr0['m1'], tr1['m1']) and not np.allclose(tr0['snr'], tr1['snr'])
+    bank = mass_bank(plant.MASSES[::30], seg1)
+    assert np.abs(bank.asym - W).max() < 1e-12
+    g0, _ = plant.simulate_batch(config('--nbar', '0', '--asym', str(W), '--seed', '3'), 0, 6, s)
+    g1, tg = plant.simulate_batch(config('--nbar', '0', '--asym', str(W), '--seed', '3', '--eps-H', '1', '--eps-L', '1',
+                                         '--rho-min', '8'), 0, 6, s)
+    for I in 'HL':
+        rho = np.sqrt(np.sum(2.0 * np.abs(g1['d_' + I] - g0['d_' + I]) ** 2 / g1['sig2_' + I], axis=1))
+        assert tg['glitch_' + I].all() and np.allclose(rho, tg['rho_' + I], rtol=1e-10)
+    ep, _ = make_unequal_epoch(1266933768, 5)
+    path = str(tmp_path / 'epoch.npz')
+    np.savez(path, **ep)
+    cfg = config('--nbar', '0', '--curves', path)
+    assert cfg['noise']['curves'] == path and len(cfg['noise']['sha256']) == 64
+    seg2, _ = plant.simulate_batch(cfg, 0, 2, s)
+    from exmarg import strain
+    want = strain.own_sig2(ep)
+    assert all(np.array_equal(seg2['sig2_' + I], want[I]) for I in 'HL')
+    np.savez(path, **dict(ep, sig2_ref_L=ep['sig2_ref_L'] * 1.01))
+    plant._CURVES.clear()
+    with pytest.raises(SystemExit, match='changed since the campaign'):
+        plant.simulate_batch(cfg, 0, 2, s)
+
+
+class UStub(Stub):
+    """the Stub for segments on two curves (sig2_H, sig2_L): its arrays with the curve of each detector"""
+
+    def pe(self, seg, seed, glitch):
+        res = {I: Stub.pe(self, dict(seg, sig2=seg['sig2_' + I]), seed, glitch) for I in 'HL'}
+        del self.calls[-1]
+        out = dict(res['H'], asym_outside=1)
+        if glitch:
+            out.update(ln_glitch_L=res['L']['ln_glitch_L'], wmax_L=res['L']['wmax_L'])
+        return out
+
+
+def test_unequal_driver(tmp_path, capsys, monkeypatch):
+    """plant.main --asym with two store folders, --zmin-cut and --asym-tol 0.03: the files record noise, tables_asym,
+    zmin_cut, asym_tol and per segment asym_outside, and plant_fit reads and fits them; another --asym into the folder
+    stops; make_analysis passes the list of stores, zmin and asym_tol to pe_redshift; a default campaign records none of
+    them"""
+    from test_store import write_store
+    stores = '%s,%s' % (write_store(str(tmp_path / 's3'), asym=-0.3), write_store(str(tmp_path / 's6'), asym=-0.6))
+    out = tmp_path / 'u'
+    stub = UStub()
+    assert plant.main([stores, 'cpu', '--nbar', '0.3', '--eps-H', '0.3', '--n', '6', '--batch', '3', '--seed', '5',
+                       '--asym', '-0.45', '--zmin-cut', '--asym-tol', '0.03', '--out', str(out)], factory=stub.factory) == 0
+    assert len(stub.calls) == 2
+    cfg, _, a, _, _ = plant_fit.load(str(out))
+    assert cfg['noise'] == dict(asym=-0.45) and cfg['tables_asym'] == [-0.6, -0.3] and cfg['zmin_cut'] is True
+    assert cfg['asym_tol'] == 0.03 and a['k'].size == 6 and np.array_equal(a['asym_outside'], np.ones(6))
+    assert not {'noise', 'tables_asym', 'asym_tol', 'zmin_cut'} & set(config('--nbar', '0'))
+    capsys.readouterr()
+    plant_fit.main([str(out)])
+    assert 'nbar' in capsys.readouterr().out
+    with pytest.raises(SystemExit, match='another campaign.*noise'):
+        plant.main([stores, 'cpu', '--nbar', '0.3', '--eps-H', '0.3', '--n', '6', '--batch', '3', '--seed', '5',
+                    '--asym', '-0.4', '--zmin-cut', '--asym-tol', '0.03', '--out', str(out)], factory=UStub().factory)
+    import exmarg.search as search
+    seen = []
+    monkeypatch.setattr(search, 'pe_redshift', lambda seg, bank, store, **kw: seen.append((store, kw)))
+    seg, _ = plant.simulate_batch(config('--nbar', '0', '--asym', '-0.45'), 0, 2, plant.Sampler(plant.population()))
+    plant.make_analysis(['a', 'b'], 'cpu', zmin=1.0, asym_tol=0.05)(seg)(seg, 17, True)
+    assert seen[0][0] == ['a', 'b'] and seen[0][1]['zmin'] == 1.0 and seen[0][1]['asym_tol'] == 0.05
