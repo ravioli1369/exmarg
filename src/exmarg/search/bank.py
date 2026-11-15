@@ -25,11 +25,13 @@ def array_module(device):
 
 
 class MassBank:
-    """templates for one frequency grid and noise curve.
+    """templates for one frequency grid and the noise curves of the two detectors.
 
     M, q, chi  (n_template,) detector-frame total mass, mass ratio
                m2/m1 <= 1 and common aligned spin
-    u          (n_template,) template power sum a^2 / sig2_H at D0
+    u_H, u_L   (n_template,) template power u_I = sum a^2 / sig2_I at D0 (E_0|z_I|^2)
+    u          (n_template,) their mean ubar = (u_H + u_L) / 2 (u_H with equal curves, to the last bit)
+    asym       (n_template,) w = (u_H - u_L) / (u_H + u_L), so u_H = u (1 + w), u_L = u (1 - w)
     W          (n_template, n_freq) complex64 a e^{i psi0}, on the device"""
 
     def __init__(self, M, q, chi, seg, device="cpu"):
@@ -42,7 +44,7 @@ class MassBank:
         self.lo, self.hi = int(self.nu[0]), int(self.nu[-1]) + 1
         self.n_time = 8 * int(self.nu.max())
         W = np.empty((M.size, self.nu.size), np.complex64)
-        self.u = np.empty(M.size)
+        self.u_H, self.u_L = np.empty(M.size), np.empty(M.size)
         for i in range(M.size):
             m1 = M[i] / (1.0 + q[i]); m2 = M[i] * q[i] / (1.0 + q[i])
             nu, _, a1, p0 = profile(m1, m2, chi[i], chi[i], self.T, self.fmin, self.fmax, 1.0)
@@ -50,7 +52,10 @@ class MassBank:
             a = np.zeros(self.nu.size); a[j] = a1 / D0
             psi0 = np.zeros(self.nu.size); psi0[j] = p0
             W[i] = a * np.exp(1j * psi0)
-            self.u[i] = float((a ** 2 / seg["sig2_H"]).sum())
+            self.u_H[i] = float((a ** 2 / seg["sig2_H"]).sum())
+            self.u_L[i] = float((a ** 2 / seg["sig2_L"]).sum())
+        self.u = (self.u_H + self.u_L) / 2.0
+        self.asym = (self.u_H - self.u_L) / (self.u_H + self.u_L)
         self.W = self.xp.asarray(W)
 
     def trajectories(self, d, sig2, chunk=1024):
@@ -84,7 +89,7 @@ def mass_bank(bank, segments, device="cpu"):
     bank      .npy path or array: (n,) detector-frame total masses (equal
               mass, zero spin) or (n, 3) rows (M_det, q, chi)
     segments  anything read_segments takes; its frequency grid, T, band
-              and sig2_H define the templates
+              and sig2_H, sig2_L define the templates
     device    'cpu' or 'gpu'"""
     B = np.load(bank) if isinstance(bank, (str, bytes)) or hasattr(bank, "__fspath__") else np.asarray(bank)
     B = np.asarray(B, float)

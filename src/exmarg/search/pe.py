@@ -29,6 +29,26 @@ weights kbar of each window (single.window_posterior), kbar of a window
 given to each of its arrival times; the rest is the same computation, and
 the lambda_HL expression with these weights is the segment's B.
 window_evidences gives the window evidences alone (stage 1 of Sec. 4a).
+
+Unequal noise curves (docs/2026-11-15_unequal_noise_design.md, Secs. 2, 3).  A template has u_H, u_L,
+ubar = (u_H + u_L) / 2 and w = (u_H - u_L) / (u_H + u_L) (bank.MassBank); a store has an asymmetry w_j and its
+node s is sbar (s_H = sbar (1 + w_j), s_L = sbar (1 - w_j)).  Store j is read at a = sbar / ubar with the data of
+the template scaled to the store's model, ln|z_I''| = ln|z_I| + c_I, c_H = ln((1 + w_j) / (1 + w)) / 2,
+c_L = ln((1 - w_j) / (1 - w)) / 2, so that E_0|z_I''|^2 = ubar (1 +- w_j); its single-detector merger columns are
+those at s_H and s_L, read with the data w_I = |z_I|^2 / u_I.  Each X_j is then the likelihood ratio of a model
+with the same total power, E_0 X_j = 1.  store may be one store, which every template's w must match within
+ASYM_TOL, or a sequence of stores with distinct asym and the same nodes, grids and lags, whose range must hold
+every w: the result of a template is (1 - f) X_j + f X_{j+1} of the two stores that bracket its w,
+f = (w - w_j) / (w_{j+1} - w_j), taken on the node values (the same nodes sbar and y = sqrt(sbar / ubar) in every
+store) of every quantity linear in the merger likelihood: Lambda, Lambda_S^I and the lambda terms (B).  What
+depends on the data alone (glitch and window evidences, the posteriors and weights kbar, ln c, wmax, the arrival
+times visited) is computed once per segment from the unscaled data with the true u_I.  Per store only the
+(node, template) pairs of non-zero weight are read, and a store of zero weight for every template not at all.  With
+asym_tol > 0 a template whose w lies outside the stores' range by at most asym_tol is read from the end store alone
+(its data scaled to that store's model, so still a likelihood ratio), and the result counts them (asym_outside).
+
+pe_redshift(zmin=...) reads only the nodes that the redshifts z >= zmin need: a template skips the nodes with y
+above D0 / D_L(zmin) but the first one (the interpolation in y needs it), and ln Lambda below zmin is -inf.
 """
 
 import numpy as np
@@ -43,6 +63,7 @@ GLITCH = dict(pi_k=None, pi_m=None, window=0.1)    # the glitch settings and the
 WINDOWS = dict(model="windows", n_window=64, zone=1, pi_m=None, H=None, L=None)   # those of model='windows'
 STATE = ("f", "q", "pi_k")                          # the settings of one detector in model='windows'
 SUM_TOL = 1e-6                                      # how far from 1 the sum of a law may be
+ASYM_TOL = 1e-9                                     # how far a template's w may be from the asym of the one store
 
 
 def _dl_of_z(z):
@@ -56,17 +77,134 @@ def _chunks(seg, chunk):
         yield range(c0, min(c0 + chunk, n))
 
 
+def _store_list(store):
+    """store, or a sequence of stores, as a list sorted by asym; several must have distinct asym and the same nodes,
+    amplitude limits and grids (to 1e-12: the published store's own Delta grids differ between nodes by 4e-16), lags,
+    truncation order and table shape (ValueError otherwise).  Each store is read on its own grids; the geometry is that
+    of the first"""
+    stores = list(store) if isinstance(store, (list, tuple)) else [store]
+    if not stores:
+        raise ValueError("no store given")
+    stores.sort(key=lambda st: float(getattr(st, "asym", 0.0)))
+    asym = [float(getattr(st, "asym", 0.0)) for st in stores]
+    if len(set(asym)) < len(asym):
+        raise ValueError("the stores must have distinct asym, not %s" % asym)
+    a = stores[0]
+    close = lambda x, y: np.shape(x) == np.shape(y) and np.allclose(x, y, rtol=1e-12, atol=1e-12)
+    for st in stores[1:]:
+        same = dict(s=close(st.s, a.s), alpha=close(st.alpha_lo, a.alpha_lo) and close(st.alpha_hi, a.alpha_hi),
+                    lags=np.array_equal(st.tau_idx, a.tau_idx),
+                    beta=len(st.beta) == len(a.beta) and all(close(x, y) for x, y in zip(st.beta, a.beta)),
+                    delta=len(st.delta) == len(a.delta) and all(close(x, y) for x, y in zip(st.delta, a.delta)),
+                    n_max=st.n_max == a.n_max, shape=np.shape(st.tables[0]) == np.shape(a.tables[0]))
+        bad = [k for k, v in same.items() if not v]
+        if bad:
+            raise ValueError("the stores of asym %g and %g differ in %s: a mixture needs the same nodes, grids and lags"
+                             % (a.asym, st.asym, ", ".join(bad)))
+    return stores
+
+
+def _store_weights(stores, bank, asym_tol=0.0):
+    """(n_store, n_template) the weight of each store (sorted by asym) in the result of each template: one store, 1 if
+    every template's w is its asym within ASYM_TOL + asym_tol; several, 1 - f and f on the two that bracket w,
+    f = (w - w_j) / (w_{j+1} - w_j), 1 on w_j alone for a w within ASYM_TOL of it (a weight of 1e-9 is not worth
+    reading a store for), and 1 on the end store for a w outside the range by at most ASYM_TOL + asym_tol (its data
+    scaled to that store's model like any other: a likelihood ratio, with the model error of the nearest table).
+    ValueError for a w farther outside (no extrapolation)"""
+    grid = np.array([float(getattr(st, "asym", 0.0)) for st in stores])
+    w = np.asarray(bank.asym, float)
+    tol = ASYM_TOL + float(asym_tol)
+    if np.any(w < grid[0] - tol) or np.any(w > grid[-1] + tol):
+        ratio = lambda x: (1.0 + x) / (1.0 - x)
+        cover = ("u_H/u_L = %.4g only (w = %g)" % (ratio(grid[0]), grid[0]) if grid.size == 1 else
+                 "u_H/u_L from %.4g to %.4g (w from %g to %g, %d stores)" % (ratio(grid[0]), ratio(grid[-1]), grid[0],
+                                                                             grid[-1], grid.size))
+        raise ValueError("the templates have u_H/u_L from %.4g to %.4g (w = (u_H - u_L)/(u_H + u_L) from %.4g to %.4g); "
+                         "the tables cover %s, asym_tol %g: give stores whose asym covers every template" % (
+                             ratio(w.min()), ratio(w.max()), w.min(), w.max(), cover, asym_tol))
+    if grid.size == 1:
+        return np.ones((1, w.size))
+    near = np.abs(w[:, None] - grid[None, :]) <= ASYM_TOL
+    wc = np.clip(np.where(near.any(axis=1), grid[np.argmax(near, axis=1)], w), grid[0], grid[-1])
+    j = np.clip(np.searchsorted(grid, wc, side="right") - 1, 0, grid.size - 2)
+    f = (wc - grid[j]) / (grid[j + 1] - grid[j])
+    W = np.zeros((grid.size, w.size))
+    m = np.arange(w.size)
+    W[j, m] = 1.0 - f
+    W[j + 1, m] += f
+    return W
+
+
+def _outside(stores, bank):
+    """the number of templates whose w lies outside the range of the stores by more than ASYM_TOL (read from an end
+    store, within asym_tol)"""
+    grid = np.array([float(getattr(st, "asym", 0.0)) for st in stores])
+    w = np.asarray(bank.asym, float)
+    return int(np.sum((w < grid[0] - ASYM_TOL) | (w > grid[-1] + ASYM_TOL)))
+
+
+def _plan(bank, store, geometry, trim=False, asym_tol=0.0):
+    """the stores a call reads (those of non-zero weight for some template), each a dict: store; use (n_template,) the
+    templates it is read for; lnw (n_template,) ln of its weight; need (n_node,) the nodes read: all of them, or with
+    trim only those of a valid pair or boundary point of a template in use; cH, cL (n_template,) the scales of the
+    data to its model (_scaled), None where all zero"""
+    stores = _store_list(store)
+    W = _store_weights(stores, bank, asym_tol)
+    valid, bnode = geometry[0], geometry[3]
+    out = []
+    for st, w in zip(stores, W):
+        use = w > 0
+        if not use.any():
+            continue
+        need = np.ones(st.s.size, bool)
+        if trim:
+            need = valid[:, use].any(axis=1)
+            need[bnode[use & (bnode >= 0)]] = True
+        a = float(getattr(st, "asym", 0.0))
+        cH = 0.5 * (np.log1p(a) - np.log1p(bank.asym))
+        cL = 0.5 * (np.log1p(-a) - np.log1p(-bank.asym))
+        with np.errstate(divide="ignore"):
+            lnw = np.log(w)
+        out.append(dict(store=st, asym=a, use=use, lnw=lnw, need=need, cH=cH if cH.any() else None,
+                        cL=cL if cL.any() else None))
+    return out
+
+
+def _scaled(traj, e, xp):
+    """the trajectories of a segment with the data of every template scaled to the model of the store of e (Sec. 3):
+    ln|z_I''| = ln|z_I| + c_I, so that E_0|z_I''|^2 = ubar (1 +- w_j); the phases are kept"""
+    if e["cH"] is None and e["cL"] is None:
+        return traj
+    out = dict(traj)
+    for I in "HL":
+        if e["c" + I] is not None:
+            out["lq" + I] = (traj["lq" + I] + xp.asarray(e["c" + I])[:, None]).astype(xp.float32)
+    return out
+
+
+def _mix(xs, plan):
+    """ln sum_j w_j exp x_j over the stores of the plan, the weights per template on the last axis (one store of
+    weight 1 for every template: x itself)"""
+    if len(xs) == 1 and np.all(plan[0]["lnw"] == 0.0):
+        return xs[0]
+    out = np.full(xs[0].shape, -np.inf)
+    for x, e in zip(xs, plan):
+        out = np.logaddexp(out, x + e["lnw"])
+    return out
+
+
 def _fit_chunk(bank, store, chunk, nodes_per_launch, resident):
     """GPU: the number of segments filtered at once, at most chunk, so that their trajectories
     (16 n_template n_time bytes each) fit next to the tables on the device"""
     if bank.device == "cpu":
         return chunk
     import cupy as cp
+    stores = _store_list(store)
     free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
-    sizes = [t.nbytes for t in store.tables]
-    if resident and getattr(store, "device", None) is None:
-        free -= sum(sizes)
-    elif not resident:
+    sizes = [t.nbytes for t in stores[0].tables]
+    if resident:
+        free -= sum(sum(t.nbytes for t in st.tables) for st in stores if getattr(st, "device", None) is None)
+    else:
         free -= nodes_per_launch * max(sizes)
     per_segment = 16 * bank.u.size * bank.n_time
     return max(1, min(chunk, int(0.6 * free / per_segment)))
@@ -77,13 +215,15 @@ def _filter(bank, seg, e):
                              {I: seg["sig2_" + I] for I in "HL"})
 
 
-def _node_geometry(bank, st, ymin):
+def _node_geometry(bank, st, ymin, ymax=None):
     """which (node, template) pairs the redshift store covers, and their ln a and y.
 
-    a = s/u is valid for y = sqrt(a) >= ymin and alpha_lo' < a < alpha_hi,
+    a = s/u (u = ubar) is valid for y = sqrt(a) >= ymin and alpha_lo' < a < alpha_hi,
     alpha_lo' = min(alpha_lo, ymin^2).  a template whose a crosses
     alpha_lo' between two nodes also gets a boundary point at
-    a = alpha_lo' (1 + 1e-9), read from the upper node's table."""
+    a = alpha_lo' (1 + 1e-9), read from the upper node's table.  With ymax a
+    template keeps, of its nodes with y > ymax, only the first."""
+    st = _store_list(st)[0]
     nn, nm = st.s.size, bank.u.size
     valid = np.zeros((nn, nm), bool)
     lna = np.zeros((nn, nm))
@@ -103,6 +243,12 @@ def _node_geometry(bank, st, ymin):
         bnode[low] = k
         blna[low] = np.log(a_b)
         y[nn][low] = np.sqrt(a_b)
+    if ymax is not None:
+        above = valid & (y[:nn] > ymax)
+        drop = above & (np.cumsum(above, axis=0) > 1)
+        valid &= ~drop
+        lna[drop] = 0.0
+        y[:nn][drop] = 0.0
     return valid, lna, y, bnode, blna
 
 
@@ -166,14 +312,18 @@ def _log_mean(lam, w, cp=np):
 
 
 def _tables(store, ks, beta, delta, bank, resident):
-    """the tables ks for a gather: host list (CPU) or device stack (GPU), and the offset of ks[0]"""
-    if bank.device == "cpu":
-        return dict(T=[store.tables[k] for k in ks], tau=store.tau_idx, beta=beta, delta=delta), ks[0]
-    if resident:
+    """the tables ks for a gather: host list (CPU) or device stack (GPU), and the slot of every node in it
+    (n_node,), -1 for a node not in it"""
+    slot = np.full(store.s.size, -1)
+    if bank.device == "gpu" and resident:
         if getattr(store, "device", None) is None:
             store.device = _store.upload(store.tables, store.tau_idx, beta, delta)
-        return dict(store.device, beta=beta, delta=delta), 0
-    return _store.upload([store.tables[k] for k in ks], store.tau_idx, beta, delta), ks[0]
+        slot[:] = np.arange(store.s.size)
+        return dict(store.device, beta=beta, delta=delta), slot
+    slot[ks] = np.arange(len(ks))
+    if bank.device == "cpu":
+        return dict(T=[store.tables[k] for k in ks], tau=store.tau_idx, beta=beta, delta=delta), slot
+    return _store.upload([store.tables[k] for k in ks], store.tau_idx, beta, delta), slot
 
 
 def _read(bank, traj, tab, ids, lna, tab_ids, block, times, time_weights=None):
@@ -187,16 +337,29 @@ def _release(bank):
         _store.free()
 
 
-def _single_setup(bank, seg, store, geometry):
-    """what single=True needs once per call: the columns of single.py (amplitude bins, then the store nodes s) and
-    the signal power s = a u of the boundary point of every template"""
-    if not np.array_equal(seg["sig2_H"], seg["sig2_L"]):
-        raise ValueError("single=True needs sig2_H == sig2_L, as the tables (u_H = u_L, "
-                         "docs/glitch_likelihood.md Sec. 6)")
+def _single_setup(bank, seg, store, geometry, trim=False, asym_tol=0.0):
+    """what single=True needs once per call: per detector I the columns of single.py (the amplitude bins, then for
+    every store read the merger columns at s_H = s (1 + w_j), s_L = s (1 - w_j) of the nodes it reads) and ln u_I; the
+    plan of the stores (_plan), each with the first column of its nodes and the signal powers s_I = a ubar (1 +- w_j)
+    of the boundary point of every template.  (seg is not read: the stores' coverage of u_H / u_L is checked by
+    _store_weights)"""
     bnode, blna = geometry[3], geometry[4]
-    lnT = np.concatenate([_single.glitch_columns(), _single.merger_columns(store.s)], axis=1)
-    return dict(lnT=array_module(bank.device).asarray(lnT), ln_u=np.log(bank.u),
-                s_b=np.where(bnode >= 0, np.exp(blna) * bank.u, 0.0), n_rho=_single.RHO_EDGES.size - 1)
+    plan = _plan(bank, store, geometry, trim, asym_tol)
+    xp = array_module(bank.device)
+    G = _single.glitch_columns()
+    lnT, col = {"H": [G], "L": [G]}, G.shape[1]
+    for e in plan:
+        nodes = np.nonzero(e["need"])[0]
+        e.update(nodes=nodes, col=col)
+        col += nodes.size
+        for I, sg in (("H", 1.0), ("L", -1.0)):
+            lnT[I].append(_single.merger_columns(e["store"].s[nodes] * (1.0 + sg * e["asym"])))
+            e["s_b_" + I] = np.where(bnode >= 0, np.exp(blna) * bank.u * (1.0 + sg * e["asym"]), 0.0)
+    out = dict(plan=plan, n_rho=_single.RHO_EDGES.size - 1)
+    for I in "HL":
+        out["lnT_" + I] = xp.asarray(np.concatenate(lnT[I], axis=1))
+        out["ln_u_" + I] = np.log(getattr(bank, "u_" + I))
+    return out
 
 
 def _weights_array(x, shape, name):
@@ -293,7 +456,7 @@ def _glitch_setup(glitch, bank, seg, store):
     if glitch is not True and not isinstance(glitch, dict):
         raise ValueError("glitch must be None, False, True or a dict of settings, not %r" % (glitch,))
     dt = seg["T"] / bank.n_time
-    lags = np.asarray(store.tau_idx, int).ravel()
+    lags = np.asarray(_store_list(store)[0].tau_idx, int).ravel()
     lags = lags[np.abs(lags) * dt <= np.linalg.norm(_det.x["H"] - _det.x["L"]) / _det.c]
     if glitch is not True and "model" in glitch:
         if glitch["model"] is None:                         # the default model, named
@@ -318,7 +481,7 @@ def _glitch_setup(glitch, bank, seg, store):
 
 def _kbar(traj, I, gd, sd, xp):
     """ln kbar_I and ln(1 - kbar_I) (n_time,) of one segment with the fiducial glitch law of gd, on the device"""
-    lg = _single.glitch_time_series(traj["lq" + I], sd["ln_u"], gd["pi_k"], gd["pi_m"], xp)
+    lg = _single.glitch_time_series(traj["lq" + I], sd["ln_u_" + I], gd["pi_k"], gd["pi_m"], xp)
     return _single.glitch_time_weights(lg, gd["half_window"], xp)
 
 
@@ -362,7 +525,7 @@ def _window_weights(traj, gd, sd, xp):
     n_win = traj["lqH"].shape[1] // nw
     lk, ln, win = {}, {}, {}
     for I in "HL":
-        lnE = _window_evidence(traj["lq" + I], sd["ln_u"], gd["lnG"], nw, gd["pi_m"], xp)
+        lnE = _window_evidence(traj["lq" + I], sd["ln_u_" + I], gd["lnG"], nw, gd["pi_m"], xp)
         p = gd[I]
         post = _single.window_posterior(lnE, p["f"], p["q"], p["pi_k"], gd["zone"], xp)
         lk[I], ln[I] = xp.repeat(post["ln_kbar"], n_win), xp.repeat(post["ln_near"], n_win)
@@ -373,18 +536,33 @@ def _window_weights(traj, gd, sd, xp):
 
 
 def _single_values(traj, sd, xp, gw=None):
-    """per detector: ln E (n_w, n_template, n_rho + n_node), ln Lambda_S^I at the boundary point (n_w, n_template)
-    and wmax, for no weights (n_w = 1) or, with the glitch weights gw, the log weight rows 0, ln o, ln o + ln kbar
-    (n_w = 3; the first is the plain sum)"""
+    """per detector: ln E (n_w, n_template, n_rho + n_col) of the columns of _single_setup (one store, every node: n_col
+    = n_node), per store read ln Lambda_S^I at the boundary point (n_w, n_template), and wmax, w = |z_I|^2 / u_I; for
+    no weights (n_w = 1) or, with the glitch weights gw, the log weight rows 0, ln o, ln o + ln kbar (n_w = 3; the
+    first is the plain sum)"""
     out = {}
     for I in "HL":
-        lq = traj["lq" + I]
+        lq, ln_u = traj["lq" + I], sd["ln_u_" + I]
         W = None if gw is None else xp.concatenate([xp.zeros((1, lq.shape[1])), gw[I]])
-        lnE = _single._host(_single.ln_evidence(lq, sd["ln_u"], sd["lnT"], W, xp, log_weights=True))
-        b = _single._host(_single.ln_merger_at(lq, sd["ln_u"], sd["s_b"], W, xp, log_weights=True))
-        out[I] = (lnE.reshape(-1, *lnE.shape[-2:]), b.reshape(-1, b.shape[-1]),
-                  _single._host(_single._wmax(lq, sd["ln_u"], xp)))
+        lnE = _single._host(_single.ln_evidence(lq, ln_u, sd["lnT_" + I], W, xp, log_weights=True))
+        b = [_single._host(_single.ln_merger_at(lq, ln_u, e["s_b_" + I], W, xp, log_weights=True)) for e in sd["plan"]]
+        out[I] = (lnE.reshape(-1, *lnE.shape[-2:]), [x.reshape(-1, x.shape[-1]) for x in b],
+                  _single._host(_single._wmax(lq, ln_u, xp)))
     return out
+
+
+def _store_single(one, i, e, n_node, n_rho):
+    """the single-detector values of the store i of the plan (e) in the layout _single_nodes reads: per segment and
+    detector ln E with the amplitude bins, then one column per node of the store (-inf at the nodes it does not read),
+    its boundary values, and wmax"""
+    def layout(lnE):
+        if e["col"] == n_rho and e["nodes"].size == n_node == lnE.shape[-1] - n_rho:
+            return lnE
+        out = np.full(lnE.shape[:-1] + (n_rho + n_node,), -np.inf)
+        out[..., :n_rho] = lnE[..., :n_rho]
+        out[..., n_rho + e["nodes"]] = lnE[..., e["col"]:e["col"] + e["nodes"].size]
+        return out
+    return [{I: (layout(o[I][0]), o[I][1][i], o[I][2]) for I in "HL"} for o in one]
 
 
 def _on_nodes(lnE, b, geometry):
@@ -424,34 +602,31 @@ def _single_nodes(one, lamN, geometry, n_rho, far=None, lc0=None, win=None):
     return out
 
 
-def _node_values(bank, seg, ev, store, geometry, groups, block, resident, n_loud, n_random, seed, single=None,
-                 glitch=None, shared_times=False):
-    """ln Lambda of every template at every node of the redshift store, for the segments ev:
-    (len(ev), n_node + 1, n_template), row n_node the boundary point at the smallest amplitude.
-    with single (_single_setup) also the dict of _single_nodes, with glitch (_glitch_setup) its glitch terms"""
+def _store_values(bank, traj, e, geometry, groups, block, resident, times, tw, xp, glitch):
+    """the gather of the store of e (_plan) for the segments of traj, at the valid (node, template) pairs and boundary
+    points of the templates it is read for, from the nodes it needs, with the data scaled to its model (_scaled):
+    lamN (n_seg, n_node + 1, n_template) and, with the glitch weights, far (n_seg, 3, n_node + 1, n_template); -inf
+    elsewhere"""
     valid, lna, _, bnode, blna = geometry
-    nn = store.s.size
-    traj = [_filter(bank, seg, e) for e in ev]
-    xp = array_module(bank.device)
-    gw = [None] * len(ev) if glitch is None else [_glitch_weights(t, glitch, single, xp) for t in traj]
-    one = None if single is None else [_single_values(t, single, xp, g) for t, g in zip(traj, gw)]
-    tw = [None if g is None else g["tw"] for g in gw]
-    times = [_gather.select_times(t, store.tau_idx, n_loud, n_random, seed + int(seg["rows"][e]), xp, shared=shared_times)
-             if n_loud > 0 else None
-             for t, e in zip(traj, ev)]
-    lamN = np.full((len(ev), nn + 1, bank.M.size), -np.inf)
-    far = None if glitch is None else np.full((len(ev), 3, nn + 1, bank.M.size), -np.inf)
+    store, use, need = e["store"], e["use"], e["need"]
+    nn, n = store.s.size, len(traj)
+    lamN = np.full((n, nn + 1, bank.M.size), -np.inf)
+    far = None if glitch is None else np.full((n, 3, nn + 1, bank.M.size), -np.inf)
     for ks in groups:
+        ks = [k for k in ks if need[k]]
+        if not ks:
+            continue
         k0 = ks[0]
-        tab, base = _tables(store, ks, store.beta[k0], store.delta[k0], bank, resident)
-        ok = valid[ks]
+        tab, slot = _tables(store, ks, store.beta[k0], store.delta[k0], bank, resident)
+        ok = valid[ks] & use[None, :]
         ids = np.nonzero(ok.any(axis=0))[0]
         lnaM = np.where(ok[:, ids], lna[ks][:, ids], 0.0).T
-        tid = np.tile(np.arange(len(ks)) + (k0 - base), (ids.size, 1))
-        bids = np.nonzero((bnode >= k0) & (bnode <= ks[-1]))[0]
-        for j in range(len(ev)):
+        tid = np.tile(slot[ks], (ids.size, 1))
+        bids = np.nonzero(np.isin(bnode, ks) & use)[0]
+        for j in range(n):
+            t = _scaled(traj[j], e, xp) if ids.size or bids.size else None
             if ids.size:
-                val = _read(bank, traj[j], tab, ids, lnaM, tid, block, times[j], tw[j])
+                val = _read(bank, t, tab, ids, lnaM, tid, block, times[j], tw[j])
                 val, fv = (val, None) if tw[j] is None else (val[0], val[1:])
                 for i, k in enumerate(ks):
                     keep = ok[i][ids]
@@ -459,22 +634,51 @@ def _node_values(bank, seg, ev, store, geometry, groups, block, resident, n_loud
                     if fv is not None:
                         far[j, :, k][:, ids[keep]] = fv[:, i][:, keep]
             if bids.size:
-                val = _read(bank, traj[j], tab, bids, blna[bids][:, None], (bnode[bids] - base)[:, None], block,
-                            times[j], tw[j])
+                val = _read(bank, t, tab, bids, blna[bids][:, None], slot[bnode[bids]][:, None], block, times[j], tw[j])
                 val, fv = (val, None) if tw[j] is None else (val[0], val[1:])
                 lamN[j, nn, bids] = val[0]
                 if fv is not None:
                     far[j, :, nn][:, bids] = fv[:, 0]
+            del t
         del tab
         if not resident:
             _release(bank)
+    return lamN, far
+
+
+def _node_values(bank, seg, ev, store, geometry, groups, block, resident, n_loud, n_random, seed, single=None,
+                 glitch=None, shared_times=False, trim=False, asym_tol=0.0):
+    """ln Lambda of every template at every node of the redshift store, for the segments ev:
+    (len(ev), n_node + 1, n_template), row n_node the boundary point at the smallest amplitude.
+    with single (_single_setup) also the dict of _single_nodes, with glitch (_glitch_setup) its glitch terms.
+    With several stores each is gathered for the templates it has weight for and the node values of the
+    quantities linear in the merger likelihood are mixed (_mix); the weights of the data are computed once"""
+    plan = single["plan"] if single is not None else _plan(bank, store, geometry, trim, asym_tol)
+    st0 = plan[0]["store"]
+    nn = st0.s.size
+    traj = [_filter(bank, seg, e) for e in ev]
+    xp = array_module(bank.device)
+    gw = [None] * len(ev) if glitch is None else [_glitch_weights(t, glitch, single, xp) for t in traj]
+    one = None if single is None else [_single_values(t, single, xp, g) for t, g in zip(traj, gw)]
+    tw = [None if g is None else g["tw"] for g in gw]
+    times = [_gather.select_times(t, st0.tau_idx, n_loud, n_random, seed + int(seg["rows"][e]), xp, shared=shared_times)
+             if n_loud > 0 else None
+             for t, e in zip(traj, ev)]
+    parts = [_store_values(bank, traj, e, geometry, groups, block, resident, times, tw, xp, glitch) for e in plan]
     del traj, times, tw
     _release(bank)
+    lamN = _mix([p[0] for p in parts], plan)
     if single is None:
         return lamN
     lc0 = None if glitch is None else [g["lc0"] for g in gw]
     win = gw if glitch is not None and glitch["model"] == "windows" else None
-    return lamN, _single_nodes(one, lamN, geometry, single["n_rho"], far, lc0, win)
+    nodes = [_single_nodes(_store_single(one, i, e, nn, single["n_rho"]), p[0], geometry, single["n_rho"], p[1], lc0,
+                           win) for i, (e, p) in enumerate(zip(plan, parts))]
+    out = dict(nodes[0])
+    for k in out:
+        if k.startswith("lamN_"):
+            out[k] = _mix([d[k] for d in nodes], plan)
+    return lamN, out
 
 
 def _single_out(single, n_seg, shape, bank, gd=None):
@@ -525,13 +729,16 @@ def _segment_keys(gd):
 def pe_redshift(segments, bank, store, rows=None, chunk=8, zmax=8.0, nz=1600,
                 m1_range=(3.0, 150.0), nm1=1600, ymin=0.1267, nodes_per_launch=6, block=256,
                 mdet_range=(10.0, 500.0), resident=False, n_loud=1024, n_random=1024, seed=0, single=False,
-                glitch=None, shared_times=False):
+                glitch=None, shared_times=False, zmin=None, asym_tol=0.0):
     """ln Lambda(m1_source, z) of each segment.
 
     segments          anything read_segments takes (see there)
     bank              mass_bank of a one-column bank of detector-frame total
                       masses, ascending, built on the same segments
-    store             load_redshift_store
+    store             load_redshift_store, whose asym every template's w = (u_H - u_L)/(u_H + u_L)
+                      must equal within ASYM_TOL; or a sequence of stores of distinct asym (same
+                      nodes, grids and lags) whose range holds every w: the mixture of the two that
+                      bracket it (module docstring).  ValueError otherwise
     rows              segment indices (default all)
     chunk             segments filtered at once (16 n_template n_time bytes each; on the GPU
                       at most what fits next to the tables)
@@ -546,7 +753,7 @@ def pe_redshift(segments, bank, store, rows=None, chunk=8, zmax=8.0, nz=1600,
                       n_loud = 0 visits all of them
     seed              seed of the random draw (plus the segment index)
     shared_times      the same random arrival times for every template (gather.select_times)
-    single            also the single-detector evidences (needs sig2_H == sig2_L)
+    single            also the single-detector evidences (w = |z_I|^2 / u_I in each detector)
     glitch            None, or True or a dict of settings: also the merger likelihood ratios
                       given a glitch (implies single), with the glitch-time weights kbar of the
                       fiducial law pi_k (n_rho,) on rho_edges (default dN/drho ~ rho^-4 above
@@ -563,6 +770,12 @@ def pe_redshift(segments, bank, store, rows=None, chunk=8, zmax=8.0, nz=1600,
                       f (K,), glitch probability per window q (K,) in [0, 1) and amplitude laws
                       pi_k (K, n_rho) on rho_edges (f and the rows of pi_k sum to 1 within 1e-6
                       and are divided by their sums).  Every setting is checked (ValueError)
+    zmin              None, or the smallest redshift needed: a template reads, of its nodes with
+                      y above D0 / D_L(zmin), only the first; ln Lambda (and every grid) is then the
+                      same for z >= zmin and -inf below, and ln B averages over z >= zmin only
+    asym_tol          a template whose w lies outside the range of the stores by at most asym_tol
+                      (one store: differs from its asym by at most asym_tol) is read from the end
+                      store alone, its data scaled to that store's model; 0: none (ValueError)
 
     ln B averages Lambda over the prior uniform in M_det = 2 m1 (1+z) on
     mdet_range and proportional to D_L^2 in luminosity distance, i.e.
@@ -583,27 +796,35 @@ def pe_redshift(segments, bank, store, rows=None, chunk=8, zmax=8.0, nz=1600,
     the noise ratio c_I, state_H, state_L (n_segment, K) the posterior of the
     state, ln_window_H, ln_window_L (n_segment, n_window, n_rho) ln E_w[k]
     (as window_evidences), and glitch_model ('windows'), glitch_n_window,
-    glitch_zone."""
+    glitch_zone.  With asym_tol > 0 also asym_outside (int), the number of
+    templates read from an end store outside its range (_outside)."""
     if np.any(np.diff(bank.M) <= 0) or np.any(bank.q != 1.0) or np.any(bank.chi != 0.0):
         raise ValueError("pe_redshift needs an ascending equal-mass zero-spin bank")
+    stores = _store_list(store)
+    _store_weights(stores, bank, asym_tol)
+    store = stores[0] if len(stores) == 1 else stores
     xp = array_module(bank.device)
     seg = read_segments(segments, rows)
     z = np.linspace(0.02, zmax, int(nz))
     m1 = np.geomspace(m1_range[0], m1_range[1], int(nm1))
     yq = D0 / _dl_of_z(z)
-    geometry = _node_geometry(bank, store, ymin)
-    nn = store.s.size
+    below = None if zmin is None else z < zmin
+    geometry = _node_geometry(bank, stores[0], ymin, None if zmin is None else float(D0 / _dl_of_z(zmin)[0]))
+    trim = zmin is not None or len(stores) > 1
+    nn = stores[0].s.size
     groups = [list(range(g, min(g + nodes_per_launch, nn))) for g in range(0, nn, nodes_per_launch)]
 
     out = np.full((seg["rows"].size, m1.size, z.size), -np.inf)
     gd = None if glitch is None or glitch is False else _glitch_setup(glitch, bank, seg, store)
     single = single or gd is not None
-    sd = _single_setup(bank, seg, store, geometry) if single else None
+    sd = _single_setup(bank, seg, store, geometry, trim, asym_tol) if single else None
     extra = _single_out(single, seg["rows"].size, (m1.size, z.size), bank, gd)
+    if asym_tol:
+        extra["asym_outside"] = _outside(stores, bank)
     chunk = _fit_chunk(bank, store, chunk, nodes_per_launch, resident)
     for ev in _chunks(seg, chunk):
         lamN = _node_values(bank, seg, ev, store, geometry, groups, block, resident, n_loud, n_random, seed, sd, gd,
-                            shared_times)
+                            shared_times, trim, asym_tol)
         if single:
             lamN, one = lamN
         for j, e in enumerate(ev):
@@ -612,11 +833,17 @@ def pe_redshift(segments, bank, store, rows=None, chunk=8, zmax=8.0, nz=1600,
                 extra[key][e] = _to_source_frame(one[node][j], geometry[2], bank.M, yq, m1, z, xp)
             for key in _segment_keys(gd) if single else ():
                 extra[key][e] = one[key][j]
+            if below is not None:
+                out[e][:, below] = -np.inf
+                for key, _ in _node_keys(gd) if single else ():
+                    extra[key][e][:, below] = -np.inf
 
     dl = _dl_of_z(z)
     lnp = np.log(np.maximum((1.0 + z) * dl ** 2 * np.gradient(dl, z), 1e-300))
     Md = 2.0 * m1[:, None] * (1.0 + z[None, :])
     inside = (Md >= mdet_range[0]) & (Md <= mdet_range[1])
+    if below is not None:
+        inside &= ~below[None, :]
     w = np.where(inside, np.exp(lnp)[None, :], 0.0) * np.gradient(m1)[:, None] * np.gradient(z)[None, :]
     w /= w.sum()
     ln_b = np.array([_log_mean(L, w) for L in out])
@@ -636,12 +863,12 @@ def window_evidences(segments, bank, rows=None, chunk=8, n_window=64, pi_m=None)
 
     returns dict: ln_window_H, ln_window_L (n_segment, n_window, n_rho) ln E_w[k], the same arrays as pe_redshift
     with glitch=dict(model='windows') and the same n_window and pi_m; wmax_H, wmax_L (n_segment, n_template) the
-    largest w of each template; rho_edges (n_rho + 1,); rows."""
+    largest w of each template; rho_edges (n_rho + 1,); rows.  w = |z_I|^2 / u_I with the power u_I of detector I."""
     seg = read_segments(segments, rows)
     nw = _window_count(n_window, bank.n_time)
     pm = _template_weights(pi_m, bank.u.size, True)
     xp = array_module(bank.device)
-    lnG, ln_u = _window_columns(xp), np.log(bank.u)
+    lnG, ln_u = _window_columns(xp), {I: np.log(getattr(bank, "u_" + I)) for I in "HL"}
     n, nm, nr = seg["rows"].size, bank.u.size, _single.RHO_EDGES.size - 1
     out = {}
     for I in "HL":
@@ -651,8 +878,8 @@ def window_evidences(segments, bank, rows=None, chunk=8, n_window=64, pi_m=None)
         traj = [_filter(bank, seg, e) for e in ev]
         for t, e in zip(traj, ev):
             for I in "HL":
-                out["ln_window_" + I][e] = _single._host(_window_evidence(t["lq" + I], ln_u, lnG, nw, pm, xp))
-                out["wmax_" + I][e] = _single._host(_single._wmax(t["lq" + I], ln_u, xp))
+                out["ln_window_" + I][e] = _single._host(_window_evidence(t["lq" + I], ln_u[I], lnG, nw, pm, xp))
+                out["wmax_" + I][e] = _single._host(_single._wmax(t["lq" + I], ln_u[I], xp))
         del traj
     return dict(out, rho_edges=_single.RHO_EDGES.copy(), rows=seg["rows"])
 
@@ -695,12 +922,13 @@ def _distance_integral(lnW, lam):
 
 def pe_intrinsic(segments, bank, store, rows=None, prior="volume", ymin=0.1267, chunk=4,
                  nodes_per_launch=6, block=256, resident=False, n_loud=1024, n_random=1024, seed=0, single=False,
-                 glitch=None, shared_times=False):
+                 glitch=None, shared_times=False, asym_tol=0.0):
     """ln Lambda of each template of the bank, the distance integrated over its prior.
 
     segments          anything read_segments takes (see there)
     bank              mass_bank built on the same segments, rows (M_det, q, chi)
-    store             load_redshift_store
+    store             load_redshift_store, or a sequence of stores of distinct asym: as for pe_redshift
+                      (the mixture is taken on the node values, before the distance integral)
     rows              segment indices (default all)
     prior             'volume' (uniform in volume) or 'madau-dickinson' (the distance prior of the
                       simulated year, exmarg.priors)
@@ -714,9 +942,10 @@ def pe_intrinsic(segments, bank, store, rows=None, prior="volume", ymin=0.1267, 
                       n_loud = 0 visits all of them
     seed              seed of the random draw (plus the segment index)
     shared_times      the same random arrival times for every template (gather.select_times)
-    single            also the single-detector evidences (needs sig2_H == sig2_L)
+    single            also the single-detector evidences (w = |z_I|^2 / u_I in each detector)
     glitch            None, or True or a dict of settings: also the merger likelihood ratios
                       given a glitch, or with model='windows' the B of Sec. 4a (see pe_redshift)
+    asym_tol          as for pe_redshift (and asym_outside in the result when > 0)
 
     each template reads the store at every node s it reaches, y = sqrt(s/u), and
     Lambda = sum_j w_j Lambda(y_j) with the weights of distance_weights.  ln B
@@ -731,10 +960,13 @@ def pe_intrinsic(segments, bank, store, rows=None, prior="volume", ymin=0.1267, 
     with the same distance weights, glitch_pi_k and glitch_window; with
     model='windows' ln_B (n_segment, n_template) with the same distance weights
     in their place and the other arrays and settings of pe_redshift."""
+    stores = _store_list(store)
+    _store_weights(stores, bank, asym_tol)
+    store = stores[0] if len(stores) == 1 else stores
     seg = read_segments(segments, rows)
-    geometry = _node_geometry(bank, store, ymin)
+    geometry = _node_geometry(bank, stores[0], ymin)
     yN = geometry[2]
-    nn = store.s.size
+    nn = stores[0].s.size
     groups = [list(range(g, min(g + nodes_per_launch, nn))) for g in range(0, nn, nodes_per_launch)]
     lnW = np.full(yN.shape, -np.inf)
     for m in range(bank.M.size):
@@ -747,12 +979,15 @@ def pe_intrinsic(segments, bank, store, rows=None, prior="volume", ymin=0.1267, 
     out = np.full((seg["rows"].size, bank.u.size), -np.inf)
     gd = None if glitch is None or glitch is False else _glitch_setup(glitch, bank, seg, store)
     single = single or gd is not None
-    sd = _single_setup(bank, seg, store, geometry) if single else None
+    trim = len(stores) > 1
+    sd = _single_setup(bank, seg, store, geometry, trim, asym_tol) if single else None
     extra = _single_out(single, seg["rows"].size, (bank.u.size,), bank, gd)
+    if asym_tol:
+        extra["asym_outside"] = _outside(stores, bank)
     chunk = _fit_chunk(bank, store, chunk, nodes_per_launch, resident)
     for ev in _chunks(seg, chunk):
         lamN = _node_values(bank, seg, ev, store, geometry, groups, block, resident, n_loud, n_random, seed, sd, gd,
-                            shared_times)
+                            shared_times, trim, asym_tol)
         if single:
             lamN, one = lamN
         for j, e in enumerate(ev):
