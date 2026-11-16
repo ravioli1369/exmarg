@@ -47,6 +47,14 @@ times visited) is computed once per segment from the unscaled data with the true
 asym_tol > 0 a template whose w lies outside the stores' range by at most asym_tol is read from the end store alone
 (its data scaled to that store's model, so still a likelihood ratio), and the result counts them (asym_outside).
 
+Signal gain (bank.gain, strain.signal_gain).  The data of detector I carry a signal with amplitude kappa_I times the
+true strain (the conditioning with estimated spectra).  The model's template of detector I is then kappa_I a: its
+powers kappa_I^2 u_I give ubar and w (bank.u, bank.asym, so the node geometry and the single-detector merger powers are
+those of the model), and the scale of the data to store j becomes c_I + ln kappa_I, so that E_0|z_I''|^2 = ubar (1 +-
+w_j) still (each X_j a likelihood ratio, E_0 X_j = 1, whatever the gains).  The single-detector statistics of the data,
+w_I = |z_I|^2 / u_I, and everything computed from them alone (glitch and window evidences, kbar, wmax) do not depend on
+the gain and are bit for bit those of gains 1.  With gains 1 every output is bit for bit that of the code without them.
+
 pe_redshift(zmin=...) reads only the nodes that the redshifts z >= zmin need: a template skips the nodes with y
 above D0 / D_L(zmin) but the first one (the interpolation in y needs it), and ln Lambda below zmin is -inf.
 """
@@ -147,7 +155,8 @@ def _plan(bank, store, geometry, trim=False, asym_tol=0.0):
     """the stores a call reads (those of non-zero weight for some template), each a dict: store; use (n_template,) the
     templates it is read for; lnw (n_template,) ln of its weight; need (n_node,) the nodes read: all of them, or with
     trim only those of a valid pair or boundary point of a template in use; cH, cL (n_template,) the scales of the
-    data to its model (_scaled), None where all zero"""
+    data to its model (_scaled), None where all zero; with bank.gain kappa_I the scale includes ln kappa_I (the model's
+    template is kappa_I a)"""
     stores = _store_list(store)
     W = _store_weights(stores, bank, asym_tol)
     valid, bnode = geometry[0], geometry[3]
@@ -163,6 +172,11 @@ def _plan(bank, store, geometry, trim=False, asym_tol=0.0):
         a = float(getattr(st, "asym", 0.0))
         cH = 0.5 * (np.log1p(a) - np.log1p(bank.asym))
         cL = 0.5 * (np.log1p(-a) - np.log1p(-bank.asym))
+        gain = getattr(bank, "gain", None) or {}
+        if gain.get("H", 1.0) != 1.0:                    # the model's template kappa_I a: data scaled by kappa_I too
+            cH = cH + np.log(gain["H"])
+        if gain.get("L", 1.0) != 1.0:
+            cL = cL + np.log(gain["L"])
         with np.errstate(divide="ignore"):
             lnw = np.log(w)
         out.append(dict(store=st, asym=a, use=use, lnw=lnw, need=need, cH=cH if cH.any() else None,
