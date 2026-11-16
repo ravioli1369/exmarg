@@ -76,6 +76,13 @@ segment's epoch in asym_outside).  --zmin (default 0.99119; 0: the whole populat
 and of the injections; for every variant but inj (whose injections are drawn from it) a setting of the merger stage
 only, so the window models of a windows stage serve merger stages of any --zmin.  --zmin-cut: pe_redshift(zmin=--zmin),
 the nodes that z >= zmin needs alone (the same results there).  Without these options nothing changes.
+
+Signal gain (strain.signal_gain; src/exmarg/strain.py).  With estimated spectra the conditioning scales a signal in the
+data of detector I, on its own curve, by kappa_I (0.97283 for the median of N = 32 and 66 neighbour blocks), a number of
+the epoch and detector.  With --unequal the bank of each epoch takes these gains (the model's template of detector I is
+kappa_I a; bank.MassBank, pe), and the injections of inj are multiplied by them, so that they are what a real signal is
+in these data.  --no-gain: the model without them (a control; recorded as signal_gain none, the default as epoch; a
+setting of the merger stage only, plant.MERGER_KEYS: the window stage does not depend on it).
 """
 import argparse
 import glob
@@ -250,11 +257,13 @@ def extra_seed(seed, gps_epoch, seg, name):
     return plant.stream(seed, int(round(gps_epoch)) + (2 * abs(m) - (m < 0)) * 2 ** 24, 'pe')
 
 
-def injections(cfg, ep, rows, sampler, sig2=None):
+def injections(cfg, ep, rows, sampler, sig2=None, gain=None):
     """the mergers injected into the segments rows of the epoch ep: (signal {I: (n, n_freq) complex}, truth dict of
     (n,) arrays merger, m1, z, y, snr), presence and (m1, z) from plant.mergers keyed by the GPS second, the signal of
-    pp.simulate (seed plant.stream(seed, gps, 'noise')) with y less that with y = 0, snr the optimal network SNR with
-    the noise curve of each detector, sig2 {I: (n_freq,)} (default the epoch's sig2 for both)"""
+    pp.simulate (seed plant.stream(seed, gps, 'noise')) with y less that with y = 0, times gain[I] when given (the
+    signal gain of the epoch, strain.signal_gain: a signal added to conditioned data must carry it to be what a real
+    signal is in them; simulated segments drawn in the frequency domain have gain 1), snr the optimal network SNR of
+    that signal with the noise curve of each detector, sig2 {I: (n_freq,)} (default the epoch's sig2 for both)"""
     sig2 = {I: ep['sig2'] for I in 'HL'} if sig2 is None else sig2
     gps = [int(round(float(ep['gps'][i]))) for i in rows]
     present, m1, z, y = plant.mergers(dict(seed=cfg['seed'], nbar=cfg['nbar_inj']), gps, sampler)
@@ -273,20 +282,28 @@ def injections(cfg, ep, rows, sampler, sig2=None):
         a, b = one(y[j]), one(0.0)
         for I in 'HL':
             h[I][j] = a['d_' + I][0] - b['d_' + I][0]
+            if gain is not None and gain[I] != 1.0:
+                h[I][j] = gain[I] * h[I][j]
         snr[j] = np.sqrt(sum(2.0 * np.sum(np.abs(h[I][j]) ** 2 / sig2[I]) for I in 'HL'))
     truth = dict(merger=present, m1=np.where(present, m1, np.nan), z=np.where(present, z, np.nan), y=y, snr=snr)
     return h, truth
 
 
-def variants(cfg, ep, names, sampler, own=False):
+def variants(cfg, ep, names, sampler, own=False, gain=False):
     """the selected segments of the epoch ep in each variant of names: ({variant: segments dict}, rows (n,) their
     indices in the epoch, injection truth or None).  own: the data of each detector on its own curve (strain.own_curves,
-    sig2_H and sig2_L), else the equalized data on the epoch's one curve sig2"""
+    sig2_H and sig2_L), else the equalized data on the epoch's one curve sig2.  With own, the injections of inj carry
+    the epoch's signal gain kappa_I (strain.signal_gain: the amplitude a real signal has in these data), and with gain
+    also every variant's dict holds it under 'gain' for the bank of the analysis (make_analysis)"""
     rows = np.flatnonzero(selected(ep))
     base = dict(f=ep['f'], nu=ep['nu'], T=ep['T'], fmin=ep['fmin'], fmax=ep['fmax'])
+    kappa = None
     if own:
         o = strain.own_curves(ep)
         base.update(d_H=o['H'][0][rows], d_L=o['L'][0][rows], sig2_H=o['H'][1], sig2_L=o['L'][1])
+        kappa = strain.signal_gain(ep) if (gain or 'inj' in names) else None
+        if gain:
+            base['gain'] = dict(kappa)
     elif 'sig2' not in ep:
         raise ValueError('the epoch has sig2_H and sig2_L: the published tables need one noise curve (equal_noise), '
                          'or analyse it with --unequal')
@@ -308,7 +325,8 @@ def variants(cfg, ep, names, sampler, own=False):
         elif v == 'inj':
             whole_samples(base, SHIFTS['slide+0.5'])
             slid = controls.time_slide(base, SHIFTS['slide+0.5'])
-            h, inj = injections(cfg, ep, rows, sampler, {I: base.get('sig2_' + I, base.get('sig2')) for I in 'HL'})
+            h, inj = injections(cfg, ep, rows, sampler, {I: base.get('sig2_' + I, base.get('sig2')) for I in 'HL'},
+                                kappa)
             out[v] = dict(slid, d_H=slid['d_H'] + h['H'], d_L=slid['d_L'] + h['L'])
         else:
             raise ValueError('unknown variant %r' % v)
@@ -316,7 +334,8 @@ def variants(cfg, ep, names, sampler, own=False):
 
 
 def make_analysis(store, device, resident=False, chunk=CHUNK, ymin=None, zmin=None, asym_tol=None):
-    """factory(segments) builds the bank of plant.MASSES on the epoch's noise curves and returns pe(segments, seed, rows,
+    """factory(segments) builds the bank of plant.MASSES on the epoch's noise curves, with the signal gain the segments
+    carry (segments['gain'], set by variants with gain; gains 1 without it), and returns pe(segments, seed, rows,
     glitch=True) -> the pe_redshift dict (glitch=True, or the dict of the window model) of those rows of the segments,
     on plant.GRID; store one store or a list (the mixture), zmin and asym_tol those of pe_redshift (each given only when
     not None)"""
@@ -324,7 +343,7 @@ def make_analysis(store, device, resident=False, chunk=CHUNK, ymin=None, zmin=No
     cut = {k: v for k, v in (('zmin', zmin), ('asym_tol', asym_tol)) if v is not None}
 
     def factory(seg0):
-        bank = mass_bank(plant.MASSES, seg0, device)
+        bank = mass_bank(plant.MASSES, seg0, device, gain=seg0.get('gain'))
 
         def pe(seg, seed, rows, glitch=True):
             return pe_redshift(seg, bank, store, rows=rows, chunk=chunk, resident=resident, seed=seed, ymin=ymin,
@@ -390,6 +409,7 @@ def campaign(a, seg_dir, variant, sha=None):
                glitch_settings='pe default')
     if a.unequal:
         cfg['noise'] = 'own curves'
+        cfg['signal_gain'] = 'none' if a.no_gain else 'epoch'
     cfg.update(plant.store_settings(a))
     cfg = plant.stage_settings(cfg, a)
     if sha is not None:
@@ -467,7 +487,8 @@ def run(a, factory, log=print):
                 continue
             t0 = time.time()
             ep = strain.read_epoch(os.path.join(a.segments, sel[e]['name']))
-            var, rows, inj = variants(params, ep, need, sampler, a.unequal)
+            var, rows, inj = variants(params, ep, need, sampler, a.unequal,
+                                      a.unequal and not a.no_gain and not windows)
             n, ns = rows.size, int(np.asarray(ep['gps']).size)
             extra = [v for v in need if v not in VARIANTS]
             # the variants of VARIANTS at the fixed slots VARIANTS.index(v) ns + row of one stack; the windows stage has
@@ -584,7 +605,11 @@ def parser():
                    help='pe_redshift reads only the nodes the redshifts z >= --zmin need (the same results there)')
     p.add_argument('--unequal', action='store_true',
                    help='each detector on its own noise curve (strain.own_curves: no step 5); needs stores that cover '
-                        'the u_H/u_L of the templates')
+                        'the u_H/u_L of the templates.  The model carries the signal gain of each epoch '
+                        '(strain.signal_gain), and so do the injections of inj')
+    p.add_argument('--no-gain', action='store_true',
+                   help='with --unequal: the model without the signal gain (gains 1; a control: the injections of inj '
+                        'still carry it); recorded as signal_gain none')
     p.add_argument('--asym-tol', type=float, default=plant.ASYM_TOL,
                    help='with --unequal or several stores: a template whose asymmetry lies outside the stores\' range by at '
                         'most this is read from the end store (default %g; recorded, and the number of such templates '
@@ -613,6 +638,8 @@ def parse(argv=None):
         p.error('--glitch-model, --ymin, --zmin-cut and --mmap are of the merger stage')
     if not a.zmin >= 0:
         p.error('need zmin >= 0')
+    if a.no_gain and not a.unequal:
+        p.error('--no-gain is an option of --unequal (the equalized data have no gain model)')
     if not a.asym_tol >= 0:
         p.error('need asym-tol >= 0')
     if not (0 <= a.window_rho_min < a.window_rho_max):

@@ -57,7 +57,7 @@ def make_epoch(gps_epoch, seed, loud_H=(), loud_L=(), event=(), usable=True):
               gps=gps_epoch + T * np.arange(NSEG), gps_epoch=float(gps_epoch), usable=bool(usable), equal_noise=True,
               dq_H=np.full(NSEG, 127), dq_L=np.full(NSEG, 127), inj_H=np.full(NSEG, 31), inj_L=np.full(NSEG, 31),
               monitor_H=1 + 0.01 * rng.standard_normal((NSEG, 5)), monitor_L=1 + 0.01 * rng.standard_normal((NSEG, 5)),
-              u_ratio_60=0.8, **flags)
+              u_ratio_60=0.8, psd='known', **flags)                    # drawn on known curves: signal gain 1
     ep['analysable'] = ~ep['loud_H'] & ~ep['loud_L'] & ep['usable']
     return ep
 
