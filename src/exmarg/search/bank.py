@@ -29,12 +29,20 @@ class MassBank:
 
     M, q, chi  (n_template,) detector-frame total mass, mass ratio
                m2/m1 <= 1 and common aligned spin
-    u_H, u_L   (n_template,) template power u_I = sum a^2 / sig2_I at D0 (E_0|z_I|^2)
-    u          (n_template,) their mean ubar = (u_H + u_L) / 2 (u_H with equal curves, to the last bit)
-    asym       (n_template,) w = (u_H - u_L) / (u_H + u_L), so u_H = u (1 + w), u_L = u (1 - w)
+    u_H, u_L   (n_template,) template power u_I = sum a^2 / sig2_I at D0 (E_0|z_I|^2, the data's normalization)
+    gain       {'H': kappa_H, 'L': kappa_L} the amplitude a signal carries in the data of each detector relative to the
+               true strain (strain.signal_gain: the conditioning with estimated spectra), 1.0 for both by default.  The
+               model of detector I is the template kappa_I a, of power kappa_I^2 u_I: its matched filter is kappa_I z_I
+               (z_I of trajectories, which does not depend on the gain) and E_0|kappa_I z_I|^2 = kappa_I^2 u_I.  The
+               data's statistics |z_I|^2 / u_I are those of the template a and do not change; pe reads the tables of
+               the model with the data scaled by kappa_I (pe._plan)
+    u          (n_template,) the mean model power ubar = (kappa_H^2 u_H + kappa_L^2 u_L) / 2 ((u_H + u_L) / 2 with
+               gains 1, u_H with equal curves, to the last bit)
+    asym       (n_template,) w of the model powers, (kappa_H^2 u_H - kappa_L^2 u_L) / (2 ubar), so kappa_H^2 u_H =
+               u (1 + w), kappa_L^2 u_L = u (1 - w)
     W          (n_template, n_freq) complex64 a e^{i psi0}, on the device"""
 
-    def __init__(self, M, q, chi, seg, device="cpu"):
+    def __init__(self, M, q, chi, seg, device="cpu", gain=None):
         self.M, self.q, self.chi = M, q, chi
         self.device, self.xp = device, array_module(device)
         self.T, self.fmin, self.fmax = seg["T"], seg["fmin"], seg["fmax"]
@@ -54,8 +62,15 @@ class MassBank:
             W[i] = a * np.exp(1j * psi0)
             self.u_H[i] = float((a ** 2 / seg["sig2_H"]).sum())
             self.u_L[i] = float((a ** 2 / seg["sig2_L"]).sum())
-        self.u = (self.u_H + self.u_L) / 2.0
-        self.asym = (self.u_H - self.u_L) / (self.u_H + self.u_L)
+        g = {I: 1.0 for I in "HL"} if gain is None else {I: float(gain[I]) for I in "HL"}
+        if not all(np.isfinite(v) and v > 0 for v in g.values()):
+            raise ValueError("the gains must be finite and positive, not %s" % g)
+        self.gain = g
+        mH, mL = self.u_H, self.u_L
+        if g["H"] != 1.0 or g["L"] != 1.0:                   # gains 1: the same operations as before, bit for bit
+            mH, mL = g["H"] ** 2 * self.u_H, g["L"] ** 2 * self.u_L
+        self.u = (mH + mL) / 2.0
+        self.asym = (mH - mL) / (mH + mL)
         self.W = self.xp.asarray(W)
 
     def trajectories(self, d, sig2, chunk=1024):
@@ -83,17 +98,19 @@ class MassBank:
         return out
 
 
-def mass_bank(bank, segments, device="cpu"):
+def mass_bank(bank, segments, device="cpu", gain=None):
     """the template bank.
 
     bank      .npy path or array: (n,) detector-frame total masses (equal
               mass, zero spin) or (n, 3) rows (M_det, q, chi)
     segments  anything read_segments takes; its frequency grid, T, band
               and sig2_H, sig2_L define the templates
-    device    'cpu' or 'gpu'"""
+    device    'cpu' or 'gpu'
+    gain      {'H': kappa_H, 'L': kappa_L}, the signal gain of the data
+              (strain.signal_gain; MassBank), default 1"""
     B = np.load(bank) if isinstance(bank, (str, bytes)) or hasattr(bank, "__fspath__") else np.asarray(bank)
     B = np.asarray(B, float)
     if B.ndim == 1:
         B = np.stack([B, np.ones_like(B), np.zeros_like(B)], axis=1)
     seg = read_segments(segments, rows=[0])
-    return MassBank(*[np.ascontiguousarray(B[:, i]) for i in range(3)], seg, device)
+    return MassBank(*[np.ascontiguousarray(B[:, i]) for i in range(3)], seg, device, gain)

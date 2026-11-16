@@ -221,6 +221,134 @@ def whitened_variance(N, method="mean"):
     return 2.0 * mi2 / mi1 ** 2 - 1.0
 
 
+# the gain of the conditioning on a signal --------------------------------------------------------------------------
+#
+# A segment's bin is normalized by its leave-one-out estimate (sqrt(c Phat_{-i})) and handed over on the curve s_I of
+# the neighbouring epochs (condition: d = sqrt(s_I) W sqrt(G / (c Phat_{-i}))).  A signal h in the segment (strain units)
+# therefore arrives as gamma h, gamma = sqrt(g_s / (c g_P)), with g_P = Phat_{-i} / E P and g_s = s_I / E P the two
+# estimates over the truth (independent of each other and of block i; P_j are independent exponentials in Gaussian
+# noise, and S0 of the pre-whitening cancels in them, so nothing is smoothed over bins).  E[gamma^2] = 1 (c = E[1/g_P]),
+# so the signal POWER is unbiased, but the AMPLITUDE is not, and the matched filter sees the amplitude.  On the own curve
+# of detector I (sig2_I = s_I, no step 5) the matched filter weights bin nu by |a|^2 / s_I, which is correlated with
+# gamma; averaged over the bins of a template it recovers kappa_I of the model's amplitude,
+#     kappa_I = normalization_gain(N_I) hand_over_gain(n_ref,I),
+#     normalization_gain(N) = E[(c g_P)^{-1/2}],     hand_over_gain(n) = E[g_s^{1/2} / g_s] / E[1 / g_s] = E[g_s^{-1/2}] / E[g_s^{-1}].
+# 0.97283 for the median, N = 32 and n_ref = 66 blocks (0.95344 for n_ref = 33, the end epochs of a stretch); 0.98650 for
+# the mean.  Exact: this mean amplitude, in every in-band bin that is not notched, for both detectors, given the counts.
+# Neglected: (i) the scatter of gamma from bin to bin, under the matched filter's weights of variance
+# 1 / E[g_s^{-1}] - kappa^2 (0.023 for the median, 32 and 66), independent between bins: it adds to the projected
+# matched filter of a merger of SNR rho a variance about 0.023 rho^2 / n_eff, n_eff = (sum w)^2 / sum w^2 its effective
+# number of bins (170 to 1300 for the bank on an O3b curve), below 0.01 at rho = 8 against the unit noise variance;
+# (ii) signal power in the blocks of the estimates (other mergers, glitches) and drifts of the spectrum; (iii) the bins
+# next to a notch or the band edges, where the bin variance v < 1 correlates the periodograms of neighbouring blocks
+# slightly.  The data on the equalized curve (step 5, sig2 = max(s_H, s_L)) have another, spectrum-dependent gain that
+# is not modelled (that configuration is retired); a spectrum that is known (psd='known') or segments drawn directly in
+# the frequency domain (pp.simulate) have gain 1.  Measured on strain-level injections (scripts/validate/strain_plant.py):
+# the equalized gain predicted the same way, 0.98067, against 0.98054 +- 0.00052.
+
+def _ee1(z):
+    """e^z E_1(z)"""
+    return np.exp(z) * special.exp1(z) if z < 500.0 else (1.0 - 1.0 / z + 2.0 / z ** 2 - 6.0 / z ** 3) / z
+
+
+def _median_moment(N, p):
+    """E[m^p] of the median m of N independent Exp(1) (numpy's median), p in (1, -1, -2, 1/2, -1/2), by quadrature over
+    the order statistics as _median_moments: m = X_(k+1) for odd N, m = X_(k) + E / (2k) with E ~ Exp(1) independent
+    (Renyi) for even N = 2k, the expectation over E in closed form"""
+    k = N // 2
+    if N % 2:
+        lc = special.gammaln(N + 1) - 2.0 * special.gammaln(k + 1)
+        pw = k
+
+        def inner(x):
+            return x ** p
+    else:
+        lc = special.gammaln(N + 1) - special.gammaln(k) - special.gammaln(k + 1)
+        pw = k - 1
+        b = 2.0 * k
+        inner = {1: lambda x: x + 1.0 / b, -1: lambda x: b * _ee1(b * x),
+                 -2: lambda x: b * b * (1.0 / (b * x) - _ee1(b * x)),
+                 0.5: lambda x: (np.sqrt(b * x) + 0.5 * np.sqrt(np.pi) * special.erfcx(np.sqrt(b * x))) / np.sqrt(b),
+                 -0.5: lambda x: np.sqrt(np.pi * b) * special.erfcx(np.sqrt(b * x))}[p]
+
+    def dens(x):
+        return np.exp(lc + pw * np.log(-np.expm1(-x)) - (k + 1) * x)
+
+    return integrate.quad(lambda x: dens(x) * inner(x), 0.0, 60.0, points=(0.3, np.log(2.0), 1.5), limit=500,
+                          epsabs=0.0, epsrel=1e-11)[0]
+
+
+def estimate_moment(N, p, method="median"):
+    """E[g^p] for g = spectrum() of N independent exponential periodograms over its expectation: the mean, g ~ Gamma(N,
+    1/N), Gamma(N + p) / (Gamma(N) N^p); the median, E[m^p] / median_bias(N)^p by quadrature (_median_moment, p in 1, -1,
+    -2, 1/2, -1/2; N >= 5 for p = -2)"""
+    if method == "mean":
+        return float(np.exp(special.gammaln(N + p) - special.gammaln(N) - p * np.log(N)))
+    if method != "median":
+        raise ValueError("method must be 'mean' or 'median'")
+    return _median_moment(N, p) / median_bias(N) ** p
+
+
+_GAINS = {}
+
+
+def normalization_gain(N, method="median", correct=True):
+    """E[(c g)^{-1/2}]: the mean amplitude of a signal in a segment normalized by the leave-one-out estimate from N
+    blocks with its correction c = correction(N, method) (c = 1 with correct False), relative to the truth"""
+    key = ("P", int(N), method, bool(correct))
+    if key not in _GAINS:
+        c = correction(N, method) if correct else 1.0
+        _GAINS[key] = estimate_moment(N, -0.5, method) / np.sqrt(c)
+    return _GAINS[key]
+
+
+def hand_over_gain(n, method="median"):
+    """E[g^{-1/2}] / E[g^{-1}] for the hand-over curve, an estimate from n blocks: the amplitude factor of a signal
+    handed over on that curve, as the matched filter of data on that same curve (weights 1 / s_I) recovers it"""
+    key = ("s", int(n), method)
+    if key not in _GAINS:
+        _GAINS[key] = estimate_moment(n, -0.5, method) / estimate_moment(n, -1.0, method)
+    return _GAINS[key]
+
+
+def signal_gain(epoch, own=True):
+    """{'H': kappa_H, 'L': kappa_L}: the amplitude a signal in the segments of the epoch (a dict of condition, or read
+    back by read_epoch) carries in the data of each detector on its own curve, relative to the true strain (see above:
+    normalization_gain of the blocks behind the estimate of an unflagged segment, hand_over_gain of n_reference_I).
+    1.0 for both when the spectrum was known (psd 'known').  own False (the equalized curve of step 5): ValueError, its
+    gain depends on the two spectra and is not modelled.  The epoch must record psd, method, reference ('neighbours'),
+    N, correction and n_used_I, n_reference_I; the stored per-segment factors correction_I of the unflagged segments
+    are checked against the count used (ValueError otherwise)"""
+    if str(epoch.get("psd", "")) == "known":
+        return {"H": 1.0, "L": 1.0}
+    if not own:
+        raise ValueError("the gain of data on the equalized curve (step 5, sig2 = max(s_H, s_L)) is not modelled: "
+                         "analyse the epoch on its own curves")
+    need = ("psd", "method", "reference", "N", "correction", "n_used_H", "n_used_L", "n_reference_H", "n_reference_L")
+    missing = [k for k in need if k not in epoch]
+    if missing:
+        raise ValueError("the epoch does not record %s: its signal gain cannot be derived" % ", ".join(missing))
+    if str(epoch["reference"]) != "neighbours":
+        raise ValueError("reference %r: the hand-over curve contains the segment itself; its gain is not modelled"
+                         % str(epoch["reference"]))
+    method, N = str(epoch["method"]), int(epoch["N"])
+    correct = float(epoch["correction"]) != 1.0
+    out = {}
+    for I in "HL":
+        n_used = int(epoch["n_used_" + I])
+        count = n_used - 1 if n_used >= LEAST else N          # condition: an unflagged block's others; all if too few
+        if "correction_" + I in epoch and "loud_" + I in epoch:
+            ok = ~np.asarray(epoch["loud_" + I], bool)
+            want = correction(count, method) if correct else 1.0
+            got = np.asarray(epoch["correction_" + I], float)[ok]
+            if got.size and not np.allclose(got, want, rtol=1e-12, atol=0.0):
+                raise ValueError("detector %s: the stored correction factors %s are not those of %d blocks (%s)"
+                                 % (I, np.unique(got), count, want))
+        out[I] = float(normalization_gain(count, method, correct) * hand_over_gain(int(epoch["n_reference_" + I]),
+                                                                                    method))
+    return out
+
+
 def loud_thresholds(nbins, N, method="mean", p=1e-6):
     """upper thresholds of the band monitors of a block (mean of |e|^2 over nbins bins, normalized by an estimate
     from N periodograms), each exceeded with probability p by stationary Gaussian noise: the Gamma law of mean 1 and

@@ -72,7 +72,10 @@ The campaign records glitch_states = {H, L: [[f, q], ...], n_window}.
 
 Unequal noise curves (docs/2026-11-15_unequal_noise_design.md): --asym W puts the noise of detector I on sig2_I =
 sig2 / (1 +- W) (the same random numbers: every template then has w = W), --curves EPOCH on the two curves of a
-conditioned epoch file (strain.own_sig2); mergers and glitches keep their signals and SNR on those curves.  Recorded as
+conditioned epoch file (strain.own_sig2); mergers and glitches keep their signals and SNR on those curves.  The noise
+is drawn in the frequency domain on known curves, so the signal gain of the conditioning (strain.signal_gain) is 1:
+the planted signals carry none and the bank of the analysis takes none (it emulates conditioned data only in its
+curves, not in its estimation noise).  Recorded as
 noise {asym} or {curves, sha256}.  The store argument may list several folders (the mixture of pe_redshift, recorded as
 tables_asym), --asym-tol (default 0.05, with unequal curves or several stores; recorded, and asym_outside per segment),
 --zmin-cut (pe_redshift(zmin=--zmin)), --mmap (unbiased caches mapped).
@@ -134,7 +137,7 @@ WINDOW_RHO = (3.0, 12.2)
 WINDOW_CHUNK = 8                            # segments filtered at once by window_evidences (its default)
 # the campaign settings of the merger stage alone, and those of the stages: campaign_key leaves them out
 MERGER_KEYS = ('grid', 'ymin', 'n_loud', 'n_random', 'glitch_settings', 'tables', 'shared_times', 'glitch_model',
-               'glitch_model_sha256', 'tables_asym', 'zmin_cut', 'asym_tol')
+               'glitch_model_sha256', 'tables_asym', 'zmin_cut', 'asym_tol', 'signal_gain')
 STAGE_KEYS = ('stage', 'n_window', 'window_rho')
 PREFIX = dict(merger='plant', windows='win')
 
