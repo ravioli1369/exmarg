@@ -1007,7 +1007,39 @@ def pe_redshift_epochs(epochs, store, chunk=8, zmax=8.0, nz=1600, m1_range=(3.0,
                  rows=ep["seg"]["rows"], **ep["extra"]) for ep in eps]
 
 
-def window_evidences(segments, bank, rows=None, chunk=8, n_window=64, pi_m=None, lags=None):
+def _model_power(bank, I):
+    """kappa_I^2 u_I (n_template,): the power of the model's template of detector I (bank.MassBank), u_I itself when
+    the gain is 1 or absent"""
+    u, g = getattr(bank, "u_" + I), float((getattr(bank, "gain", None) or {}).get(I, 1.0))
+    return u if g == 1.0 else g * g * u
+
+
+def _merger_setup(population, bank, xp):
+    """what the merger evidence of window_evidences needs, per detector I: the templates of non-zero weight (use_I),
+    ln W of those rows on the nodes that any template of either detector uses (ln_W_I, on the device), the covered
+    fraction sum W_I, and the merger columns of those nodes (lnT, on the device).
+
+    The weights of detector I bracket the signal power of the model, s_I = kappa_I^2 u_I y^2 (_model_power): a merger
+    at y arrives in the data of I with amplitude kappa_I (bank.gain, the signal gain), so its matched filter has mean
+    kappa_I y u_I and w_I = |z_I|^2 / u_I (the data's statistic, which the columns Phi(w; s) read) the noncentrality
+    kappa_I^2 u_I y^2 |R|^2.  The powers of stage 2's single-detector columns are the same (bank.u, bank.asym)"""
+    from .population import merger_weights
+    if np.any(np.diff(bank.M) <= 0):
+        raise ValueError("the merger evidence needs a bank of ascending masses (a one-column bank, as pe_redshift)")
+    W = {I: merger_weights(bank.M, _model_power(bank, I), population) for I in "HL"}
+    cols = np.flatnonzero((W["H"] > 0).any(axis=0) | (W["L"] > 0).any(axis=0))
+    if cols.size == 0:
+        raise ValueError("the merger population has no weight that the ladder reaches")
+    out = dict(lnT=xp.asarray(_single.merger_columns(np.asarray(population["s"], float)[cols])))
+    for I in "HL":
+        use = np.flatnonzero((W[I] > 0).any(axis=1))
+        with np.errstate(divide="ignore"):
+            out["ln_W_" + I] = xp.asarray(np.log(W[I][np.ix_(use, cols)]))
+        out["use_" + I], out["covered_" + I] = use, float(W[I].sum())
+    return out
+
+
+def window_evidences(segments, bank, rows=None, chunk=8, n_window=64, pi_m=None, population=None, lags=None):
     """the window evidences of each segment and detector (docs/glitch_likelihood.md Sec. 4a, stage 1): the
     matched filter and single.window_evidence, no tables.
 
@@ -1017,30 +1049,49 @@ def window_evidences(segments, bank, rows=None, chunk=8, n_window=64, pi_m=None,
     chunk      segments filtered at once
     n_window   windows per segment, a divisor of bank.n_time
     pi_m       (n_template,) weights of the templates (>= 0, divided by their sum; default uniform)
+    population None, or the population that stage 2 averages over (population.merger_population: the (m1, z) grid
+               of pe_redshift, its cell weights population.population_weights, the ladder s of signal powers of
+               the tables, store.s, and pe_redshift's ymin): also the merger evidence of each window
+               (docs/2026-11-15_mergers_in_stage1.md, Sec. 4), single.window_merger with the weights
+               population.merger_weights of each detector, on the power of the model kappa_I^2 u_I (bank.gain;
+               _model_power), on the merger columns of the ladder.  Needs a bank of ascending masses (the
+               one-column bank of pe_redshift)
 
     returns dict: ln_window_H, ln_window_L (n_segment, n_window, n_rho) ln E_w[k], the same arrays as pe_redshift
     with glitch=dict(model='windows') and the same n_window and pi_m; wmax_H, wmax_L (n_segment, n_template) the
     largest w of each template; rho_edges (n_rho + 1,); rows.  w = |z_I|^2 / u_I with the power u_I of detector I.
-    With lags (the lags of the tables, store.tau_idx) also wnet (n_segment, n_template) as pe_redshift gives it."""
+    With population also ln_merger_H, ln_merger_L (n_segment, n_window) ln M_w, and merger_covered_H,
+    merger_covered_L the population weight the ladder reaches (sum W_I, the mean of M_w over Gaussian noise); the
+    other arrays are those without population, bit for bit.  With lags (the lags of the tables,
+    store.tau_idx) also wnet (n_segment, n_template) as pe_redshift gives it, with or without population."""
     seg = read_segments(segments, rows)
     nw = _window_count(n_window, bank.n_time)
     pm = _template_weights(pi_m, bank.u.size, True)
     xp = array_module(bank.device)
     lnG, ln_u = _window_columns(xp), {I: np.log(getattr(bank, "u_" + I)) for I in "HL"}
     n, nm, nr = seg["rows"].size, bank.u.size, _single.RHO_EDGES.size - 1
+    mg = None if population is None else _merger_setup(population, bank, xp)
     out, net = {}, np.zeros((n, nm))
     for I in "HL":
         out["ln_window_" + I] = np.full((n, nw, nr), -np.inf)
         out["wmax_" + I] = np.zeros((n, nm))
+        if mg is not None:
+            out["ln_merger_" + I] = np.full((n, nw), -np.inf)
     for ev in _chunks(seg, chunk):
         traj = [_filter(bank, seg, e) for e in ev]
         for t, e in zip(traj, ev):
             for I in "HL":
                 out["ln_window_" + I][e] = _single._host(_window_evidence(t["lq" + I], ln_u[I], lnG, nw, pm, xp))
                 out["wmax_" + I][e] = _single._host(_single._wmax(t["lq" + I], ln_u[I], xp))
+                if mg is not None:
+                    use = mg["use_" + I]
+                    out["ln_merger_" + I][e] = _single._host(_single.window_merger(
+                        t["lq" + I][xp.asarray(use)], ln_u[I][use], mg["lnT"], nw, mg["ln_W_" + I], xp))
             if lags is not None:
                 net[e] = _network(t, dict(ln_u_H=ln_u["H"], ln_u_L=ln_u["L"]), lags, xp)
         del traj
+    if mg is not None:
+        out.update(merger_covered_H=mg["covered_H"], merger_covered_L=mg["covered_L"])
     return dict(out, rho_edges=_single.RHO_EDGES.copy(), rows=seg["rows"], **({} if lags is None else dict(wnet=net)))
 
 

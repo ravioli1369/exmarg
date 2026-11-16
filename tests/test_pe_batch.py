@@ -186,8 +186,8 @@ def small_week(folder, n=2):
 
 def same_files(a, b, new=('wnet',)):
     """every result file of folder a is in folder b with the same members in the same order, every array the same bit
-    for bit and the same meta but for the run's own record (times, process): the number of arrays compared.  The
-    members new (wnet, added after COMMITTED) are in the files of a only, and are not compared"""
+    for bit and the same meta but for the run's own record (times, process): the number of arrays compared.  The files
+    of a may hold the members new (wnet, added after COMMITTED) besides, which are then not compared"""
     import glob
     import json
     import os
@@ -196,7 +196,7 @@ def same_files(a, b, new=('wnet',)):
     n = 0
     for name in names:
         with np.load(os.path.join(a, name)) as x, np.load(os.path.join(b, name)) as y:
-            assert set(new) <= set(x.files) and [f for f in x.files if f not in new] == y.files, name
+            assert set(x.files) - set(y.files) <= set(new) and [f for f in x.files if f in y.files] == y.files, name
             ma, mb = (json.loads(str(z['meta'])) for z in (x, y))
             ra, rb = ma.pop('run'), mb.pop('run')
             assert ma == mb and {k: ra[k] for k in ('first', 'end', 'epochs', 'chunk')} == {

@@ -543,52 +543,114 @@ def _tangent(free, blocks):
 STALL_TOL = 1e-5            # nats: the predicted gain below which a fit that cannot raise ln L any more has converged
 
 
-def fit_windows(ln_E, n_state=2, basis=None, start=None, tol=1e-9, max_iter=500, chunk=1024):
-    """the glitch model of one detector, Sec. 4a, from its window evidences (no mergers): the maximum of
+class _WindowsMerger(_Windows):
+    """sum_i ln c_i(theta, N) of a detector whose segments hold, with probability N, a merger of the population
+    (docs/2026-11-15_mergers_in_stage1.md, Sec. 2), at fixed N, and its derivatives in the x of _Windows:
 
-        sum_i ln c_i,   c_i = sum_s f_s prod_w (1 - q_s + q_s pi^s . E_iw),   pi^s = a^s @ basis
+        c_i = sum_s f_s C^s_i [1 + N b^s_i],   b^s_i = (1/n_w) sum_w kappa^s_iw (M_iw - 1),
+        kappa^s_w = prod_{w' in Z(w)} rho^s_w',   rho^s_w = (1 - q_s) / D^s_w = Om[s, 0] / (Om[s] . Y_w e^h_w)
 
-    over f and every a^s on the simplex and q in [0, 1].
+    with M_iw the merger evidence of window w (single.window_merger) and Z(w) the window and zone windows on each
+    side, circular.  With gamma = N / (1 + N b), xi_w = gamma kappa_w (M_w - 1) / n_w, Xi_w = sum_{w' in Z(w)} xi_w',
+    a_w = 1 - Xi_w, Z_w = Y_w / D_w, S_w = sum_{w' in Z(w)} Z_w' and e_0 the first unit vector, ln T^s = ln C^s +
+    ln(1 + N b^s) has the gradient and Hessian in Om[s]
 
-    ln_E     (n_segment, n_w, n_k) ln E_w[k] (single.window_evidence)
-    n_state  K
-    basis    (n_basis, n_k) rows that are normalized laws over the columns (None: the identity, a free weight per
-             column)
-    start    dict f (K,), q (K,), a (K, n_basis) (default f uniform, q from 1e-3 to 0.1, a uniform)
-    tol      the gain of the Newton step below which it has converged, nats
-    max_iter the number of updates
-    chunk    segments per task of the threads
+        Gamma        = sum_w a_w Z_w + |Z| (gamma b) e_0 / Om_0
+        d Gamma      = - sum_w a_w Z_w Z_w^T + sum_w xi_w S_w S_w^T - (gamma beta)(gamma beta)^T
+                       + |Z| (e_0 (gamma beta)^T + (gamma beta) e_0^T) / Om_0 - |Z| (|Z| + 1) (gamma b) e_0 e_0^T / Om_0^2
+        gamma beta   = |Z| (gamma b) e_0 / Om_0 - sum_w Xi_w Z_w            (gamma times d b / d Om)
 
-    In x = (f, Om[0], .., Om[K-1]), Om[s] = (1 - q_s, q_s a^s), every block on a simplex, c_i is linear in each
-    Om[s].  EM over the state of the segment, glitch or not in each window and the basis component of the glitch
-    is x -> x g / mu (g = d ln L / dx, mu = n for f and n_w sum_i r_is for Om[s]), accelerated by SQUAREM
-    (Varadhan & Roland 2008, the extrapolation kept only when it raises ln L), until a cycle gains less than 0.01;
-    then Newton steps with the exact Hessian on the entries above zero and those at zero with g > mu, each block
-    kept on its simplex (the eigenvalues of minus the Hessian taken in absolute value, so the step rises where ln L
-    is not concave), a step kept only when it raises ln L (an EM cycle otherwise), so ln L never decreases.
-    Converged when the gain the Newton step predicts, g . dx / 2, is below tol (nats; the distance to the maximum
-    is then about sqrt(2 tol) standard errors), the entries of empty states (f_s = 0) aside.  Also when neither a Newton
-    step nor an EM step raises ln L any more (the sum has reached its rounding, in a direction the data do not
-    constrain) and the predicted gain is below STALL_TOL.
+    and those of ln c follow as for _Windows with G_s replaced by Gamma_s and M[s] = - sum_i r_is d Gamma_is.  Every
+    term of T^s is a product of one entry of Om[s] per window (the windows of the zone of a merger seen by the
+    detector give (1 - q) each): T^s is homogeneous of degree n_w in Om[s] with positive coefficients for N in
+    [0, 1], so Om . Gamma = n_w and EM (x g / mu) is the growth transform of Baum and Eagon, monotone.  xi_w,
+    gamma b and a_w > 0 are bounded whatever M_w (1 + N b >= N kappa_w M_w / n_w); M_w enters through ln M_w"""
 
-    returns dict: f (K,), q (K,), pi (K, n_k), a (K, n_basis), lnl, n_iter (updates), converged, trace (ln L after
-    every update), cov (covariance of x from the Hessian on the entries above zero, the same order), err_f, err_q,
-    err_a; states ordered by increasing q"""
-    lnE = np.asarray(ln_E, float)
-    nk = lnE.shape[-1]
-    B = np.eye(nk) if basis is None else np.asarray(basis, float)
-    if B.ndim != 2 or B.shape[1] != nk or np.any(B < 0) or np.any(np.abs(B.sum(axis=1) - 1.0) > 1e-12):
-        raise ValueError('the rows of basis must be normalized laws over the %d columns' % nk)
-    model = _Windows(lnE, B, basis is None, chunk)
-    K, nb = n_state, B.shape[0]
-    P = nb + 1
-    st = dict(f=np.full(K, 1.0 / K), q=np.geomspace(1e-3, 0.1, K) if K > 1 else np.array([0.01]),
-              a=np.full((K, nb), 1.0 / nb))
-    st.update(start or {})
-    q0 = np.asarray(st['q'], float)
-    x = np.concatenate([np.asarray(st['f'], float), np.concatenate([(1.0 - q0)[:, None],
-                                                                    q0[:, None] * np.asarray(st['a'], float)], 1).ravel()])
-    blocks = [np.arange(K)] + [K + s * P + np.arange(P) for s in range(K)]
+    def __init__(self, base, ln_M, nbar, zone):
+        self.__dict__.update(base.__dict__)
+        lnM = np.asarray(ln_M, float)
+        if lnM.shape != (self.n, self.nw):
+            raise ValueError('ln_M has shape %s, not (n_segment, n_w) = %s' % (lnM.shape, (self.n, self.nw)))
+        if np.isnan(lnM).any() or np.any(lnM == np.inf):
+            raise ValueError('ln_M must be finite or -inf')
+        if isinstance(zone, (bool, np.bool_)) or not isinstance(zone, (int, np.integer)) or zone < 0 \
+                or 2 * zone + 1 > self.nw:
+            raise ValueError('zone must be an integer >= 0 with 2 zone + 1 <= n_w = %d, not %r' % (self.nw, zone))
+        if not 0.0 < nbar <= 1.0:
+            raise ValueError('nbar must lie in (0, 1], not %r' % (nbar,))
+        self.lnM, self.N, self.zone, self.nz = lnM, float(nbar), int(zone), 2 * int(zone) + 1
+
+    def _roll(self, a):
+        """the sum over the zone of each window of a (n, n_w, ...), circular in the windows"""
+        return sum(np.roll(a, d, axis=1) for d in range(-self.zone, self.zone + 1))
+
+    def _part(self, ab, f, Om, hess, tiny=1e-150):
+        a, b = ab
+        nw, K, P, n = self.nw, f.size, self.nb + 1, ab[1] - ab[0]
+        rows = slice(a * nw, b * nw)
+        Y = self.Y[rows]
+        with np.errstate(all='ignore'):
+            D = Y @ Om.T                                                    # (rows, K)
+            lnD = np.log(D)
+        i, k = np.nonzero(D < tiny)
+        if i.size:                                                          # as in _Windows._part
+            lnY = np.concatenate([-self.h[rows][i, None], self.lnF[rows][i] - self.h[rows][i, None]], axis=1)
+            lnD[i, k] = logsumexp(lnY + _log(Om[k]), axis=1)
+            rho = np.exp(np.minimum(lnY - lnD[i, k][:, None], 345.0))
+        lnC = lnD.reshape(n, nw, K).sum(axis=1) + self.hsum[a:b, None]
+        lnn, e0 = np.log(nw), np.eye(P)[0]
+        with np.errstate(all='ignore'):
+            lnfree = np.minimum(_log(Om[:, 0])[None, :] - self.h[rows][:, None] - lnD, 0.0).reshape(n, nw, K)
+            lnk = self._roll(lnfree)                                        # ln kappa_w
+            lnM = self.lnM[a:b][:, :, None]
+            kbar = np.exp(logsumexp(lnk, axis=1) - lnn)                     # (1/n_w) sum_w kappa_w, (n, K)
+            ln1 = np.logaddexp(np.log1p(-self.N * kbar), np.log(self.N) + logsumexp(lnk + lnM, axis=1) - lnn)
+            lnT = lnC + ln1                                                 # ln C + ln(1 + N b)
+            ln_c = logsumexp(lnT + _log(f), axis=1)
+            Q = np.exp(np.minimum(lnT - ln_c[:, None], 345.0))              # T_s / c = d ln c_i / d f_s
+            r = Q * f
+            e = np.log(self.N) + lnk - lnn - ln1[:, None, :]                # ln(N kappa_w / (n_w (1 + N b)))
+            xi = np.exp(e + lnM) - np.exp(e)                                # gamma kappa_w (M_w - 1) / n_w
+        Xi = self._roll(xi)
+        gb = xi.sum(axis=1)                                                 # gamma b, (n, K)
+        aw = (1.0 - Xi).reshape(n * nw, K)
+        rw = np.repeat(r, nw, axis=0)
+        with np.errstate(all='ignore'):
+            G = Y.T @ (rw * aw / D)                                         # sum r_s a_w Y / D_s, (P, K)
+        if i.size:
+            np.add.at(G.T, k, (rw[i, k] * aw[i, k])[:, None] * rho)
+        G[0] += self.nz * (r * gb).sum(axis=0) / Om[:, 0]
+        out = dict(lnl=math.fsum(ln_c), Q=Q.sum(axis=0), R=r.sum(axis=0), G=G)
+        if hess:
+            Gi, M = np.empty((n, P, K)), np.empty((K, P, P))               # Gamma per segment; - sum r_s d Gamma_s
+            for t in range(K):
+                Z = Y / D[:, t:t + 1]
+                if i.size:
+                    Z[i[k == t]] = rho[k == t]
+                Z3 = Z.reshape(n, nw, P)
+                g = (Z * aw[:, t:t + 1]).reshape(n, nw, P).sum(axis=1)
+                g[:, 0] += self.nz * gb[:, t] / Om[t, 0]
+                Gi[:, :, t] = g
+                gB = -(Z3 * Xi[:, :, t, None]).sum(axis=1)                  # gamma beta, (n, P)
+                gB[:, 0] += self.nz * gb[:, t] / Om[t, 0]
+                S = self._roll(Z3).reshape(n * nw, P)
+                Wa = Z * np.sqrt(rw[:, t] * aw[:, t])[:, None]
+                rx = rw[:, t] * xi[:, :, t].ravel()
+                v = (r[:, t, None] * gB).sum(axis=0)
+                with np.errstate(all='ignore'):
+                    M[t] = (Wa.T @ Wa - (S * rx[:, None]).T @ S + (gB * r[:, t, None]).T @ gB
+                            - self.nz * (np.outer(e0, v) + np.outer(v, e0)) / Om[t, 0]
+                            + self.nz * (self.nz + 1) * float(r[:, t] @ gb[:, t]) * np.outer(e0, e0) / Om[t, 0] ** 2)
+            with np.errstate(all='ignore'):
+                out.update(M=M, QQ=Q.T @ Q, QG=np.einsum('is,ips->sp', Q, Gi),
+                           QrG=np.einsum('is,it,ipt->stp', Q, r, Gi), GG=np.einsum('is,ips,iqs->spq', r, Gi, Gi),
+                           rrGG=np.einsum('is,it,ips,iqt->sptq', r, r, Gi, Gi))
+        return out
+
+
+def _climb(model, x, K, blocks, tol, max_iter):
+    """the maximization of fit_windows from x: (x, ev at x with the Hessian terms, trace, n_iter, converged)"""
+    P = model.nb + 1
 
     def norm(x):
         x = np.maximum(x, 0.0)
@@ -682,6 +744,14 @@ def fit_windows(ln_E, n_state=2, basis=None, start=None, tol=1e-9, max_iter=500,
                 converged = dec < STALL_TOL                                # no step raises ln L any more: its rounding
                 break
             ev = model(x, K, hess=True)
+    return x, ev, trace, n_iter, converged
+
+
+def _windows_result(model, x, ev, K, B, blocks, trace, n_iter, converged):
+    """the result dict of fit_windows at x (states ordered by increasing q), the covariance from the Hessian of the
+    model's ln L on the entries above zero"""
+    nb = B.shape[0]
+    P = nb + 1
     H = model.hessian(ev)
     Z = _tangent(np.concatenate([np.ones(K, bool), np.repeat(x[:K] > 0, P)]) & (x > 0), blocks)
     cov = np.zeros((x.size, x.size))
@@ -704,3 +774,77 @@ def fit_windows(ln_E, n_state=2, basis=None, start=None, tol=1e-9, max_iter=500,
     return dict(f=f, q=q, pi=a @ B, a=a, lnl=float(ev['lnl']), n_iter=n_iter, converged=converged,
                 trace=np.array(trace), cov=cov, err_f=sd(np.diag(cov)[:K]), err_q=sd(np.diag(cov)[K::P]),
                 err_a=sd(var_a))
+
+
+def fit_windows(ln_E, n_state=2, basis=None, start=None, tol=1e-9, max_iter=500, chunk=1024, ln_M=None, nbar=0.0,
+                zone=1):
+    """the glitch model of one detector, Sec. 4a, from its window evidences: the maximum of
+
+        sum_i ln c_i,   c_i = sum_s f_s prod_w (1 - q_s + q_s pi^s . E_iw),   pi^s = a^s @ basis
+
+    over f and every a^s on the simplex and q in [0, 1]; with ln_M and nbar > 0 the segments hold mergers of the
+    population with probability nbar (docs/2026-11-15_mergers_in_stage1.md, Sec. 2) and the maximum is that of
+
+        sum_i ln c_i,   c_i = sum_s f_s C^s_i [1 + nbar b^s_i],   b^s_i = (1/n_w) sum_w kappa^s_iw (M_iw - 1)
+
+    at fixed nbar, kappa^s_w the probability that the zone of window w (the window and zone windows on each side,
+    circular) is free of glitches (single.window_posterior), M_iw the merger evidence of the window.
+
+    ln_E     (n_segment, n_w, n_k) ln E_w[k] (single.window_evidence)
+    n_state  K
+    basis    (n_basis, n_k) rows that are normalized laws over the columns (None: the identity, a free weight per
+             column)
+    start    dict f (K,), q (K,), a (K, n_basis) (default f uniform, q from 1e-3 to 0.1, a uniform)
+    tol      the gain of the Newton step below which it has converged, nats
+    max_iter the number of updates (of each of the two fits with mergers)
+    chunk    segments per task of the threads
+    ln_M     None, or (n_segment, n_w) ln M_w (pe.window_evidences with a population)
+    nbar     the probability of a merger in a segment, in [0, 1], held fixed (stage 2 gives it); 0 or ln_M None: the
+             model without mergers, every number that of the fit without these arguments
+    zone     the zone of a window (with mergers only; that of pe_redshift's window model)
+
+    In x = (f, Om[0], .., Om[K-1]), Om[s] = (1 - q_s, q_s a^s), every block on a simplex, c_i is linear in each
+    Om[s].  EM over the state of the segment, glitch or not in each window and the basis component of the glitch
+    is x -> x g / mu (g = d ln L / dx, mu = n for f and n_w sum_i r_is for Om[s]), accelerated by SQUAREM
+    (Varadhan & Roland 2008, the extrapolation kept only when it raises ln L), until a cycle gains less than 0.01;
+    then Newton steps with the exact Hessian on the entries above zero and those at zero with g > mu, each block
+    kept on its simplex (the eigenvalues of minus the Hessian taken in absolute value, so the step rises where ln L
+    is not concave), a step kept only when it raises ln L (an EM cycle otherwise), so ln L never decreases.
+    Converged when the gain the Newton step predicts, g . dx / 2, is below tol (nats; the distance to the maximum
+    is then about sqrt(2 tol) standard errors), the entries of empty states (f_s = 0) aside.  Also when neither a Newton
+    step nor an EM step raises ln L any more (the sum has reached its rounding, in a direction the data do not
+    constrain) and the predicted gain is below STALL_TOL.  With mergers the fit without them is made first and the
+    same steps start from its maximum, on the objective with mergers (_WindowsMerger: its exact gradient and
+    Hessian; c_i is homogeneous of degree n_w in each Om[s] with positive coefficients, so the EM step is again
+    x g / mu, the hidden events now including a merger in a window whose zone is free of glitches).
+
+    returns dict: f (K,), q (K,), pi (K, n_k), a (K, n_basis), lnl, n_iter (updates), converged, trace (ln L after
+    every update), cov (covariance of x from the Hessian on the entries above zero, the same order), err_f, err_q,
+    err_a; states ordered by increasing q.  With mergers these are of the objective with mergers (lnl, the Hessian
+    and its errors, trace and n_iter of its own steps), and also nbar, zone and fit0 (the result of the fit without
+    mergers, its start)"""
+    lnE = np.asarray(ln_E, float)
+    nk = lnE.shape[-1]
+    B = np.eye(nk) if basis is None else np.asarray(basis, float)
+    if B.ndim != 2 or B.shape[1] != nk or np.any(B < 0) or np.any(np.abs(B.sum(axis=1) - 1.0) > 1e-12):
+        raise ValueError('the rows of basis must be normalized laws over the %d columns' % nk)
+    if not 0.0 <= nbar <= 1.0:
+        raise ValueError('nbar must lie in [0, 1], not %r' % (nbar,))
+    model = _Windows(lnE, B, basis is None, chunk)
+    merger = None if ln_M is None or nbar == 0 else _WindowsMerger(model, ln_M, nbar, zone)
+    K, nb = n_state, B.shape[0]
+    P = nb + 1
+    st = dict(f=np.full(K, 1.0 / K), q=np.geomspace(1e-3, 0.1, K) if K > 1 else np.array([0.01]),
+              a=np.full((K, nb), 1.0 / nb))
+    st.update(start or {})
+    q0 = np.asarray(st['q'], float)
+    x = np.concatenate([np.asarray(st['f'], float), np.concatenate([(1.0 - q0)[:, None],
+                                                                    q0[:, None] * np.asarray(st['a'], float)], 1).ravel()])
+    blocks = [np.arange(K)] + [K + s * P + np.arange(P) for s in range(K)]
+    x, ev, trace, n_iter, converged = _climb(model, x, K, blocks, tol, max_iter)
+    out = _windows_result(model, x, ev, K, B, blocks, trace, n_iter, converged)
+    if merger is None:
+        return out
+    x, ev, trace, n_iter, converged = _climb(merger, x, K, blocks, tol, max_iter)
+    return dict(_windows_result(merger, x, ev, K, B, blocks, trace, n_iter, converged), nbar=float(nbar),
+                zone=int(zone), fit0=out)

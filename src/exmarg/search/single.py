@@ -613,6 +613,31 @@ def window_evidence(lq, ln_u, lnT, n_window, pi_m=None, xp=np, block=256):
     return _ln_sum_exp(lnE + xp.asarray(lpm)[:, None, None], 0, xp)
 
 
+def window_merger(lq, ln_u, lnT, n_window, ln_W, xp=np, block=256):
+    """ln M_w = ln sum_m sum_k W[m, k] (1/n_win) sum_{t in w} T_k(w_m(t)), the merger evidence of each window of the
+    segment (docs/2026-11-15_mergers_in_stage1.md, Sec. 4): the windows those of window_evidence, T_k the merger
+    columns Phi(V^2; s_k) of a ladder of signal powers (merger_columns) and W[m, k] the weight of the population on
+    template m and node k (population.merger_weights).
+
+    lq, ln_u   as for histogram, the templates of the rows of ln_W
+    lnT        (NV, n_col) ln T_k(V^2), on the device of xp
+    n_window   a divisor of n_time
+    ln_W       (n_template, n_col) ln W[m, k], -inf where W is 0, on the device of xp
+
+    ln_evidence of the rows (template, window) of n_win times each, as in window_evidence, then the sum over
+    (m, k) in the log domain.  returns (n_window,), float64 on the device."""
+    nm, nt = lq.shape
+    if n_window < 1 or nt % n_window:
+        raise ValueError("n_time = %d is not a multiple of n_window = %d" % (nt, n_window))
+    if ln_W.shape != (nm, lnT.shape[1]):
+        raise ValueError("ln_W has shape %s, not (n_template, n_col) = %s" % (ln_W.shape, (nm, lnT.shape[1])))
+    rows = lq.reshape(nm * n_window, nt // n_window)
+    lu = xp.repeat(xp.asarray(ln_u, xp.float64), n_window)
+    lnE = ln_evidence(rows, lu, lnT, xp=xp, block=block * n_window).reshape(nm, n_window, -1)
+    x = (lnE + ln_W[:, None, :]).transpose(1, 0, 2).reshape(n_window, -1)
+    return _ln_sum_exp(x, -1, xp)
+
+
 def _ln_mixed(lnE, pi, xp, tiny=1e-280):
     """ln sum_k pi[s, k] exp lnE[..., k] for every row s of pi: (..., K).  The terms are scaled by the largest of
     their row; where the law of s has (almost) no weight on the large ones the row is summed again with its own
