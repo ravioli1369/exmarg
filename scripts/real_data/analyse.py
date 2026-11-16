@@ -34,7 +34,11 @@ epoch (they share the noise curve; the bank of plant.MASSES is built on it):
                  optimal network SNR is computed with the epoch's sig2.
 The random numbers of a segment are keyed by its GPS second (plant.stream(seed, gps, use)), those of pe_redshift by the
 epoch's GPS and a fixed row per variant and segment, so every variant of every segment is the same whatever --part and
---variants are.  The chunk passed to pe_redshift is capped there by the free GPU memory (pe._fit_chunk).
+--variants are.  Merger stage: the pe_redshift calls of all the epochs of an output group (those described here and
+under --glitch-model) are made at once, as the epochs of one pe_redshift_epochs call, each with its own bank, rows, seed
+and glitch settings: the tables are copied to the GPU once per chunk of the group's segments instead of once per call,
+and every array is that of the calls made one by one, bit for bit.  The chunk (--chunk, segments of the whole group) is
+capped there by the free GPU memory (pe._fit_chunk).
 
 Output: <out>/<variant>/plant_<first k>_<end k>.npz, one per group of --epochs-per-file epochs (groups cut at multiples
 of it in the manifest; --part i/n takes the groups i n_group / n to (i + 1) n_group / n, contiguous in time), written
@@ -319,18 +323,29 @@ def make_analysis(store, device, resident=False, chunk=CHUNK, ymin=None, zmin=No
     """factory(segments) builds the bank of plant.MASSES on the epoch's noise curves and returns pe(segments, seed, rows,
     glitch=True) -> the pe_redshift dict (glitch=True, or the dict of the window model) of those rows of the segments,
     on plant.GRID; store one store or a list (the mixture), zmin and asym_tol those of pe_redshift (each given only when
-    not None)"""
-    from exmarg.search import mass_bank, pe_redshift
+    not None).  pe.epoch(segments, seed, rows, glitch=True) is the same call as an epoch of pe_redshift_epochs, and
+    pe.batch(epochs) analyses such epochs (of any epoch's bank) in one pass over the tables: [the dict of each]"""
+    from exmarg.search import mass_bank, pe_redshift, pe_redshift_epochs
     cut = {k: v for k, v in (('zmin', zmin), ('asym_tol', asym_tol)) if v is not None}
+    settings = dict(chunk=chunk, resident=resident, ymin=ymin, mdet_range=plant.MDET, **cut, **plant.GRID)
 
     def factory(seg0):
         bank = mass_bank(plant.MASSES, seg0, device)
 
         def pe(seg, seed, rows, glitch=True):
-            return pe_redshift(seg, bank, store, rows=rows, chunk=chunk, resident=resident, seed=seed, ymin=ymin,
-                               mdet_range=plant.MDET, glitch=glitch, **cut, **plant.GRID)
+            return pe_redshift(seg, bank, store, rows=rows, seed=seed, glitch=glitch, **settings)
+        pe.epoch = lambda seg, seed, rows, glitch=True: dict(segments=seg, bank=bank, rows=rows, seed=seed, glitch=glitch)
+        pe.batch = lambda epochs: pe_redshift_epochs(epochs, store, **settings)
         return pe
     return factory
+
+
+def analyse_calls(calls):
+    """the pe dicts of the calls [(pe, args)] of a group of epochs, in order: in one pass over the tables (pe.batch of
+    every call's pe.epoch(*args)) when every pe offers it, else call by call, pe(*args)"""
+    if calls and all(hasattr(pe, 'batch') and hasattr(pe, 'epoch') for pe, _ in calls):
+        return calls[0][0].batch([pe.epoch(*args) for pe, args in calls])
+    return [pe(*args) for pe, args in calls]
 
 
 def make_windows(device, n_window=plant.N_WINDOW, chunk=plant.WINDOW_CHUNK):
@@ -431,6 +446,34 @@ def merger_shared(res):
                 glitch_window=np.asarray(res.get('glitch_window', np.nan), float))
 
 
+def merger_calls(seg, seed, rows, slots, n, need, models, alone):
+    """the pe calls of one epoch in the merger stage: [(args of pe, targets)], targets [(variant, the slice of the
+    dict's segments that is the variant's, or None: all of them)].  With a model per variant (models) one call per
+    variant, at its slots or (alone) on its own epoch-sized stack; else one call for the variants with slots, each the
+    slice of its slots, and one per variant without slots (alone), with the default glitch settings"""
+    if models:
+        return [((seg, seed, slots[v], models[v][0]) if v in slots else alone(v) + (rows, models[v][0]), [(v, None)])
+                for v in need]
+    out = []
+    if slots:
+        take = np.concatenate([slots[v] for v in slots])
+        out.append(((seg, seed, take), [(v, slice(j * n, (j + 1) * n)) for j, v in enumerate(slots)]))
+    return out + [(alone(v) + (rows,), [(v, None)]) for v in need if v not in slots]
+
+
+def merger_arrays(res, targets, pop):
+    """{variant: the per-segment arrays of plant.reduce} of one pe dict for its targets (merger_calls)"""
+    out = {}
+    for v, part in targets:
+        if part is None:
+            out[v] = plant.reduce(res, pop, plant.MDET)
+            continue
+        per_call = {k: res[k] for k in ('asym_outside',) if k in res}
+        out[v] = plant.reduce(dict(m1=res['m1'], z=res['z'], **per_call,
+                                   **{key: np.asarray(res[key])[part] for key in PER_SEGMENT}), pop, plant.MDET)
+    return out
+
+
 def run(a, factory, log=print):
     """the groups of epochs of this part, every requested variant; returns the paths written"""
     names = [v for v in VARIANTS if v in a.variants] + [v for v in a.variants if v not in VARIANTS]
@@ -462,6 +505,7 @@ def run(a, factory, log=print):
         acc = {v: [] for v in need}
         t_build = t_pe = 0.0
         n_rows = 0
+        calls, books = [], []           # merger stage: the group's pe calls; per epoch its bookkeeping and the targets
         for e in range(e0, e1):
             if sel[e]['n_selected'] == 0:
                 continue
@@ -491,44 +535,37 @@ def run(a, factory, log=print):
                 for I in 'HL':
                     pad[I][rows] = var[v]['d_' + I]
                 return dict(var[v], d_H=pad['H'], d_L=pad['L']), extra_seed(a.seed, float(ep['gps_epoch']), var[v], v)
+            book = {v: dict(epoch_arrays(ep, rows, n, inj if v == 'inj' else None), k=sel[e]['k'] + np.arange(n))
+                    for v in need}
             if windows:                                 # every variant in one call, sliced
                 res = pe(seg, take)
                 arrays = {v: plant.reduce_windows(dict(rho_edges=res['rho_edges'], **{
                     key: np.asarray(res[key])[j * n:(j + 1) * n] for key in WINDOW_KEYS}), bins)
                     for j, v in enumerate(need)}
                 shared = plant.window_shared(bins)
-            elif models:                                # a model per variant: a call per variant, the same rows
-                arrays = {}
                 for v in need:
-                    if v in slots:
-                        res = pe(seg, seed, slots[v], models[v][0])
-                    else:
-                        one, seed_v = alone(v)
-                        res = pe(one, seed_v, rows, models[v][0])
-                    arrays[v] = plant.reduce(res, pop, plant.MDET)
-                shared = merger_shared(res)
-            else:
-                arrays = {}
-                if slots:
-                    res = pe(seg, seed, take)
-                    per_call = {k: res[k] for k in ('asym_outside',) if k in res}
-                    arrays = {v: plant.reduce(dict(m1=res['m1'], z=res['z'], **per_call, **{
-                        key: np.asarray(res[key])[j * n:(j + 1) * n] for key in PER_SEGMENT}), pop, plant.MDET)
-                        for j, v in enumerate(slots)}
-                for v in extra:
-                    one, seed_v = alone(v)
-                    res = pe(one, seed_v, rows)
-                    arrays[v] = plant.reduce(res, pop, plant.MDET)
-                shared = merger_shared(res)
-            del res
-            t2 = time.time()
-            for v in need:
-                arrays[v].update(epoch_arrays(ep, rows, n, inj if v == 'inj' else None))
-                arrays[v]['k'] = sel[e]['k'] + np.arange(n)
-                acc[v].append(arrays[v])
+                    acc[v].append(dict(arrays[v], **book[v]))
+                del res
+            else:                                       # the calls of every epoch of the group, made below at once
+                c = merger_calls(seg, seed, rows, slots, n, need, models, alone)
+                calls += [(pe, args) for args, _ in c]
+                books.append((book, [targets for _, targets in c]))
             t_build += t1 - t0
-            t_pe += t2 - t1
+            t_pe += time.time() - t1
             n_rows += n * len(need)
+        if calls:                                       # merger stage: one pass over the tables for the whole group
+            t1 = time.time()
+            results = iter(analyse_calls(calls))
+            for book, targets in books:
+                arrays = {}
+                for tg in targets:
+                    res = next(results)
+                    arrays.update(merger_arrays(res, tg, pop))
+                for v in need:
+                    acc[v].append(dict(arrays[v], **book[v]))
+            shared = merger_shared(res)
+            del res, results, calls
+            t_pe += time.time() - t1
         for v in need:
             parts = acc[v]
             arrays = {key: np.concatenate([p[key] for p in parts]) for key in parts[0] if key != 'w_inf_cells'}

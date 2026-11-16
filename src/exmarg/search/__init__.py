@@ -14,6 +14,9 @@ GPU, load the store with pinned=True for fast copies to the device.
     res = pe_redshift(segments, bank, store, single=True)   # also ln_lambda_H, ln_lambda_L, ln_glitch_H, ...
     res = pe_redshift(segments, bank, store, glitch=True)   # also ln_lambda_gH, ln_lambda_gL, ln_lambda_gHL
 
+    # several epochs (own noise curves, own banks) in one pass over the tables: the per-epoch dicts, bit for bit
+    res = pe_redshift_epochs([dict(segments=s1, bank=b1, seed=11), dict(segments=s2, bank=b2, seed=12)], store)
+
 single.py holds the single-detector evidences (docs/glitch_likelihood.md):
 the columns, the histogram of a trajectory and the glitch time weights.
 """
@@ -21,7 +24,7 @@ the columns, the histogram of a trajectory and the glitch time weights.
 from .segments import D0, read_segments
 from .bank import mass_bank
 from .store import load_redshift_store
-from .pe import pe_redshift, pe_intrinsic, distance_weights
+from .pe import pe_redshift, pe_redshift_epochs, pe_intrinsic, distance_weights
 from .single import (RHO_EDGES, kernel, ln_kernel, response_distribution, glitch_columns, merger_columns,
                      histogram, ln_evidence, ln_merger_at, glitch_time_series, glitch_time_weights, ln_near_fraction,
                      amplitude_weights)
