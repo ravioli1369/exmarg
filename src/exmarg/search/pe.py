@@ -590,6 +590,12 @@ def _single_values(traj, sd, xp, gw=None):
     return out
 
 
+def _network(traj, sd, tau, xp):
+    """wnet (n_template,) on the host: the largest w_H(t + tau) + w_L(t) of the unscaled data over every arrival time
+    and lag tau of the tables (gather.network_max), w_I = |z_I|^2 / u_I with the true u_I"""
+    return _single._host(_gather.network_max(traj["lqH"], traj["lqL"], sd["ln_u_H"], sd["ln_u_L"], tau, xp))
+
+
 def _store_single(one, i, e, n_node, n_rho):
     """the single-detector values of the store i of the plan (e) in the layout _single_nodes reads: per segment and
     detector ln E with the amplitude bins, then one column per node of the store (-inf at the nodes it does not read),
@@ -712,9 +718,11 @@ def _epochs_values(jobs, groups, block, resident, n_loud, n_random, shared_times
         gw = [None] * len(ev) if gd is None else [_glitch_weights(t, gd, sd, xp) for t in traj]
         one = None if sd is None else [_single_values(t, sd, xp, g) for t, g in zip(traj, gw)]
         tau = ep["plan"][0]["store"].tau_idx
+        net = None if sd is None else [_network(t, sd, tau, xp) for t in traj]
         times = [_gather.select_times(t, tau, n_loud, n_random, ep["seed"] + int(seg["rows"][e]), xp, shared=shared_times)
                  if n_loud > 0 else None for t, e in zip(traj, ev)]
-        data.append(dict(ep, traj=traj, gw=gw, one=one, times=times, tw=[None if g is None else g["tw"] for g in gw]))
+        data.append(dict(ep, traj=traj, gw=gw, one=one, times=times, tw=[None if g is None else g["tw"] for g in gw],
+                         net=net))
     read = {id(e["store"]): e["store"] for d in data for e in d["plan"]}
     parts = [[None] * len(d["plan"]) for d in data]
     for st in sorted(read.values(), key=lambda st: float(getattr(st, "asym", 0.0))):
@@ -744,6 +752,7 @@ def _mixed(d, parts):
     for k in out:
         if k.startswith("lamN_"):
             out[k] = _mix([x[k] for x in nodes], plan)
+    out["wnet"] = np.stack(d["net"])
     return lamN, out
 
 
@@ -762,7 +771,7 @@ def _node_values(bank, seg, ev, store, geometry, groups, block, resident, n_loud
 
 def _single_out(single, n_seg, shape, bank, gd=None):
     """the arrays single=True adds to the result: ln_lambda_H, ln_lambda_L of the given shape per segment, and
-    ln_glitch_H, ln_glitch_L, wmax_H, wmax_L, rho_edges; with the glitch settings gd also ln_lambda_gH,
+    ln_glitch_H, ln_glitch_L, wmax_H, wmax_L, wnet, rho_edges; with the glitch settings gd also ln_lambda_gH,
     ln_lambda_gL, ln_lambda_gHL and glitch_pi_k, glitch_window, or for model='windows' ln_B of the given shape,
     ln_c_H, ln_c_L, state_H, state_L, ln_window_H, ln_window_L and glitch_model, glitch_n_window, glitch_zone"""
     if not single:
@@ -773,6 +782,7 @@ def _single_out(single, n_seg, shape, bank, gd=None):
         out["ln_lambda_" + I] = np.full((n_seg,) + shape, -np.inf)
         out["ln_glitch_" + I] = np.full((n_seg, nm, nr), -np.inf)
         out["wmax_" + I] = np.zeros((n_seg, nm))
+    out["wnet"] = np.zeros((n_seg, nm))
     if gd is not None and gd["model"] == "windows":
         out["ln_B"] = np.full((n_seg,) + shape, -np.inf)
         for I in "HL":
@@ -799,7 +809,7 @@ def _node_keys(gd):
 
 def _segment_keys(gd):
     """the per-segment arrays copied into the result"""
-    keys = [k + I for I in "HL" for k in ("ln_glitch_", "wmax_")]
+    keys = [k + I for I in "HL" for k in ("ln_glitch_", "wmax_")] + ["wnet"]
     if gd is not None and gd["model"] == "windows":
         keys += [k + I for I in "HL" for k in ("ln_c_", "state_", "ln_window_")]
     return keys
@@ -865,7 +875,10 @@ def pe_redshift(segments, bank, store, rows=None, chunk=8, zmax=8.0, nz=1600,
     (n_segment, nm1, nz) ln Lambda_S^I through the nodes and the reduction of
     ln_lambda, ln_glitch_H, ln_glitch_L (n_segment, n_template, n_rho) ln E_I
     of the amplitude bins rho_edges (n_rho + 1,), wmax_H, wmax_L
-    (n_segment, n_template) the largest w of each template; with glitch also
+    (n_segment, n_template) the largest w of each template, wnet
+    (n_segment, n_template) the largest w_H(t + tau) + w_L(t) over every
+    arrival time and every lag of the store (gather.network_max: the largest
+    W any table read of the template can have); with glitch also
     ln_lambda_gH, ln_lambda_gL, ln_lambda_gHL (n_segment, nm1, nz) ln lambda_H,
     ln lambda_L, ln lambda_HL through the nodes and the reduction of ln_lambda,
     and the settings used, glitch_pi_k and glitch_window.  With model='windows'
@@ -994,7 +1007,7 @@ def pe_redshift_epochs(epochs, store, chunk=8, zmax=8.0, nz=1600, m1_range=(3.0,
                  rows=ep["seg"]["rows"], **ep["extra"]) for ep in eps]
 
 
-def window_evidences(segments, bank, rows=None, chunk=8, n_window=64, pi_m=None):
+def window_evidences(segments, bank, rows=None, chunk=8, n_window=64, pi_m=None, lags=None):
     """the window evidences of each segment and detector (docs/glitch_likelihood.md Sec. 4a, stage 1): the
     matched filter and single.window_evidence, no tables.
 
@@ -1007,14 +1020,15 @@ def window_evidences(segments, bank, rows=None, chunk=8, n_window=64, pi_m=None)
 
     returns dict: ln_window_H, ln_window_L (n_segment, n_window, n_rho) ln E_w[k], the same arrays as pe_redshift
     with glitch=dict(model='windows') and the same n_window and pi_m; wmax_H, wmax_L (n_segment, n_template) the
-    largest w of each template; rho_edges (n_rho + 1,); rows.  w = |z_I|^2 / u_I with the power u_I of detector I."""
+    largest w of each template; rho_edges (n_rho + 1,); rows.  w = |z_I|^2 / u_I with the power u_I of detector I.
+    With lags (the lags of the tables, store.tau_idx) also wnet (n_segment, n_template) as pe_redshift gives it."""
     seg = read_segments(segments, rows)
     nw = _window_count(n_window, bank.n_time)
     pm = _template_weights(pi_m, bank.u.size, True)
     xp = array_module(bank.device)
     lnG, ln_u = _window_columns(xp), {I: np.log(getattr(bank, "u_" + I)) for I in "HL"}
     n, nm, nr = seg["rows"].size, bank.u.size, _single.RHO_EDGES.size - 1
-    out = {}
+    out, net = {}, np.zeros((n, nm))
     for I in "HL":
         out["ln_window_" + I] = np.full((n, nw, nr), -np.inf)
         out["wmax_" + I] = np.zeros((n, nm))
@@ -1024,8 +1038,10 @@ def window_evidences(segments, bank, rows=None, chunk=8, n_window=64, pi_m=None)
             for I in "HL":
                 out["ln_window_" + I][e] = _single._host(_window_evidence(t["lq" + I], ln_u[I], lnG, nw, pm, xp))
                 out["wmax_" + I][e] = _single._host(_single._wmax(t["lq" + I], ln_u[I], xp))
+            if lags is not None:
+                net[e] = _network(t, dict(ln_u_H=ln_u["H"], ln_u_L=ln_u["L"]), lags, xp)
         del traj
-    return dict(out, rho_edges=_single.RHO_EDGES.copy(), rows=seg["rows"])
+    return dict(out, rho_edges=_single.RHO_EDGES.copy(), rows=seg["rows"], **({} if lags is None else dict(wnet=net)))
 
 
 def distance_weights(y, prior, ymin):
@@ -1099,7 +1115,7 @@ def pe_intrinsic(segments, bank, store, rows=None, prior="volume", ymin=0.1267, 
     returns dict: M, q, chi, u (n_template,), ln_lambda (n_segment, n_template),
     ln_b (n_segment,), rows; with single also ln_lambda_H, ln_lambda_L
     (n_segment, n_template) ln Lambda_S^I with the same distance weights, and
-    ln_glitch_H, ln_glitch_L, rho_edges, wmax_H, wmax_L as for pe_redshift; with
+    ln_glitch_H, ln_glitch_L, rho_edges, wmax_H, wmax_L, wnet as for pe_redshift; with
     glitch also ln_lambda_gH, ln_lambda_gL, ln_lambda_gHL (n_segment, n_template)
     with the same distance weights, glitch_pi_k and glitch_window; with
     model='windows' ln_B (n_segment, n_template) with the same distance weights

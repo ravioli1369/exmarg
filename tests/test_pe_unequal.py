@@ -319,11 +319,12 @@ def test_equal_curves_unchanged(pe_before, glitch):
             a = getattr(pe, name)(c["segs"], c["bank"], st, ymin=0.1, nodes_per_launch=1, **kw, **sel, **extra)
             b = getattr(pe_before, name)(c["segs"], c["bank"], st, ymin=0.1, nodes_per_launch=1, **kw, **sel, **extra)
             a1 = getattr(pe, name)(c["segs"], c["bank"], [st], ymin=0.1, nodes_per_launch=1, **kw, **sel, **extra)
-            assert set(a) == set(b) == set(a1)
+            assert set(a) == set(a1) and set(a) - {"wnet"} == set(b)      # wnet: added after BEFORE
             for k in a:
+                assert np.array_equal(np.asarray(a1[k]), np.asarray(a[k])), (name, k)
+            for k in b:
                 assert np.array_equal(np.asarray(a[k]), np.asarray(b[k])), (name, k)
-                assert np.array_equal(np.asarray(a1[k]), np.asarray(b[k])), (name, k)
-            n += len(a)
+            n += len(b)
     w0, w1 = pe.window_evidences(c["segs"], c["bank"]), pe_before.window_evidences(c["segs"], c["bank"])
     assert all(np.array_equal(w0[k], w1[k]) for k in w0)
     print("\nglitch %s: %d arrays bit for bit equal to the committed pe.py" % (glitch, n + len(w0)))
