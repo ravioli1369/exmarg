@@ -1153,6 +1153,90 @@ def run_gain(a):
     return 0
 
 
+def run_pairs(a):
+    """Nbar of every arm and the paired ratios between arms (any names, as runs/simstrain_<name>/zero), with block
+    jackknife errors on the segments every arm keeps (veto wmax_I <= 72 in all of them): overall, by detector-frame total
+    mass of the equal-mass merger (bins at the quartiles of the planted mergers, fixed before any fit; a bin keeps every
+    merger-free segment and the mergers of the bin) and by arrival time t_H in the segment; the unit mean of every arm
+    (merger-free segments; all segments of a noise-only arm, whose name starts with N) and of the merger-free segments
+    whose next segment holds a merger; the campaign settings of each arm; and the predictions given, beside the ratios"""
+    pf = _load_script('exmarg_plant_fit', os.path.join(HERE, 'plant_fit.py'))
+    tr = load_truth(a.root)
+    where = {int(g): i for i, g in enumerate(tr['gps'])}
+    n, present = tr['gps'].size, tr['present']
+    arms = [x for x in a.arms.split(',') if x]
+    pairs = [tuple(p.split('/')) for p in a.pairs.split(',') if p]
+    pred = dict(kv.split('=') for kv in a.predict.split(',') if kv)
+    full, res = {}, dict(arms={}, predictions={k: float(v) for k, v in pred.items()})
+    for arm in arms:
+        cfg, _, dd, runs, _ = pf.load(os.path.join(a.runs, 'simstrain_' + arm, 'zero'))
+        idx = np.array([where[int(round(g))] for g in dd['gps']])
+        lnL, keep = np.full(n, np.nan), np.zeros(n, bool)
+        lnL[idx] = dd['ln_lambda_bar']
+        keep[idx] = (dd['wmax_H'] <= pf.VETO_W) & (dd['wmax_L'] <= pf.VETO_W)
+        full[arm] = (lnL, keep)
+        own = np.flatnonzero(keep)
+        r = pf.nbar_fit(lnL[own])
+        noise_only = arm.startswith('N')
+        truth = 0.0 if noise_only else float(present[own].mean())
+        x = np.expm1(lnL[own] if noise_only else lnL[own][~present[own]])
+        res['arms'][arm] = dict(
+            segments=int(idx.size), kept=int(own.size), nbar=r['nbar'], err=r['err']['nbar'], edge=r['edge'],
+            truth=truth, pull=(r['nbar'] - truth) / r['err']['nbar'], unit_mean=[float(x.mean()), float(
+                x.std(ddof=1) / np.sqrt(x.size)), int(x.size)], t_pe=float(np.mean([q['t_pe'] for q in runs])),
+            w_inf_max=float(np.max(dd['w_inf'])), settings={k: cfg.get(k) for k in (
+                'noise', 'signal_gain', 'segments', 'manifest_sha256', 'asym_tol', 'tables_asym', 'seed', 'zmin')},
+            asym_outside_max=int(np.max(dd['asym_outside'])) if 'asym_outside' in dd else None)
+    common = np.ones(n, bool)
+    for arm in arms:
+        common &= full[arm][1]
+    cidx = np.flatnonzero(common)
+    res['common'] = dict(n=int(cidx.size), mergers=int(present[cidx].sum()), truth=float(present[cidx].mean()))
+    used = sorted(set(x for p in pairs for x in p))
+
+    def values(ii):
+        v = {arm: pf.nbar_fit(full[arm][0][ii])['nbar'] for arm in used}
+        return np.array([v[p] / v[q] if v[q] > 0 else np.nan for p, q in pairs] + [v[x] for x in used])
+
+    names = ['%s/%s' % p for p in pairs] + ['nbar ' + x for x in used]
+
+    def block(ii):
+        est, se = jackknife(values, ii, a.blocks)
+        out = dict(n=int(ii.size), mergers=int(present[ii].sum()), truth=float(present[ii].mean()))
+        for nm, e, s in zip(names, est, se):
+            out[nm] = [float(e), float(s)]
+            if nm in pred:
+                out[nm + ' minus prediction'] = [float(e - float(pred[nm])), float(s), float((e - float(pred[nm])) / s)
+                                                 if s > 0 else None]
+        return out
+
+    res['all'] = block(cidx)
+    mA = tr['mdet_A']
+    edges = np.concatenate([[20.0], np.quantile(mA[present], [0.25, 0.5, 0.75]), [400.0]])
+    res['mass_edges'] = edges.tolist()
+    res['by mass'] = {}
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        sel = common & (~present | ((mA >= lo) & ((mA < hi) if hi < 400 else (mA <= hi))))
+        res['by mass']['%.1f-%.1f' % (lo, hi)] = block(np.flatnonzero(sel))
+    res['by arrival'] = {}
+    for lo, hi in ((0.0, 0.5), (0.5, 1.0), (1.0, 2.0), (2.0, 4.0), (4.0, 8.0)):
+        sel = common & (~present | ((tr['t_H'] >= lo) & (tr['t_H'] < hi)))
+        res['by arrival']['%.1f-%.1f s' % (lo, hi)] = block(np.flatnonzero(sel))
+    nxt = np.zeros(n, bool)
+    nxt[:-1] = present[1:] & (tr['stretch'][1:] == tr['stretch'][:-1])
+    res['unit mean of merger-free segments'] = {}
+    for arm in arms:
+        lnL, keep = full[arm]
+        for label, sel in (('next holds a merger', keep & ~present & nxt), ('next without', keep & ~present & ~nxt)):
+            x = np.expm1(lnL[sel])
+            res['unit mean of merger-free segments']['%s, %s' % (arm, label)] = [
+                float(x.mean()), float(x.std(ddof=1) / np.sqrt(x.size)), int(x.size)]
+    with open(a.out, 'w') as fh:
+        json.dump(res, fh, indent=1, default=float)
+    print(json.dumps(res, indent=1, default=float))
+    return 0
+
+
 def run_owncheck(a):
     """the arms on own curves (strain.own_curves, as analyse.py --unequal reads them): per band, the mean power of the
     own-curve data of N and C over sig2_ref_I (1 for noise; C carries the mergers' tiny power), and of A - N against the
@@ -1251,6 +1335,14 @@ def main(argv=None):
     q.add_argument('--own', action='store_true', help='also on own curves, over strain.signal_gain of the epoch')
     q.add_argument('--spectrum', default='', help='also the ratio over the per-bin conditional gain: sigma^2 from this spectrum file (v T S / 2), or '
                         '"epochs": the mean of the hand-over curves of all epochs')
+    q = sub.add_parser('pairs')
+    q.add_argument('root')
+    q.add_argument('runs')
+    q.add_argument('out')
+    q.add_argument('--arms', required=True, help='comma-separated names of runs/simstrain_<name>/zero')
+    q.add_argument('--pairs', required=True, help='X/Y,...: Nbar_X / Nbar_Y on the segments every arm keeps')
+    q.add_argument('--predict', default='', help='X/Y=value,...: predictions written down before the runs')
+    q.add_argument('--blocks', type=int, default=64)
     q = sub.add_parser('owncheck')
     q.add_argument('root')
     q.add_argument('out')
@@ -1267,7 +1359,7 @@ def main(argv=None):
     q.add_argument('--blocks', type=int, default=64)
     a = p.parse_args(argv)
     return dict(spectrum=run_spectrum, generate=run_generate, controls=run_controls, control3=run_control3,
-                gain=run_gain, owncheck=run_owncheck, factors=run_factors)[a.cmd](a)
+                gain=run_gain, owncheck=run_owncheck, pairs=run_pairs, factors=run_factors)[a.cmd](a)
 
 
 if __name__ == '__main__':
