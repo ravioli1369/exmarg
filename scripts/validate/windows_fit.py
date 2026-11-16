@@ -321,14 +321,14 @@ def fit(folder, n_state=N_STATE, basis='bins', rho_min=RHO[0], rho_max=RHO[1], v
         if nbar > 0:
             r0 = r['fit0']
             L.append('  without mergers (nbar 0, the start of the fit): ln L %.3f; with them %.3f' % (r0['lnl'], r['lnl']))
-            L.append('    %-16s' % 'rho bin' + ''.join('%26s' % ('state %d, nbar 0 -> %g' % (s + 1, nbar))
+            L.append('    %-16s' % 'rho bin' + ''.join('%34s' % ('state %d, nbar 0 -> %g' % (s + 1, nbar))
                                                        for s in range(n_state)))
             for j in range(nb):
                 L.append('    %-16s' % (('%.2f - %.2f' % (fe[j], fe[j + 1])) if B is None else 'basis %d' % j) + ''.join(
-                    '%26s' % ('%.4f -> %.4f' % (r0['a'][s, j], r['a'][s, j])) for s in range(n_state)))
-            L.append('    %-16s' % 'f' + ''.join('%26s' % ('%.5g -> %.5g' % (r0['f'][s], r['f'][s]))
+                    '%34s' % ('%.4f -> %.4f' % (r0['a'][s, j], r['a'][s, j])) for s in range(n_state)))
+            L.append('    %-16s' % 'f' + ''.join('%34s' % ('%.5g -> %.5g' % (r0['f'][s], r['f'][s]))
                                                  for s in range(n_state)))
-            L.append('    %-16s' % 'n_window q' + ''.join('%26s' % ('%.5g -> %.5g' % (nw * r0['q'][s], nw * r['q'][s]))
+            L.append('    %-16s' % 'n_window q' + ''.join('%34s' % ('%.5g -> %.5g' % (nw * r0['q'][s], nw * r['q'][s]))
                                                           for s in range(n_state)))
         pi = np.zeros((n_state, RHO_EDGES.size - 1))
         pi[:, i0:i1] = r['pi']
