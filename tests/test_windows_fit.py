@@ -390,3 +390,34 @@ def test_windows_fit_record_and_convergence(small, tmp_path, monkeypatch, capsys
     os.remove(model_path)
     count_fits(monkeypatch, unconverged=(3,))
     assert windows_fit.main([folder, '--n-state', '3']) == 1 and not os.path.exists(model_path)
+
+
+def test_script_fits_with_one_blas_thread():
+    """windows_fit.py run as a script sets one BLAS thread before numpy is loaded, whatever the environment says (the
+    model then does not depend on the number of cores: measured on 32 cores, where the model of 32 threads differs
+    from that of one by 1e-15 to 1e-12 and one thread repeats bit for bit); imported as a module it leaves the
+    environment as it is.  Fires on: the setting removed, or placed after the import of numpy"""
+    import subprocess
+    import sys
+    names = ('OPENBLAS_NUM_THREADS', 'OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'VECLIB_MAXIMUM_THREADS')
+    script = os.path.join(ROOT, 'scripts', 'validate', 'windows_fit.py')
+    code = ('import builtins, os, runpy, sys\n'
+            'real = builtins.__import__\n'
+            'seen = []\n'
+            'def spy(name, *a, **k):\n'
+            '    if name == "numpy" and not seen:\n'
+            '        seen.append(",".join(os.environ.get(v, "unset") for v in %r))\n'
+            '    return real(name, *a, **k)\n'
+            'builtins.__import__ = spy\n'
+            'sys.argv = ["windows_fit.py", "--help"]\n'
+            'try:\n'
+            '    runpy.run_path(%r, run_name=%%r)\n'
+            'except SystemExit:\n'
+            '    pass\n'
+            'print("AT_NUMPY " + seen[0])\n' % (names, script))
+    env = dict(os.environ, **{v: '7' for v in names})
+    for run_name, want in (('__main__', '1,1,1,1'), ('windows_fit', '7,7,7,7')):
+        out = subprocess.run([sys.executable, '-c', code % run_name], env=env, capture_output=True, text=True, check=True)
+        line = [l for l in out.stdout.splitlines() if l.startswith('AT_NUMPY ')]
+        assert line == ['AT_NUMPY ' + want], (run_name, out.stdout[-300:], out.stderr[-300:])
+

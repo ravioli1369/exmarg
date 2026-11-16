@@ -35,6 +35,9 @@ zone --zone; refused for a control of the data (a time slide, time reversal, pha
 not none, zero or inj).  The report adds the law, f and n_window q of the fit without mergers next to those with them,
 and the model records nbar and the merger_population of the files (a model at N = 0 has neither entry, and is the file
 written before these options, byte for byte).  --model: where to write the model (default <folder>/glitch_model.json).
+
+Run as a script the fit uses one BLAS thread whatever the environment says (set before numpy is loaded), so that the
+model and its sha256 do not depend on the number of cores of the machine.
 """
 import argparse
 import glob
@@ -44,6 +47,14 @@ import os
 import re
 import socket
 import sys
+
+if __name__ == '__main__':
+    # as a script: one BLAS thread, set before numpy loads the library.  The fit runs its parts in parallel itself;
+    # with a threaded BLAS inside them the sums depend on the number of threads (on 32 cores the model differs from
+    # that of one thread by 1e-15 to 1e-12 and its sha256 changes; one thread repeats bit for bit, and is faster:
+    # 17 s against 46 s), so the file written would depend on the cores the machine gives the fit
+    for _v in ('OPENBLAS_NUM_THREADS', 'OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'VECLIB_MAXIMUM_THREADS'):
+        os.environ[_v] = '1'
 
 import numpy as np
 
