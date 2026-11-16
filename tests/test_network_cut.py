@@ -12,6 +12,7 @@ plant_fit.py and windows_fit.py as committed at BASE, before the network cut, im
 truth (which segments hold a loud coincidence); a two-component model with a known selection, integrated by quadrature
 (the limit of each estimator and f)."""
 
+import glob
 import importlib.util
 import json
 import math
@@ -565,3 +566,89 @@ def test_summarize_f_det_and_w_net(tmp_path, monkeypatch, capsys):
         W = plant_fit.nbar_fit(lnB[k], f)
         row = [l for l in text.splitlines() if l.startswith('pr ')][0]
         assert '%s+-%s' % (plant_fit._f(W['nbar'], '%.3g'), plant_fit._f(W['err']['nbar'], '%.2g')) in row, row
+
+
+# ------------------------------------------------------------------- the windows stage with the mergers of stage 1
+
+
+def test_wnet_window_evidences_with_population():
+    """window_evidences with lags gives the same wnet with and without a population (the merger evidence of stage 1),
+    the brute force of the unscaled data; every other array is that of the call without lags (with the population: of
+    the call with the population and without lags), bit for bit.
+    Break that fires it: wnet computed only when no population is given."""
+    import test_pe_unequal as tu
+    import test_stage1_mergers as tm
+    c = tu.make_case(0.0)
+    lags = np.asarray(tu.TAU)
+    pop = tm.tiny_population(c['bank'], tm.S_LADDER)
+    plain = pe.window_evidences(c['segs'], c['bank'], lags=lags)
+    with_pop = pe.window_evidences(c['segs'], c['bank'], lags=lags, population=pop)
+    pop_only = pe.window_evidences(c['segs'], c['bank'], population=pop)
+    assert set(with_pop) == set(pop_only) | {'wnet'} and set(plain) <= set(with_pop)
+    for k in pop_only:
+        assert np.array_equal(np.asarray(with_pop[k]), np.asarray(pop_only[k])), k
+    assert np.array_equal(plain['wnet'], with_pop['wnet'])
+    ref = np.stack([traj_wnet(c, e, lags) for e in range(3)])
+    assert np.allclose(with_pop['wnet'], ref, rtol=1e-13, atol=0)
+    print('\nwnet with and without a population: %s' % np.array2string(with_pop['wnet'], precision=3))
+
+
+def test_wnet_windows_stage_driver(tmp_path, capsys):
+    """plant.py --stage windows with a store folder (headers only, lags -2 .. 2) writes wnet next to the merger evidence:
+    per segment the largest over the templates of window_evidences(lags) of the same simulated segments; with 'none'
+    in place of the store it writes neither, and says that the network cut will lack wnet.
+    Break that fires it: the lags not passed to the windows stage."""
+    import test_stage1_drivers as td
+    store = td.header_store(str(tmp_path / 'store'))
+    argv = ['cpu', '--stage', 'windows', '--n', '2', '--batch', '2', '--nbar', '0.5', '--seed', '3', '--glitch-states',
+            '0.9:0.0001,0.1:0.001', '--gamma', '4', '--rho-min', '5', '--zmin', '0.5']
+    out_s, out_n = str(tmp_path / 'with'), str(tmp_path / 'none')
+    assert plant.main([store] + argv + ['--out', out_s]) == 0
+    assert plant.main(['none'] + argv + ['--out', out_n]) == 0
+    assert 'writes no wnet' in capsys.readouterr().out
+    name = 'win_0000000000_0000000002.npz'
+    with np.load(os.path.join(out_s, name)) as a, np.load(os.path.join(out_n, name)) as b:
+        assert {'wnet', 'ln_merger_H'} <= set(a.files) and not {'wnet', 'ln_merger_H'} & set(b.files)
+        cfg = {k: v for k, v in json.loads(str(a['meta'])).items() if k != 'run'}
+        wnet = a['wnet']
+    from exmarg.search import mass_bank
+    seg, _ = plant.simulate_batch(cfg, 0, 2, plant.Sampler(plant.population(cfg['zmin']), cfg['mdet_range']))
+    ref = pe.window_evidences(seg, mass_bank(plant.MASSES, seg, 'cpu'), lags=np.arange(-2, 3))['wnet'].max(axis=1)
+    assert np.array_equal(wnet, ref), (wnet, ref)
+    print('\nwindows stage with the store: wnet %s' % np.round(wnet, 2))
+
+
+def test_cut_windows_fit_with_mergers(tmp_path):
+    """windows_fit.fit on the toy with merger evidence of tests/test_stage1_mergers.py (2000 segments) and 25 planted
+    loud coincidences (wnet 90) and 6 segments loud in H: the fit without mergers (nbar 0) and the fit with them (nbar
+    0.05) set aside the same segments, the loud and the planted ones, and both models record w_net 84 and the same
+    set_aside_net; switched off, both keep the single-detector selection.
+    Break that fires it: the network condition applied in one of the two fits only."""
+    import test_stage1_mergers as tm
+    folder = str(tmp_path / 'toy')
+    tm.write_toy_folder(folder, True)
+    rng = np.random.default_rng(6)
+    loud_H = np.zeros(2000, bool)
+    loud_H[rng.choice(2000, 6, replace=False)] = True
+    coinc = np.zeros(2000, bool)
+    coinc[rng.choice(np.flatnonzero(~loud_H), 25, replace=False)] = True
+    for path in sorted(glob.glob(os.path.join(folder, 'win_*.npz'))):
+        with np.load(path) as z:
+            arrays = {key: z[key] for key in z.files if key != 'meta'}
+            meta = json.loads(str(z['meta']))
+        k = arrays['k']
+        arrays['wmax_H'] = np.where(loud_H[k], 100.0, arrays['wmax_H'])
+        arrays['wnet'] = np.where(coinc[k], 90.0, np.where(loud_H[k], 110.0, np.minimum(
+            arrays['wmax_H'] + arrays['wmax_L'], 83.0)))
+        plant.write_batch(path, {key: v for key, v in meta.items() if key != 'run'}, meta['run'], arrays)
+    loud = loud_H | (np.concatenate([np.load(p)['wmax_L'] for p in sorted(glob.glob(os.path.join(folder, 'win_*.npz')))])
+                     > 72)
+    fits = {nb: windows_fit.fit(folder, n_state=1, record=(1,), nbar=nb) for nb in (0.0, 0.05)}
+    for nb, r in fits.items():
+        assert np.array_equal(r['keep'], ~(loud | coinc)), nb
+        assert r['model']['settings']['w_net'] == 84.0 and r['model']['segments']['set_aside_net'] == (loud_H | coinc).sum()
+    assert fits[0.05]['model']['nbar'] == 0.05 and 'nbar' not in fits[0.0]['model']
+    for nb in (0.0, 0.05):
+        r = windows_fit.fit(folder, n_state=1, record=(1,), nbar=nb, w_net=np.inf)
+        assert np.array_equal(r['keep'], ~loud) and 'w_net' not in r['model']['settings'], nb
+    print('\n' + '\n'.join(fits[0.05]['lines'][:7]))
