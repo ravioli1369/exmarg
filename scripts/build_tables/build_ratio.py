@@ -32,22 +32,32 @@ in (beta, Delta) (search/gather.py) and after the removal of the interpolation b
 along beta and Delta (search/store.py, unbias).  A read therefore depends on raw entries up to two grid steps outside
 the cuts (W up to 1.5 wnet); need_mask is that set, and stage R answers for every entry of it.  An entry keeps its
 series value when both errors of the series are under control: the cancellation (T_abs - T <= gap, 18: error < 2e-8),
-and the truncation, which is either measured, for W <= W_SERIES = 84 (below 1e-4 at every node), or proven below tol
-(1e-6) by the bound below with the entry's own T.  Every other entry is replaced by the quadrature of the
-formula itself over the points of the lag, a sum of positive terms with no series (function repair; its own i0e on
-the GPU, since cupy's is wrong above 88 in float32 and above 713 in float64).  The search uses zcut 72 and wnet 84,
-and the files record the cuts they were repaired for (repair_zcut, repair_wnet, repair_gap, repair_tol).
+and the truncation.  The truncation of an entry is under control when the bound below proves it below tol (1e-6) with
+the entry's own T, or, for the entries up to the network cut (W <= wnet), by the column rule: at fixed lag, phi and
+Delta the lag sum is a power series in e^beta with coefficients >= 0 (sum_p w_p e^{-D_p} y_p^{2n} / (n!)^2), so the
+share eps of the orders above 120 grows with beta (d ln eps / d beta >= 1 - eps > 0: the left-out orders are all above
+the kept ones).  One quadrature at the loudest entry of a column that the bound does not cover therefore answers for
+every quieter one: when it agrees with the series to ctol / 2 (ctol 1e-5; the other half is for the float32 kernel,
+1e-6), the column keeps its series; otherwise that entry is replaced and the next quieter one is tried (function
+column_test).  Every other entry is replaced by the quadrature of the formula itself over the points of the lag, a sum
+of positive terms with no series (function repair; its own i0e on the GPU, since cupy's is wrong above 88 in float32
+and above 713 in float64).  The search uses zcut 72 and wnet 84, and the files record what they were repaired for
+(repair_zcut, repair_wnet, repair_gap, repair_tol, repair_ctol; repair_ctol 0 or absent: no column rule, the series
+kept up to wnet as it is: the first stores of 2026-11-16, whose truncation there had been measured on a sample, below
+1e-4; the evaluation of every entry with 82 < W <= 84 of the last node then found 4.5e-4 at the opposite phase).
 Truncation at n = 120: at every sky point a|X|^2 <= x W (Cauchy-Schwarz), x = s_H |R_H|^2 + s_L |R_L|^2 <= s_H + s_L,
 so the lag sum loses at most omega_lag sup_{x <= s_H + s_L} e^{-x} sum_{n > 120} (x W)^n / (n!)^2 (absolute; in ln,
 divided by e^T; omega_lag the sky weight of the lag), and each term is largest at x = min(n, s_H + s_L) (ln_tail).
-For s_H + s_L >= 121 this is e^W P(Poisson(W) > 120) / sqrt(2 pi 121).  Measured against the quadrature: below 1e-4 for
-W <= 84 at every node, nothing at sbar <= 34 for any W <= 144.
+For s_H + s_L >= 121 this is e^W P(Poisson(W) > 120) / sqrt(2 pi 121).  Measured against the quadrature: nothing at
+sbar <= 34 for any W <= 144; at the last node (sbar 4000) up to 2.1e-4 at the aligned and 4.5e-4 at the opposite phase
+for 82 < W <= 84.
 
     python scripts/build_tables/build_ratio.py <out_dir> --asym W [--nodes i j k ...] [--keep-w DIR]
            [--per-sweep 53] [--chunk 8] [--part k K] [--slices K] [--repair-zcut 72] [--repair-wnet 84]
-           [--repair-gap 18] [--repair-tol 1e-6] [--repair-dry]
-    -> <out_dir>/bd_n120_s<sbar %09.3f>.npz: the members of the published files plus asym, s_H, s_L and the cuts of
-       stage R (repair_zcut, repair_wnet, repair_gap, repair_tol; repair_zcut 0: built without stage R)
+           [--repair-gap 18] [--repair-tol 1e-6] [--repair-ctol 1e-5] [--repair-dry] [--reuse DIR]
+    -> <out_dir>/bd_n120_s<sbar %09.3f>.npz: the members of the published files plus asym, s_H, s_L and the settings
+       of stage R (repair_zcut, repair_wnet, repair_gap, repair_tol, repair_ctol; repair_zcut 0: built without
+       stage R)
        --keep-w DIR keeps V on the data lags (float64, rows (n, a, b) with b <= a) and l_n per node, and resumes
        from them.  --part k K (needs --keep-w) sweeps only the k-th of K slices of the sky and writes its V; a run
        without --part sums the K slices (the deposit keeps the global 1/npix, so they add up to the whole sky) and
@@ -55,6 +65,11 @@ W <= 84 at every node, nothing at sbar <= 34 for any W <= 144.
        sky, not the nodes, is what to split between GPUs.  --slices K (needs --keep-w) sweeps the K slices one after
        the other in one run and writes the running sum after each: a killed run resumes after the last finished slice.
        --repair-dry builds no table: per node, the number of entries stage R would replace and why.
+       --reuse DIR: a store built before from the same sweeps with the same cuts, gap and tol and no column rule.
+       The entries its stage R replaced (the cancellation, and beyond the network cut what the bound does not cover)
+       are those this build replaces before the column rule: they are copied, and only the column rule is computed.
+       The quadrature of an entry depends on nothing but the entry, so the files are those of a build without
+       --reuse, bit for bit.
 """
 import argparse
 import os
@@ -80,7 +95,6 @@ from exmarg.tables import _quad, _tau_grid, _deposit, patterns, rebin
 N_MAX, NSIDE, N_TAU = 120, 32, 257             # the settings of build_w.py
 LNRMAX2 = np.log(2.0)                           # ln max|R|^2 of w_gpu.py
 LN_FLOOR = np.log(1e-300)                       # T in the lags without sky (the minimum of the published tables)
-W_SERIES = 84.0                                 # w_H + w_L up to which the truncation at N_MAX was measured below 1e-4
 
 
 def grids(tau_f):
@@ -240,6 +254,8 @@ def lag_weights(nside=NSIDE, n_tau=N_TAU):
 # in float32 and inf or nan above 713 in float64.
 I0E_SERIES = (1.0, 1.0, 4.5, 37.5, 459.375, 7441.875, 150077.8125, 3623307.1875)
 ROWS = 1024                                     # parallel rows of the reductions of the repair
+BATCH = 32                                      # columns of the column rule evaluated in one launch
+BIG = 0.1                                       # a column-rule entry farther than this from its series goes to repair
 _KERNELS = {}
 
 
@@ -258,6 +274,15 @@ def _repair_kernels():
             'float64 base, float64 y, float64 c, float64 top', 'float64 out',
             '(double)(expf((float)(base + c * y - top)) * i0e_f((float)(c * y)))', 'a + b', 'out = a', '0',
             'repair_sum', preamble='#include <cupy/math_constants.h>\n' + pre)
+        # one pass for the column rule: y formed on the fly, the offset given (the series value, within BIG of the
+        # answer), so that neither y nor the largest term is read or written: sum_p e^{ub_p - off} i0e(arg_p)
+        term = ('__device__ double term_f(double base, complex<double> c1, complex<double> c2, complex<double> z, '
+                'double c, double off) { double cy = c * abs(c1 * z + c2); '
+                'return (double)(expf((float)(base + cy - off)) * i0e_f((float)cy)); }')
+        _KERNELS['test'] = cp.ReductionKernel(
+            'float64 base, complex128 c1, complex128 c2, complex128 z, float64 c, float64 off', 'float64 out',
+            'term_f(base, c1, c2, z, c, off)', 'a + b', 'out = a', '0', 'repair_test',
+            preamble='#include <cupy/math_constants.h>\n' + pre + '\n' + term)
     return _KERNELS
 
 
@@ -308,11 +333,12 @@ def ln_tail(W, x_max, n_max=N_MAX, w_big=3000.0):
 
 
 def flag_entries(T, V, s_H, s_L, s_ref, beta, delta, zcut, gap_max, n_max=N_MAX, nside=NSIDE, n_tau=N_TAU, xp=np,
-                 wnet=np.inf, tol=1e-6, wseries=W_SERIES):
+                 wnet=np.inf, tol=1e-6, wseries=0.0):
     """the entries of the series table T (float64, n_lag x n_phi x n_beta x n_delta) that stage R replaces: those of
     need_mask (what a read of data below the cuts zcut, wnet depends on), in the lags with sky, where the series is not
-    under control: the cancellation, T_abs - T > gap_max; or the truncation, for the entries with W > wseries (up to
-    which it was measured: W_SERIES at the order of the tables), unless the bound proves it below tol:
+    under control: the cancellation, T_abs - T > gap_max; or the truncation, for the entries with W > wseries (0: every
+    entry; with wseries = wnet the entries beyond the network cut, those up to it being left to column_test), unless
+    the bound proves it below tol:
         ln omega_lag + ln_tail(W, s_H + s_L) - T <= ln tol
     (T of the series is below the true one, the orders left out being positive).  Returns the flags and the counts
     need (entries answered for), cancellation, truncation (flagged for it alone), flagged"""
@@ -337,6 +363,29 @@ def flag_entries(T, V, s_H, s_L, s_ref, beta, delta, zcut, gap_max, n_max=N_MAX,
     return flags, counts
 
 
+def _points(l, th, ph, wl, s_H, s_L, c2p, s2p, Ap, cgx, wq, xp, rows):
+    """the points p (pixel, psi, chi) of lag l for the quadrature with no series, on the device of xp: base_p =
+    ln(w_p e^{-D_p}), c1_p = conj(R_H,p), c2_p = conj(R_L,p) (complex128).  rows (the GPU): padded to a multiple of
+    ROWS with points that add nothing (base -inf, c 0), base as (ROWS, -1) and c1, c2 flat"""
+    pix = np.nonzero(wl[l] > 0)[0]
+    R = []
+    for I in 'HL':                           # tables._responses, the psi rotation and chi dressing on the device
+        Fp0, Fx0 = (xp.asarray(v) for v in Fplus_Fcross(I, th[pix], ph[pix], np.zeros(pix.size)))
+        Fp = Fp0[:, None] * c2p[None, :] - Fx0[:, None] * s2p[None, :]
+        Fx = Fp0[:, None] * s2p[None, :] + Fx0[:, None] * c2p[None, :]
+        R.append(Ap[None, None, :] * Fp[:, :, None] + 1j * cgx[None, None, :] * Fx[:, :, None])
+    base = (xp.asarray(np.log(wl[l, pix]))[:, None, None] + xp.asarray(np.log(wq))[None, None, :]
+            - (s_H * xp.abs(R[0])**2 + s_L * xp.abs(R[1])**2)).ravel()
+    c1, c2 = xp.conj(R[0]).ravel(), xp.conj(R[1]).ravel()
+    del R
+    if rows:                                 # rows of a reduction run in parallel: 1024 rows, padded with base = -inf
+        pad = (-base.size) % ROWS
+        base = xp.concatenate([base, xp.full(pad, -np.inf)]).reshape(ROWS, -1)
+        c1 = xp.concatenate([c1, xp.zeros(pad, c1.dtype)])
+        c2 = xp.concatenate([c2, xp.zeros(pad, c2.dtype)])
+    return base, c1, c2
+
+
 def repair(T, flags, s_H, s_L, beta, delta, phi, n_max=N_MAX, nside=NSIDE, n_tau=N_TAU, xp=np):
     """T (float64, n_lag x n_phi x n_beta x n_delta) with the flagged entries (flag_entries) replaced by the quadrature
     with no series
@@ -358,22 +407,7 @@ def repair(T, flags, s_H, s_L, beta, delta, phi, n_max=N_MAX, nside=NSIDE, n_tau
     if xp is np:
         from scipy.special import i0e
     for l in np.nonzero(flags.any(axis=(1, 2, 3)))[0]:
-        pix = np.nonzero(wl[l] > 0)[0]
-        R = []
-        for I in 'HL':                       # tables._responses, the psi rotation and chi dressing on the device
-            Fp0, Fx0 = (xp.asarray(v) for v in Fplus_Fcross(I, th[pix], ph[pix], np.zeros(pix.size)))
-            Fp = Fp0[:, None] * c2p[None, :] - Fx0[:, None] * s2p[None, :]
-            Fx = Fp0[:, None] * s2p[None, :] + Fx0[:, None] * c2p[None, :]
-            R.append(Ap[None, None, :] * Fp[:, :, None] + 1j * cgx[None, None, :] * Fx[:, :, None])
-        base = (xp.asarray(np.log(wl[l, pix]))[:, None, None] + xp.asarray(np.log(wq))[None, None, :]
-                - (s_H * xp.abs(R[0])**2 + s_L * xp.abs(R[1])**2)).ravel()
-        c1, c2 = xp.conj(R[0]).ravel(), xp.conj(R[1]).ravel()
-        del R
-        if ker is not None:                  # rows of a reduction run in parallel: 1024 rows, padded with base = -inf
-            pad = (-base.size) % ROWS
-            base = xp.concatenate([base, xp.full(pad, -np.inf)]).reshape(ROWS, -1)
-            c1 = xp.concatenate([c1, xp.zeros(pad, c1.dtype)])
-            c2 = xp.concatenate([c2, xp.zeros(pad, c2.dtype)])
+        base, c1, c2 = _points(l, th, ph, wl, s_H, s_L, c2p, s2p, Ap, cgx, wq, xp, ker is not None)
         sel = np.argwhere(flags[l])
         for k, d in {(int(k), int(d)) for k, b, d in sel}:
             y = xp.abs(c1 * np.exp(delta[d] + 1j * phi[k]) + c2)
@@ -394,6 +428,95 @@ def repair(T, flags, s_H, s_L, beta, delta, phi, n_max=N_MAX, nside=NSIDE, n_tau
                 T[l, k, bs, d] = xp.stack(vals).get()
             done += bs.size
     return T, done
+
+
+def column_test(T, test, s_H, s_L, beta, delta, phi, thr, n_max=N_MAX, nside=NSIDE, n_tau=N_TAU, xp=np, batch=BATCH):
+    """the column rule of stage R on the series entries test (bool, as T: those up to the network cut that the
+    cancellation rule keeps and the truncation bound does not cover).  At fixed lag, phi and Delta the lag sum is
+    sum_n a_n e^{n beta} with a_n = sum_p w_p e^{-D_p} y_p^{2n} / (n!)^2 >= 0, y_p = |conj(R_H,p) e^{Delta + i phi} +
+    conj(R_L,p)|, and the series keeps n <= n_max; eps(beta), the share of the orders left out, has d ln eps / d beta =
+    <n>_left out - <n>_all >= (1 - eps)(<n>_left out - n_max) > 0: it grows with beta.  So in each column the entries
+    of test are taken from the loudest down: the quadrature there (one pass, offset by the series value:
+    ln sum_p e^{ub_p - T} i0e(arg_p) = -ln(1 - eps)) against thr; at or below thr the entry and every quieter one of
+    the column keep the series, above it the entry takes the quadrature and the next quieter one is tried.  An entry
+    farther than BIG from its series (the one pass is then short of digits) is redone by repair.  The entries of a
+    column that the bound covers need nothing.  Returns T, the number of entries evaluated and the number replaced"""
+    beta, delta, phi = (np.asarray(v, float) for v in (beta, delta, phi))
+    th, ph, wl = lag_weights(nside, n_tau)
+    psi, cg, wq = _quad(n_max, None, None)
+    c2p, s2p = xp.asarray(np.cos(2 * psi)), xp.asarray(np.sin(2 * psi))
+    Ap, cgx = xp.asarray(0.5 * (1 + cg**2)), xp.asarray(cg)
+    ker = None if xp is np else _repair_kernels()
+    if xp is np:
+        from scipy.special import i0e
+    n_eval = n_rep = 0
+    big = np.zeros(T.shape, bool)
+    nb = beta.size
+    for l in np.nonzero(test.any(axis=(1, 2, 3)))[0]:
+        base, c1, c2 = _points(l, th, ph, wl, s_H, s_L, c2p, s2p, Ap, cgx, wq, xp, ker is not None)
+        if ker is not None:
+            c1, c2 = c1.reshape(ROWS, -1), c2.reshape(ROWS, -1)
+        k, d = np.nonzero(test[l].any(axis=1))                    # the columns (phi, Delta) of this lag
+        col = test[l][k, :, d]                                    # (n_column, n_beta)
+        while k.size:
+            b = nb - 1 - np.argmax(col[:, ::-1], axis=1)          # the loudest entry left of each column
+            dif = np.empty(k.size)
+            for lo in range(0, k.size, batch):
+                j = slice(lo, lo + batch)
+                z, cb, off = np.exp(delta[d[j]] + 1j * phi[k[j]]), 2.0 * np.exp(beta[b[j]] / 2), T[l, k[j], b[j], d[j]]
+                if ker is None:
+                    for m in range(z.size):
+                        cy = cb[m] * np.abs(c1 * z[m] + c2)
+                        dif[lo + m] = np.log((np.exp(base + cy - off[m]) * i0e(cy)).sum())
+                else:
+                    S = ker['test'](base[None], c1[None], c2[None], xp.asarray(z)[:, None, None],
+                                    xp.asarray(cb)[:, None, None], xp.asarray(off)[:, None, None], axis=2).sum(axis=1)
+                    dif[lo:lo + z.size] = xp.log(S).get()
+            n_eval += k.size
+            fail = ~(dif <= thr)                                  # a NaN is not accepted
+            T[l, k[fail], b[fail], d[fail]] += dif[fail]
+            big[l, k[fail], b[fail], d[fail]] = ~(np.abs(dif[fail]) <= BIG)
+            n_rep += int(fail.sum())
+            k, d, b, col = k[fail], d[fail], b[fail], col[fail]
+            col &= np.arange(nb)[None, :] < b[:, None]            # the quieter entries of the columns that failed
+            more = col.any(axis=1)
+            k, d, col = k[more], d[more], col[more]
+    if big.any():
+        T, _ = repair(T, big, s_H, s_L, beta, delta, phi, n_max=n_max, nside=nside, n_tau=n_tau, xp=xp)
+    return T, n_eval, n_rep
+
+
+def reuse_entries(T, flags, T_old, flags_old):
+    """the entries that an earlier store built from the same sweeps already replaced by the quadrature (flags_old; T_old
+    its table, float32) copied into T (float64): returns the flags left to compute.  flags_old must be a subset of
+    flags (ValueError: the earlier store was built with other settings).  The quadrature of an entry depends on
+    nothing but the entry, and the copied values are exact in float64, so after the rounding to float32 the table is
+    that of a build without the earlier store, bit for bit"""
+    if flags_old.shape != flags.shape or T_old.shape != T.shape:
+        raise ValueError('the earlier store has another grid')
+    if (flags_old & ~flags).any():
+        raise ValueError('the earlier store replaced %d entries that this build keeps as the series: it was built with '
+                         'other settings' % int((flags_old & ~flags).sum()))
+    T[flags_old] = T_old[flags_old]
+    return flags & ~flags_old
+
+
+def earlier_store(path, gr, s, w, args):
+    """T (float32) of the file of an earlier store for --reuse, checked against this build: the same grids, node and
+    asymmetry, the same cuts, gap and tol of stage R, and no column rule (repair_ctol 0 or absent), so that the
+    entries it replaced are those flag_entries gives with wseries = wnet.  SystemExit naming what differs"""
+    if not os.path.exists(path):
+        raise SystemExit('--reuse: %s does not exist' % path)
+    h = np.load(path)
+    bad = [k for k in ('beta', 'delta', 'tau_idx') if not np.array_equal(h[k], gr[k])]
+    bad += [k for k, v in (('s_node', s), ('asym', w), ('repair_zcut', args.repair_zcut), ('repair_wnet', args.repair_wnet),
+                           ('repair_gap', args.repair_gap), ('repair_tol', args.repair_tol))
+            if k not in h.files or float(h[k]) != float(v)]
+    if 'repair_ctol' in h.files and float(h['repair_ctol']) != 0.0:
+        bad.append('column rule (repair_ctol %g: the entries it replaced are not given by a rule)' % float(h['repair_ctol']))
+    if bad:
+        raise SystemExit('--reuse: %s was built with another %s' % (path, ', '.join(bad)))
+    return h['T']
 
 
 def noise_mean(V_sum, keys, s_ref, w):
@@ -518,9 +641,15 @@ def main():
     ap.add_argument('--repair-gap', type=float, default=18.0,
                     help='repair where T_abs - T exceeds this (the cancellation error is ~1e-16 e^gap)')
     ap.add_argument('--repair-tol', type=float, default=1e-6,
-                    help='for w_H + w_L above %g, keep the series only where the truncation is proven below this'
-                         % W_SERIES)
+                    help='keep the series only where the truncation is proven below this')
+    ap.add_argument('--repair-ctol', type=float, default=1e-5,
+                    help='up to the network cut, where that proof fails: the column rule, the series kept when the '
+                         'quadrature at the loudest such entry of a column agrees with it to half of this (0: no '
+                         'column rule, the series kept there as it is)')
     ap.add_argument('--repair-dry', action='store_true', help='count the entries stage R would replace; write nothing')
+    ap.add_argument('--reuse', default=None, metavar='DIR',
+                    help='an earlier store of the same sweeps, cuts, gap and tol built without the column rule: the '
+                         'entries its stage R replaced are copied, and only the column rule is computed')
     args = ap.parse_args()
     import cupy as cp
     w = args.asym
@@ -585,19 +714,35 @@ def main():
             nonpos = np.zeros(gr['tau_idx'].size, np.int64)
             T = cp.asnumpy(t_from_v(Vj, s, gr['delta'], gr['beta'], gr['phi'], n_max=N_MAX, xp=cp, nonpos=nonpos,
                                     out_dtype=np.float64))
-            t2, n_rep, counts = time.time(), 0, None
+            t2, n_rep, counts, n_old, n_eval, n_col = time.time(), 0, None, 0, 0, 0
             if args.repair_zcut > 0:
-                flags, counts = flag_entries(T, Vj, s * (1 + w), s * (1 - w), s, gr['beta'], gr['delta'],
-                                             args.repair_zcut, args.repair_gap, n_max=N_MAX, nside=NSIDE, xp=cp,
-                                             wnet=args.repair_wnet, tol=args.repair_tol)
+                kw = dict(n_max=N_MAX, nside=NSIDE, xp=cp, wnet=args.repair_wnet, tol=args.repair_tol)
+                node = (T, Vj, s * (1 + w), s * (1 - w), s, gr['beta'], gr['delta'], args.repair_zcut, args.repair_gap)
+                flags, counts = flag_entries(*node, wseries=args.repair_wnet, **kw)       # replaced whatever follows
+                test = None
+                if args.repair_ctol > 0:                                                  # left to the column rule
+                    test = flag_entries(*node, wseries=0.0, **kw)[0] & ~flags
+                    counts.update(test=int(test.sum()), columns=int(test.any(axis=2).sum()))
+                if args.reuse:
+                    T_old = earlier_store(str(Path(args.reuse) / out_name(s)), gr, s, w, args)
+                    n_old = int(flags.sum())
+                    if not args.repair_dry:
+                        flags = reuse_entries(T, flags, T_old, flags.copy())
+                    del T_old
                 if args.repair_dry:
                     print('node %2d s %10.5f: stage R answers for %d entries; cancellation %d, truncation alone %d, '
-                          'to replace %d' % (i, s, counts['need'], counts['cancellation'], counts['truncation'],
-                                             counts['flagged']), flush=True)
+                          'to replace %d%s%s' % (i, s, counts['need'], counts['cancellation'], counts['truncation'],
+                                                 counts['flagged'], ' (all in the earlier store)' if args.reuse else '',
+                                                 '' if test is None else '; column rule: %d entries in %d columns'
+                                                 % (counts['test'], counts['columns'])), flush=True)
                     continue
                 T, n_rep = repair(T, flags, s * (1 + w), s * (1 - w), gr['beta'], gr['delta'], gr['phi'], n_max=N_MAX,
                                   nside=NSIDE, xp=cp)
                 del flags
+                if test is not None:
+                    T, n_eval, n_col = column_test(T, test, s * (1 + w), s * (1 - w), gr['beta'], gr['delta'],
+                                                   gr['phi'], args.repair_ctol / 2, n_max=N_MAX, nside=NSIDE, xp=cp)
+                    del test
             elif args.repair_dry:
                 raise SystemExit('--repair-dry needs --repair-zcut > 0')
             T = T.astype(np.float32)
@@ -611,7 +756,8 @@ def main():
                      asym=float(w), s_H=float(s * (1 + w)), s_L=float(s * (1 - w)),
                      repair_zcut=float(args.repair_zcut), repair_wnet=float(args.repair_wnet) if done else 0.0,
                      repair_gap=float(args.repair_gap) if done else np.inf,
-                     repair_tol=float(args.repair_tol) if done else np.inf)
+                     repair_tol=float(args.repair_tol) if done else np.inf,
+                     repair_ctol=float(args.repair_ctol) if done else 0.0)
             os.replace(tmp, path)
             del T
             cp.get_default_memory_pool().free_all_blocks()
@@ -619,8 +765,11 @@ def main():
             print('node %2d s %10.5f: T %.0f s (repair of %d entries %.0f s%s), noise mean of the truncated series '
                   '%.15f (deficit %.3e), G_n <= 0 everywhere in lags %s, at %d other points -> %s'
                   % (i, s, time.time() - t1, n_rep, time.time() - t2,
-                     '' if counts is None else '; of %d answered for, cancellation %d, truncation alone %d'
-                     % (counts['need'], counts['cancellation'], counts['truncation']), E, 1.0 - E,
+                     '' if counts is None else '; of %d answered for, cancellation %d, truncation alone %d%s%s'
+                     % (counts['need'], counts['cancellation'], counts['truncation'],
+                        '; %d other entries copied from the earlier store' % n_old if args.reuse else '',
+                        '' if 'test' not in counts else '; column rule: %d entries in %d columns, %d evaluated, %d '
+                        'replaced' % (counts['test'], counts['columns'], n_eval, n_col)), E, 1.0 - E,
                      [int(v) for v in gr['tau_idx'][full]], int(nonpos[~full].sum()), path.name), flush=True)
         del V
     print('done', flush=True)

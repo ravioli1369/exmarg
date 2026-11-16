@@ -488,7 +488,93 @@ def test_repair_outside_the_network_cut():
         assert e_series > 1e-2, 'sbar %g: the truncation must show before the repair (%.2e)' % (sbar, e_series)
         assert counts['truncation'] > 0
     assert n_keep > 5, 'at sbar 0.35 the bound must prove some entries above the cut (%d sampled)' % n_keep
-    assert br.W_SERIES == 84.0, 'the level up to which the truncation of the tables was measured'
+
+
+def column_toy(sbar=6.0, w=-0.45, n_max=12, zcut=8.0, wnet=10.0, tol=1e-6):
+    """the toy of check_layer for the column rule: the series table, the entries stage R replaces before the rule
+    (must: cancellation, and beyond the network cut what the bound does not cover) and those left to the rule (test:
+    up to the cut, not covered by the bound), with the grids"""
+    tau, keys, V = stage_w(n_max, np.array([6.0, 0.35]), np.array([-0.45, 0.3]))
+    j = [6.0, 0.35].index(sbar)
+    gr = br.grids(tau)
+    beta, delta, phi = gr['beta'][::6], gr['delta'][::9], gr['phi'][::12]
+    s_H, s_L = sbar * (1 + w), sbar * (1 - w)
+    T = br.t_from_v(V[j], sbar, delta, beta, phi, n_max=n_max, out_dtype=np.float64)
+    kw = dict(n_max=n_max, nside=NSIDE, wnet=wnet, tol=tol)
+    must = br.flag_entries(T, V[j], s_H, s_L, sbar, beta, delta, zcut, 18.0, wseries=wnet, **kw)[0]
+    test = br.flag_entries(T, V[j], s_H, s_L, sbar, beta, delta, zcut, 18.0, wseries=0.0, **kw)[0] & ~must
+    return dict(T=T, must=must, test=test, beta=beta, delta=delta, phi=phi, s_H=s_H, s_L=s_L, sbar=sbar, w=w, gr=gr,
+                n_max=n_max, zcut=zcut, wnet=wnet)
+
+
+def test_column_rule_below_the_network_cut(monkeypatch):
+    """up to the network cut the truncation of the series is settled column by column (lag, phi, Delta), at an order
+    (12) where it shows there, with ctol 1e-4.  (1) column_test: fewer entries are evaluated than the rule is asked
+    about (most columns are accepted at their loudest entry), some are replaced, nothing else changes; against
+    lnlam_direct the replaced entries were wrong by more than ctol / 2 and are right to 1e-6, and the entries that
+    kept the series, most of them never evaluated, are right to ctol / 2.  (2) The lemma on numbers: along beta in a
+    column, T_quad - T_series = -ln(1 - eps) never falls, to the rounding of the series (every entry of 60 columns
+    by repair, 40 of them columns where an entry was replaced: there it grows by more than 100).  (3) --reuse:
+    copying what the store without the rule had replaced and running the rule gives the table built in one go, bit
+    for bit in float32; an earlier store that replaced entries the build keeps is refused.  Fires on: the columns
+    taken from the quietest entry up, a column accepted whatever the quadrature says, the offset left out of the
+    quadrature, a reuse that does not copy.  (4) An entry farther than BIG from its series is redone by repair: the
+    same table"""
+    t = column_toy()
+    T, must, test, beta, delta, phi = (t[k] for k in ('T', 'must', 'test', 'beta', 'delta', 'phi'))
+    kw = dict(n_max=t['n_max'], nside=NSIDE)
+    assert must.sum() > 0 and test.sum() > 1000 and not (must & test).any()
+    need, W = br.need_mask(beta, delta, t['s_H'], t['s_L'], t['zcut'], t['wnet'])
+    assert not test[:, :, W > t['wnet']].any() and not test[:, :, ~need].any()
+    rng = np.random.default_rng(8)
+    th, ph, _, lagw = delay_weights(tau_lag(t['gr']))
+
+    def ref(l, k, b, d):
+        return lnlam_direct(t['sbar'], t['w'], t['n_max'], lagw[l], th, ph, np.exp(delta[d]), 1.0, phi[k], np.exp(beta[b]))
+    # (1) the rule
+    ctol = 1e-4
+    Tm = br.repair(T.copy(), must, t['s_H'], t['s_L'], beta, delta, phi, **kw)[0]
+    Tc, n_eval, n_rep = br.column_test(Tm.copy(), test, t['s_H'], t['s_L'], beta, delta, phi, ctol / 2, **kw)
+    n_col = int(test.any(axis=2).sum())
+    changed = Tc != Tm
+    print('column rule: %d entries in %d columns, %d evaluated, %d replaced' % (int(test.sum()), n_col, n_eval, n_rep))
+    assert 50 < n_rep < n_eval < 0.7 * int(test.sum()) and n_eval - n_rep > 0.9 * n_col
+    assert int(changed.sum()) == n_rep and not changed[~test].any()
+    rep = np.argwhere(changed)
+    for l, k, b, d in rep[rng.choice(len(rep), 20, replace=False)]:
+        r = ref(l, k, b, d)
+        assert r - Tm[l, k, b, d] > ctol / 2 - 1e-7 and abs(Tc[l, k, b, d] - r) < 1e-6, (l, k, b, d)
+    kept = np.argwhere(test & ~changed)
+    for l, k, b, d in kept[rng.choice(len(kept), 40, replace=False)]:
+        assert abs(Tc[l, k, b, d] - ref(l, k, b, d)) < ctol / 2 + 1e-7, (l, k, b, d)
+    # (2) the share of the orders left out grows with beta in every column
+    hit = np.argwhere(changed.any(axis=2))
+    rest = np.argwhere(test.any(axis=2) & ~changed.any(axis=2))
+    pick = np.concatenate([hit[rng.choice(len(hit), 40, replace=False)], rest[rng.choice(len(rest), 20, replace=False)]])
+    clean = (need & (W <= t['wnet']))[None, None] & ~must        # every entry of a column the lemma speaks of
+    f = np.zeros(T.shape, bool)
+    for l, k, d in pick:
+        f[l, k, :, d] = clean[l, k, :, d]
+    Tq = br.repair(T.copy(), f, t['s_H'], t['s_L'], beta, delta, phi, **kw)[0]
+    for n, (l, k, d) in enumerate(pick):
+        b = np.nonzero(clean[l, k, :, d])[0]
+        eps = (Tq - T)[l, k, b, d]
+        # (the series carries the rounding of its cancellation, below 2.5e-8 for the entries kept: gap <= 18)
+        assert eps.min() > -1e-7 and np.all(np.diff(eps) > -1e-7), (l, k, d, eps)
+        assert n >= 40 or (b.size >= 2 and eps[-1] > 100 * max(abs(eps[0]), 1e-9)), (l, k, d, eps)
+    # (3) reuse of the store built without the rule
+    T2 = T.copy()
+    todo = br.reuse_entries(T2, must, Tm.astype(np.float32), must.copy())
+    assert not todo.any()
+    T2 = br.column_test(T2, test, t['s_H'], t['s_L'], beta, delta, phi, ctol / 2, **kw)[0]
+    assert np.array_equal(T2.astype(np.float32), Tc.astype(np.float32))
+    with pytest.raises(ValueError, match='other settings'):
+        br.reuse_entries(T.copy(), must & ~test, Tm.astype(np.float32), must | test)
+    # an entry far from its series is redone by repair: the same table (the two quadratures agree in float64)
+    assert ((Tc - Tm)[changed] > 1e-3).sum() > 0
+    monkeypatch.setattr(br, 'BIG', 1e-3)
+    T3 = br.column_test(Tm.copy(), test, t['s_H'], t['s_L'], beta, delta, phi, ctol / 2, **kw)[0]
+    assert np.array_equal(T3 != Tm, changed) and np.abs(T3 - Tc).max() < 1e-9
 
 
 def _real_cupy():
@@ -518,3 +604,17 @@ def test_repair_on_the_gpu():
     assert nc == ng == counts['flagged'] > 0
     worst = np.abs(Tg - Tc).max()
     assert worst < 1e-6, 'GPU repair differs from the numpy path by %.2e' % worst
+    # the column rule: the one-pass kernel against the numpy path (a column decided the other way within the float32
+    # error of the kernel is allowed for one entry in fifty; where the two decide alike the tables agree to 1e-6)
+    t = column_toy()
+    kw = dict(n_max=t['n_max'], nside=NSIDE)
+    args = (t['test'], t['s_H'], t['s_L'], t['beta'], t['delta'], t['phi'], 5e-5)
+    Tm = br.repair(t['T'].copy(), t['must'], *args[1:6], **kw)[0]
+    Tc, ec, rc = br.column_test(Tm.copy(), *args, **kw)
+    Tg, eg, rg = br.column_test(Tm.copy(), *args, xp=cp, **kw)
+    alike = (Tc != Tm) == (Tg != Tm)
+    assert rc > 50 and (~alike).sum() <= 0.02 * rc + 2 and abs(eg - ec) <= 0.02 * rc + 2, (ec, eg, rc, rg)
+    worst = np.abs(Tg - Tc)[alike].max()
+    assert worst < 1e-6, 'GPU column rule differs from the numpy path by %.2e' % worst
+    Tb = br.column_test(Tm.copy(), *args, xp=cp, batch=5, **kw)[0]
+    assert np.array_equal(Tb, Tg), 'the result of the column rule depends on the batch'

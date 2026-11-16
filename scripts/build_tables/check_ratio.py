@@ -3,8 +3,10 @@ that shares nothing with the builder but the definition of the table (exmarg.det
 exmarg.tables._quad and the grids of the store files):
 
   files     every bd_*.npz of the store: members and shapes as the published file of the same name (plus asym, s_H,
-            s_L and the cuts of stage R: repair_zcut, repair_wnet, repair_gap, repair_tol, which must be those given
-            with --zcut and --wnet), beta, delta, tau_idx, lnq equal to it, alpha to 1e-15, s_H = s_node (1 + asym),
+            s_L and the settings of stage R: repair_zcut, repair_wnet, repair_gap, repair_tol, repair_ctol, of
+            which the cuts and repair_ctol must be those given with --zcut, --wnet and --ctol), beta, tau_idx
+            equal to it, delta, lnq and alpha to 1e-15 (the published files differ among themselves by one unit in
+            the last place: delta and lnq of the two lowest nodes, two entries of alpha), s_H = s_node (1 + asym),
             s_L = s_node (1 - asym), T finite;
   bessel    at random table points (tau, phi, beta, Delta) of the chosen nodes, T against the quadrature with no
             series, ln < e^{-s_H |R_H|^2 - s_L |R_L|^2} I0(2 e^{beta/2} |conj(R_H) e^{Delta + i phi} + conj(R_L)|) > in the
@@ -20,7 +22,8 @@ exmarg.tables._quad and the grids of the store files):
             truncated series, to compare with the value build_ratio.py prints from the diagonal of W.
 
     python scripts/build_tables/check_ratio.py <store_dir> --published DIR [--nodes i j ...] [--points 256]
-           [--vmax 60] [--seed 0] [--workers 8] [--compare DIR ...] [--reach] [--zcut 72] [--wnet 84] [--noise]
+           [--vmax 60] [--seed 0] [--workers 8] [--compare DIR ...] [--reach] [--zcut 72] [--wnet 84] [--ctol 1e-5]
+           [--noise]
            [--dump PREFIX]
 --compare evaluates other stores (e.g. the published one at w = 0) at the same points.
 """
@@ -43,12 +46,13 @@ from exmarg.tables import _quad
 
 N_MAX, NSIDE, N_TAU, T_STEP = 120, 32, 257, 1.0 / 4096
 MEMBERS = ('T', 'beta', 'delta', 'tau_idx', 'lnq', 'alpha', 's_node', 'u_node', 'n_max', 'nphif', 'norm')
-REPAIR = ('repair_zcut', 'repair_wnet', 'repair_gap', 'repair_tol')
+REPAIR = ('repair_zcut', 'repair_wnet', 'repair_gap', 'repair_tol', 'repair_ctol')
 
 
-def check_files(store, published, zcut, wnet):
+def check_files(store, published, zcut, wnet, ctol=1e-5):
     """members, shapes and grids of every file against the published file of the same name; T finite; the cuts of
-    stage R recorded in the file equal to zcut, wnet"""
+    stage R recorded in the file equal to zcut, wnet, and its repair_ctol (the tolerance of the column rule; 0: the
+    series kept up to the network cut without it) equal to ctol"""
     files = sorted(glob.glob(os.path.join(store, 'bd_*.npz')))
     bad = []
     for f in files:
@@ -58,15 +62,19 @@ def check_files(store, published, zcut, wnet):
             continue
         if float(h['repair_zcut']) != zcut or float(h['repair_wnet']) != wnet:
             bad.append((f, 'repaired for zcut %g, wnet %g' % (float(h['repair_zcut']), float(h['repair_wnet']))))
+        if float(h['repair_ctol']) != ctol:
+            bad.append((f, 'column rule at %g' % float(h['repair_ctol'])))
         for k in MEMBERS:
             if h[k].shape != p[k].shape or h[k].dtype != p[k].dtype:
                 bad.append((f, '%s: %s %s, published %s %s' % (k, h[k].shape, h[k].dtype, p[k].shape, p[k].dtype)))
-        for k in ('beta', 'delta', 'tau_idx', 'lnq', 'n_max', 'nphif', 'norm'):
+        for k in ('beta', 'tau_idx', 'n_max', 'nphif', 'norm'):
             if not np.array_equal(h[k], p[k]):
                 bad.append((f, '%s differs from the published file' % k))
-        # alpha: the published files themselves differ by 1 ulp in two entries (np.geomspace of two numpy versions)
-        if not np.allclose(h['alpha'], p['alpha'], rtol=1e-15, atol=0):
-            bad.append((f, 'alpha differs from the published file by more than 1e-15'))
+        # the published files themselves differ by 1 ulp: alpha in two entries (np.geomspace of two numpy versions),
+        # delta and lnq of the nodes 0 and 1 against every other node (4.4e-16); the builder writes one grid
+        for k in ('alpha', 'delta', 'lnq'):
+            if not np.allclose(h[k], p[k], rtol=1e-15, atol=1e-15):
+                bad.append((f, '%s differs from the published file by more than 1e-15' % k))
         s, w = float(h['s_node']), float(h['asym'])
         if not (abs(s - float(p['s_node'])) <= 1e-12 * s and float(h['s_H']) == s * (1 + w)
                 and float(h['s_L']) == s * (1 - w) and float(h['u_node']) == s):
@@ -209,9 +217,11 @@ def main():
                                                          'depends on, at any v')
     ap.add_argument('--zcut', type=float, default=72.0, help='the single-detector loudness cut on |z|^2 / u')
     ap.add_argument('--wnet', type=float, default=84.0, help='the network loudness cut on w_H + w_L')
+    ap.add_argument('--ctol', type=float, default=1e-5,
+                    help='the repair_ctol the files must record (the tolerance of the column rule of stage R)')
     args = ap.parse_args()
     if not os.path.samefile(args.store, args.published):
-        files, bad = check_files(args.store, args.published, args.zcut, args.wnet)
+        files, bad = check_files(args.store, args.published, args.zcut, args.wnet, args.ctol)
         print('%s: %d files, %d problems' % (args.store, len(files), len(bad)), flush=True)
         for f, why in bad:
             print('  %s: %s' % (os.path.basename(f), why))
