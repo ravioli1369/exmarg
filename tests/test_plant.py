@@ -1130,3 +1130,28 @@ def test_unequal_driver(tmp_path, capsys, monkeypatch):
     seg, _ = plant.simulate_batch(config('--nbar', '0', '--asym', '-0.45'), 0, 2, plant.Sampler(plant.population()))
     plant.make_analysis(['a', 'b'], 'cpu', zmin=1.0, asym_tol=0.05)(seg)(seg, 17, True)
     assert seen[0][0] == ['a', 'b'] and seen[0][1]['zmin'] == 1.0 and seen[0][1]['asym_tol'] == 0.05
+
+
+def test_tables_cuts_are_recorded_and_enforced(tmp_path):
+    """plant.store_settings records tables_cuts, the smallest loudness cuts the stores are answered for, when they
+    record them (none: no entry; some and not others: SystemExit); plant_fit.check_table_cuts lets a selection inside
+    them pass and stops one beyond them (a louder veto, a looser or absent network cut); report stops too"""
+    from test_store import write_store
+    a = write_store(str(tmp_path / 'a'), asym=0.0, cuts=(72.0, 84.0))
+    b = write_store(str(tmp_path / 'b'), asym=-0.3, cuts=(60.0, 90.0))
+    c = write_store(str(tmp_path / 'c'), asym=-0.6)
+
+    def settings(store):
+        return plant.store_settings(plant.parser().parse_args([store, 'cpu', '--nbar', '0', '--n', '1', '--out', 'x']))
+    assert settings(a)['tables_cuts'] == [72.0, 84.0]
+    assert settings(a + ',' + b)['tables_cuts'] == [60.0, 84.0]
+    assert 'tables_cuts' not in settings(c) and 'tables_cuts' not in settings('nowhere')
+    with pytest.raises(SystemExit, match='some record the loudness cuts'):
+        settings(a + ',' + c)
+    cfg = dict(tables_cuts=[72.0, 84.0])
+    plant_fit.check_table_cuts(cfg, 72.0, 84.0)
+    plant_fit.check_table_cuts(cfg, 50.0, 60.0)
+    plant_fit.check_table_cuts({}, 98.0, None)
+    for veto_w, w_net in ((98.0, 84.0), (72.0, 90.0), (72.0, None), (72.0, np.inf)):
+        with pytest.raises(SystemExit, match='not examined'):
+            plant_fit.check_table_cuts(cfg, veto_w, w_net)

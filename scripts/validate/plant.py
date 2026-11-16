@@ -553,13 +553,21 @@ def asym_tol(args):
 def store_settings(args):
     """the campaign entries of the tables of a merger-stage run: tables_asym, the sorted asym of the store folders, when
     several are given (one store must have the asym of every template, which the noise settings fix); asym_tol when it
-    is passed (asym_tol()); zmin_cut when pe_redshift reads only the nodes of z >= zmin"""
+    is passed (asym_tol()); zmin_cut when pe_redshift reads only the nodes of z >= zmin; tables_cuts, [zcut, wnet],
+    the loudness cuts up to which the tables are answered for (store.read_header: cuts; the smallest over the
+    stores), when the stores record them: plant_fit.check_table_cuts refuses a selection beyond them"""
     if getattr(args, 'stage', 'merger') == 'windows':
         return {}
     out = {}
     dirs = [d for d in args.store.split(',') if d]
     if len(dirs) > 1:
         out['tables_asym'] = sorted(float(read_header(d)['asym']) for d in dirs)
+    cuts = [read_header(d)['cuts'] for d in dirs if glob.glob(os.path.join(d, 'bd_*.npz')) or is_cache(d)]
+    if any(c is not None for c in cuts):
+        if any(c is None for c in cuts):
+            raise SystemExit('of the stores %s some record the loudness cuts they were repaired for and some do not'
+                             % ', '.join(dirs))
+        out['tables_cuts'] = [min(c[0] for c in cuts), min(c[1] for c in cuts)]
     if asym_tol(args) is not None:
         out['asym_tol'] = asym_tol(args)
     if getattr(args, 'zmin_cut', False):

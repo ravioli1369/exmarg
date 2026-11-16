@@ -40,14 +40,18 @@ def test_unbiased_interpolation_has_no_mean_error():
 # ----------------------------------------------------------------------------------------------- loading
 
 
-def write_store(folder, s_nodes=(0.5, 2.0, 8.0), asym=None, seed=0):
+def write_store(folder, s_nodes=(0.5, 2.0, 8.0), asym=None, seed=0, cuts=None):
     """a store folder of bd_*.npz files with the members load_redshift_store reads (asym only when given: a list, one
-    per file, or one value)"""
+    per file, or one value; cuts, (zcut, wnet) or a list of them, one per file: the members repair_zcut, repair_wnet
+    of build_ratio.py)"""
     import os
     os.makedirs(folder, exist_ok=True)
     rng = np.random.default_rng(seed)
     for i, s in enumerate(s_nodes):
         extra = {} if asym is None else dict(asym=np.array(asym[i] if np.ndim(asym) else asym))
+        if cuts is not None:
+            zc, wn = cuts[i] if np.ndim(cuts) == 2 else cuts
+            extra.update(repair_zcut=np.array(float(zc)), repair_wnet=np.array(float(wn)))
         np.savez(os.path.join(folder, 'bd_s%07.3f_n120_x.npz' % s), T=rng.normal(size=(3, 49, 6, 5)).astype(np.float32),
                  beta=np.linspace(-2.0, 3.0, 6) + np.log(s), delta=np.linspace(-1.0, 1.0, 5), tau_idx=np.arange(-1, 2),
                  alpha=np.geomspace(1e-3 * (i + 1), 1e3, 7), s_node=np.array(s), **extra)
@@ -100,3 +104,19 @@ def test_store_asym_nodes_and_cache(tmp_path):
     write_store(src, s_nodes=(32.0,))                                  # a node added to the source
     with pytest.raises(ValueError, match='written from other files'):
         load_redshift_store(cache, unbiased=True, mmap=True)
+
+
+def test_store_records_the_cuts_it_was_repaired_for(tmp_path):
+    """read_header: cuts None for files without the members (the published store) and for a store built without stage R
+    (repair_zcut 0), (zcut, wnet) otherwise, a ValueError when the files disagree; the unbiased cache carries them"""
+    from exmarg.search.store import read_header, write_unbiased_cache
+    assert read_header(write_store(str(tmp_path / 'plain')))['cuts'] is None
+    assert read_header(write_store(str(tmp_path / 'norepair'), cuts=(0.0, 0.0)))['cuts'] is None
+    src = write_store(str(tmp_path / 'r'), cuts=(72.0, 84.0))
+    assert read_header(src)['cuts'] == (72.0, 84.0)
+    assert read_header(write_store(str(tmp_path / 'nonet'), cuts=(72.0, np.inf)))['cuts'] == (72.0, np.inf)
+    with pytest.raises(ValueError, match='different loudness cuts'):
+        read_header(write_store(str(tmp_path / 'mixed'), cuts=[(72.0, 84.0), (72.0, 84.0), (50.0, 84.0)]))
+    assert read_header(write_unbiased_cache(src, str(tmp_path / 'cache'), readers=2))['cuts'] == (72.0, 84.0)
+    plain = write_unbiased_cache(str(tmp_path / 'plain'), str(tmp_path / 'cache_plain'), readers=2)
+    assert read_header(plain)['cuts'] is None

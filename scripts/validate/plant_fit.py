@@ -239,6 +239,22 @@ def veto(d, veto_w=VETO_W, w_net=W_NET):
                 note=note)
 
 
+def check_table_cuts(cfg, veto_w, w_net):
+    """SystemExit when the selection keeps segments that the tables of the campaign are not answered for: the
+    campaign entry tables_cuts = [zcut, wnet] (plant.store_settings) says that the entries read by data with
+    wmax_I < zcut and wnet <= wnet were checked or replaced when the tables were built (build_ratio.py, stage R);
+    louder data read entries that nobody examined.  w_net None or inf: no network cut.  Campaigns without the entry
+    (the published tables): nothing is checked"""
+    cuts = cfg.get('tables_cuts')
+    if cuts is None:
+        return
+    net = np.inf if w_net is None else float(w_net)
+    if veto_w > cuts[0] or net > cuts[1]:
+        raise SystemExit('the tables of this campaign are answered for up to wmax_I < %g and wnet <= %g: the selection '
+                         'veto_w %g, w_net %g keeps louder segments, whose table entries were not examined'
+                         % (cuts[0], cuts[1], veto_w, net))
+
+
 def heavy_tail(ln_x):
     """the number of segments that carry half of sum |x - 1| (x = exp(ln_x)), the largest first"""
     dev = np.sort(np.abs(_excess(ln_x)))[::-1]
@@ -578,6 +594,7 @@ def report(directory, rho_min_fit=False, veto_w=VETO_W, w_inf_max=W_INF_MAX, rho
     sel_ = veto(d, veto_w, w_net)
     if not sel_['applied'] and w_net is not None and w_net != np.inf:
         sel_['note'] += ' (%d of %d files lack it)' % (_lacking(directory, 'wnet'), len(runs))
+    check_table_cuts(cfg, veto_w, w_net if sel_['applied'] else None)
     loud = {I: sel_['loud_' + I] for I in 'HL'}
     keep = sel_['keep'].copy()
     noisy = {I: np.zeros(n, bool) for I in 'HL'}

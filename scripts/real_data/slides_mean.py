@@ -83,6 +83,7 @@ def read_slide(out, variant, veto_w, w_net=None):
     order = np.argsort(d['k'], kind='stable')
     d = {key: v[order] for key, v in d.items()}
     v = plant_fit.veto(d, veto_w, w_net)
+    plant_fit.check_table_cuts(meta, veto_w, w_net if v['applied'] else None)
     keep = v['keep']
     lack = sum('wnet' not in p for p in parts)
     net = 'on' if v['applied'] else v['note'] + (' (%d of %d files lack it)' % (lack, len(parts)) if lack else '')

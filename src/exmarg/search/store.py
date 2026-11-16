@@ -151,8 +151,11 @@ def _sources(store_dir):
 
 def read_header(store_dir):
     """the small arrays of a store folder or unbiased cache, nodes sorted by s: dict s, alpha_lo, alpha_hi, beta,
-    delta (lists), tau_idx, n_max, asym, files (the table of each node).  The files of a store must agree on asym
-    (absent: 0); a cache whose source folder still exists must have been written from its present files"""
+    delta (lists), tau_idx, n_max, asym, cuts, files (the table of each node).  The files of a store must agree on asym
+    (absent: 0) and on cuts; a cache whose source folder still exists must have been written from its present files.
+    cuts: (zcut, wnet), the loudness cuts for which every entry a read depends on was checked or replaced by the
+    builder (build_ratio.py: single-detector |z|^2 / u < zcut, network w_H + w_L <= wnet), None for tables that do
+    not record them (the published store)"""
     if is_cache(store_dir):
         with open(os.path.join(store_dir, CACHE)) as fh:
             rec = json.load(fh)
@@ -163,6 +166,7 @@ def read_header(store_dir):
             return dict(s=h["s"], alpha_lo=h["alpha_lo"], alpha_hi=h["alpha_hi"], tau_idx=h["tau_idx"],
                         beta=[h["beta_%d" % k] for k in range(n)], delta=[h["delta_%d" % k] for k in range(n)],
                         n_max=int(h["n_max"]), asym=float(h["asym"]),
+                        cuts=tuple(float(v) for v in h["cuts"]) if "cuts" in h.files else None,
                         files=[os.path.join(store_dir, "T_%03d.npy" % k) for k in range(n)])
     files = glob.glob(os.path.join(store_dir, "bd_*.npz"))
     if not files:
@@ -170,15 +174,19 @@ def read_header(store_dir):
     head = []
     for f in files:
         with np.load(f) as h:
+            cuts = (float(h["repair_zcut"]), float(h["repair_wnet"])) if "repair_zcut" in h.files else None
             head.append((float(h["s_node"]), float(h["alpha"][0]), float(h["alpha"][-1]),
-                         h["beta"], h["delta"], h["tau_idx"], float(h["asym"]) if "asym" in h.files else 0.0, f))
+                         h["beta"], h["delta"], h["tau_idx"], float(h["asym"]) if "asym" in h.files else 0.0,
+                         cuts if cuts and cuts[0] > 0 else None, f))
     head.sort(key=lambda r: r[0])
-    s, alo, ahi, beta, delta, tau, asym, files = zip(*head)
+    s, alo, ahi, beta, delta, tau, asym, cuts, files = zip(*head)
     if len(set(asym)) > 1:
         raise ValueError("the files of %s have different asym: %s" % (store_dir, sorted(set(asym))))
+    if len(set(cuts)) > 1:
+        raise ValueError("the files of %s were repaired for different loudness cuts: %s" % (store_dir, set(cuts)))
     return dict(s=np.array(s), alpha_lo=np.array(alo), alpha_hi=np.array(ahi), beta=list(beta), delta=list(delta),
                 tau_idx=tau[0], n_max=int(os.path.basename(files[0]).split("_n")[1].split("_")[0]), asym=asym[0],
-                files=list(files))
+                cuts=cuts[0], files=list(files))
 
 
 def load_redshift_store(store_dir, pinned=False, readers=6, mmap=False, unbiased=False, asym=None, nodes=None):
@@ -206,7 +214,8 @@ def load_redshift_store(store_dir, pinned=False, readers=6, mmap=False, unbiased
 
 def write_unbiased_cache(store_dir, cache_dir, readers=4):
     """the unbiased tables of the store folder store_dir written once to cache_dir: T_<k>.npy (float32, node k in the
-    order of s), header.npz (s, alpha_lo, alpha_hi, tau_idx, n_max, asym, beta_<k>, delta_<k>) and, last, cache.json
+    order of s), header.npz (s, alpha_lo, alpha_hi, tau_idx, n_max, asym, cuts when the store records them, beta_<k>,
+    delta_<k>) and, last, cache.json
     (the source folder and its files with their sizes).  Nothing is done when cache_dir already holds a complete cache
     of the same files.  readers tables are unbiased at once (about 4 GB of memory each)"""
     h = read_header(store_dir)
@@ -236,6 +245,8 @@ def write_unbiased_cache(store_dir, cache_dir, readers=4):
     grids = {}
     for k in range(h["s"].size):
         grids["beta_%d" % k], grids["delta_%d" % k] = h["beta"][k], h["delta"][k]
+    if h["cuts"] is not None:
+        grids["cuts"] = np.array(h["cuts"], float)
     save(os.path.join(cache_dir, "header.npz"), lambda fh: np.savez(fh, s=h["s"], alpha_lo=h["alpha_lo"],
                                                                        alpha_hi=h["alpha_hi"], tau_idx=h["tau_idx"],
                                                                        n_max=h["n_max"], asym=h["asym"], **grids))

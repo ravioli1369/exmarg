@@ -785,6 +785,7 @@ def run_factors(a):
         idx = np.array([where[int(round(g))] for g in dd['gps']])
         w_net = pf.W_NET if a.w_net is None else a.w_net
         cut = pf.veto(dd, pf.VETO_W, w_net)
+        pf.check_table_cuts(cfg, pf.VETO_W, w_net if cut['applied'] else None)
         print('%s: network cut %s' % (arm, 'on, wnet > %g' % w_net if cut['applied'] else cut['note']), flush=True)
         data[arm] = dict(lnL=dd['ln_lambda_bar'], keep=cut['keep'],
                          idx=idx, t_pe=float(np.mean([r['t_pe'] for r in runs])), wmax_H=dd['wmax_H'],
@@ -1179,6 +1180,7 @@ def run_pairs(a):
         lnL[idx] = dd['ln_lambda_bar']
         w_net = pf.W_NET if a.w_net is None else a.w_net
         cut = pf.veto(dd, pf.VETO_W, w_net)
+        pf.check_table_cuts(cfg, pf.VETO_W, w_net if cut['applied'] else None)
         print('%s: network cut %s' % (arm, 'on, wnet > %g' % w_net if cut['applied'] else cut['note']), flush=True)
         keep[idx] = cut['keep']
         full[arm] = (lnL, keep)
