@@ -6,6 +6,7 @@ when a fit of the model written does not converge (the fits with other numbers o
     python scripts/validate/windows_fit.py runs/states [--n-state 2] [--basis bins|power] [--rho-min 4] [--rho-max 12.2]
                                            [--veto-w 72] [--zone 1]
     python scripts/validate/windows_fit.py runs/week_w/slide+0.5        # a variant of the week: the whole selection
+    python scripts/validate/windows_fit.py runs/states --nbar 0.0184 --model runs/states_pass2/glitch_model.json
 
 The files.  Every win_<first>_<end>.npz of the folder, of one campaign (the meta of every file the same, stage
 'windows'), each holding the segments first .. end - 1, together a contiguous range of k once each; for a variant of the
@@ -25,6 +26,13 @@ where not finite), lnl, n_iter, n_parameters; fits {H, L: [{n_state, lnl, n_para
 rho_edges, fitted_edges}; segments {files, first, end, total, used, set_aside, set_aside_H, set_aside_L}; campaign
 (plant.campaign_key of the files: the same for both stages of a campaign); sha256 of the rest (plant.model_sha256, the
 JSON with sorted keys and no spaces).  f, q and pi_k are the arguments of single.window_posterior.
+
+--nbar N > 0 (docs/2026-11-15_mergers_in_stage1.md): every fit with the mergers of the population at the rate N of stage
+2, mixture.fit_windows with the merger evidence ln_merger_I of the files (the windows stage run with the store) and the
+zone --zone; refused for a control of the data (a time slide, time reversal, phase randomization, segment slide: control
+not none, zero or inj).  The report adds the law, f and n_window q of the fit without mergers next to those with them,
+and the model records nbar and the merger_population of the files (a model at N = 0 has neither entry, and is the file
+written before these options, byte for byte).  --model: where to write the model (default <folder>/glitch_model.json).
 """
 import argparse
 import glob
@@ -60,6 +68,8 @@ MODEL = 'glitch_model.json'
 FILE = re.compile(r'^win_(\d+)_(\d+)\.npz$')
 SHARED = ('window_rho_edges', 'window_bin0')
 LARGE = ('ln_window_H', 'ln_window_L')
+MERGERS = ('ln_merger_H', 'ln_merger_L')
+WITH_MERGERS = ('none', 'zero', 'inj')     # controls of the data whose model may be fitted with mergers (nbar > 0)
 
 
 def load(folder):
@@ -83,7 +93,7 @@ def load(folder):
             if meta.get('stage') != 'windows' or not set(SHARED + LARGE) <= set(f.files):
                 raise SystemExit('%s: not a file of the windows stage' % path)
             same = {key: np.asarray(f[key]) for key in SHARED}
-            arrays = {key: f[key] for key in f.files if key not in ('meta',) + SHARED + LARGE}
+            arrays = {key: f[key] for key in f.files if key not in ('meta',) + SHARED + LARGE + MERGERS}
         meta.pop('run', None)
         if cfg is None:
             cfg, shared = meta, same
@@ -122,6 +132,18 @@ def evidences(paths, I, keep, cols):
         with np.load(path) as f:
             parts.append(np.asarray(f['ln_window_' + I])[:, :, cols])
     return np.concatenate(parts)[keep].astype(float)
+
+
+def merger_evidences(paths, I, keep):
+    """ln M_w (n_kept, n_window) float64 of detector I, kept segments; SystemExit when a file has none"""
+    parts = []
+    for path in paths:
+        with np.load(path) as f:
+            if 'ln_merger_' + I not in f.files:
+                raise SystemExit('%s holds no merger evidence (ln_merger_%s): run the windows stage with the store '
+                                 'folder in place of none' % (path, I))
+            parts.append(np.asarray(f['ln_merger_' + I], float))
+    return np.concatenate(parts)[keep]
 
 
 def fit_columns(edges, rho_min, rho_max):
@@ -188,14 +210,26 @@ def describe(cfg):
 
 
 def fit(folder, n_state=N_STATE, basis='bins', rho_min=RHO[0], rho_max=RHO[1], veto_w=VETO_W, zone=ZONE,
-        record=RECORD):
+        record=RECORD, nbar=0.0):
     """the fits and the model of the folder: dict lines (the report), model (the content of glitch_model.json without
-    its sha256), ok (the fits of the model written converged), fits {I: {K: fit_windows result}}, keep (n,), cols, data"""
+    its sha256), ok (the fits of the model written converged), fits {I: {K: fit_windows result}}, keep (n,), cols, data.
+    nbar > 0: every fit with the mergers of the population at that rate (fit_windows with the merger evidence of the
+    files, docs/2026-11-15_mergers_in_stage1.md), refused (SystemExit) for a control of the data (a time slide, time
+    reversal, phase randomization: their model is the one without mergers, Sec. 3) and for files without the merger
+    evidence; the model then records nbar and the merger_population of the files"""
     if basis not in ('bins', 'power'):
         raise ValueError("basis must be 'bins' or 'power'")
     if n_state < 1 or zone < 0:
         raise ValueError('need n_state >= 1 and zone >= 0')
+    if not 0.0 <= nbar <= 1.0:
+        raise ValueError('need 0 <= nbar <= 1')
     cfg, d, shared, paths = load(folder)
+    if nbar > 0 and cfg.get('control') not in WITH_MERGERS:
+        raise SystemExit('%s: the data are a control (%s): no merger has a partner in the other detector, the glitch '
+                         'model is fitted without mergers (nbar 0)' % (folder, cfg.get('control')))
+    if nbar > 0 and 'merger_population' not in cfg:
+        raise SystemExit('%s: the files hold no merger evidence (no merger_population in their campaign): run the '
+                         'windows stage with the store folder in place of none' % folder)
     edges, b0 = np.asarray(shared['window_rho_edges'], float), int(shared['window_bin0'])
     if not np.array_equal(edges, RHO_EDGES[b0:b0 + edges.size]):
         raise SystemExit('%s: window_rho_edges are not bins of single.RHO_EDGES' % folder)
@@ -217,7 +251,11 @@ def fit(folder, n_state=N_STATE, basis='bins', rho_min=RHO[0], rho_max=RHO[1], v
     R = {}
     for I in 'HL':
         E = evidences(paths, I, keep, cols)
-        R[I] = {K: mixture.fit_windows(E, n_state=K, basis=B) for K in Ks}
+        if nbar > 0:
+            lnM = merger_evidences(paths, I, keep)
+            R[I] = {K: mixture.fit_windows(E, n_state=K, basis=B, ln_M=lnM, nbar=nbar, zone=zone) for K in Ks}
+        else:
+            R[I] = {K: mixture.fit_windows(E, n_state=K, basis=B) for K in Ks}
         del E
     ok = all(R[I][n_state]['converged'] for I in 'HL')            # of the model written; the others are a record
 
@@ -230,6 +268,12 @@ def fit(folder, n_state=N_STATE, basis='bins', rho_min=RHO[0], rho_max=RHO[1], v
          'fitted bins: %d, rho %.4g to %.4g (the law is zero outside); amplitude basis: %s' % (
              cols.sum(), fe[0], fe[-1], 'a free weight per bin' if B is None else
              'the laws rho^-g, g in %s, each normalized on these bins' % ', '.join('%g' % g for g in GAMMAS))]
+    if nbar > 0:
+        mp = cfg['merger_population']
+        L.append('with mergers at nbar %.6g (fixed; docs/2026-11-15_mergers_in_stage1.md): the merger evidence of the '
+                 'files, population z >= %g, M_det %g to %g, ladder of %d nodes s %.4g to %.4g, ymin %.6g; zone %d'
+                 % (nbar, mp['zmin'], mp['mdet_range'][0], mp['mdet_range'][1], len(mp['s']), mp['s'][0], mp['s'][-1],
+                    mp['ymin'], zone))
     det, record = {}, {}
     for I in 'HL':
         L.append('\n%s: fits with %s states' % (I, ', '.join(map(str, Ks))))
@@ -274,6 +318,18 @@ def fit(folder, n_state=N_STATE, basis='bins', rho_min=RHO[0], rho_max=RHO[1], v
             for s in range(n_state):
                 L.append('    state %d, weights of rho^-g: %s' % (s + 1, ', '.join(
                     'g %g %.4f +- %.4f' % (g, r['a'][s, b], r['err_a'][s, b]) for b, g in enumerate(GAMMAS))))
+        if nbar > 0:
+            r0 = r['fit0']
+            L.append('  without mergers (nbar 0, the start of the fit): ln L %.3f; with them %.3f' % (r0['lnl'], r['lnl']))
+            L.append('    %-16s' % 'rho bin' + ''.join('%26s' % ('state %d, nbar 0 -> %g' % (s + 1, nbar))
+                                                       for s in range(n_state)))
+            for j in range(nb):
+                L.append('    %-16s' % (('%.2f - %.2f' % (fe[j], fe[j + 1])) if B is None else 'basis %d' % j) + ''.join(
+                    '%26s' % ('%.4f -> %.4f' % (r0['a'][s, j], r['a'][s, j])) for s in range(n_state)))
+            L.append('    %-16s' % 'f' + ''.join('%26s' % ('%.5g -> %.5g' % (r0['f'][s], r['f'][s]))
+                                                 for s in range(n_state)))
+            L.append('    %-16s' % 'n_window q' + ''.join('%26s' % ('%.5g -> %.5g' % (nw * r0['q'][s], nw * r['q'][s]))
+                                                          for s in range(n_state)))
         pi = np.zeros((n_state, RHO_EDGES.size - 1))
         pi[:, i0:i1] = r['pi']
         det[I] = dict(f=_list(r['f']), q=_list(r['q']), pi_k=_list(pi), a=_list(r['a']), err_f=_list(r['err_f']),
@@ -290,6 +346,8 @@ def fit(folder, n_state=N_STATE, basis='bins', rho_min=RHO[0], rho_max=RHO[1], v
                                used=int(keep.sum()), set_aside=int((~keep).sum()), set_aside_H=int(loud['H'].sum()),
                                set_aside_L=int(loud['L'].sum())),
                  campaign=plant.campaign_key(cfg))
+    if nbar > 0:
+        model.update(nbar=float(nbar), merger_population=cfg['merger_population'])
     model = json.loads(json.dumps(model))
     slow = ['%s with %d states' % (I, K) for I in 'HL' for K in Ks if not R[I][K]['converged']]
     if not ok:
@@ -326,15 +384,22 @@ def main(argv=None):
     p.add_argument('--record', default=','.join(map(str, RECORD)),
                    help='numbers of states fitted for the record besides --n-state (comma-separated; a fit of 3 '
                         'states of a week takes several minutes)')
+    p.add_argument('--nbar', type=float, default=0.0,
+                   help='the merger rate of stage 2 at which the glitch model is fitted with the mergers of the '
+                        'population (default 0: without; not for the controls of the data)')
+    p.add_argument('--model', default=None, metavar='JSON',
+                   help='where to write the model (default <folder>/%s)' % MODEL)
     a = p.parse_args(argv)
-    if not (0 <= a.rho_min < a.rho_max) or a.n_state < 1 or a.zone < 0:
-        p.error('need 0 <= rho-min < rho-max, n-state >= 1, zone >= 0')
+    if not (0 <= a.rho_min < a.rho_max) or a.n_state < 1 or a.zone < 0 or not 0 <= a.nbar <= 1:
+        p.error('need 0 <= rho-min < rho-max, n-state >= 1, zone >= 0, 0 <= nbar <= 1')
     r = fit(a.folder, a.n_state, a.basis, a.rho_min, a.rho_max, a.veto_w, a.zone,
-            tuple(int(x) for x in a.record.split(',') if x))
+            tuple(int(x) for x in a.record.split(',') if x), a.nbar)
     print('\n'.join(r['lines']), flush=True)
     if not r['ok']:
         return 1
-    path = os.path.join(a.folder, MODEL)
+    path = os.path.join(a.folder, MODEL) if a.model is None else a.model
+    if os.path.dirname(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
     old = None
     if os.path.exists(path):
         with open(path) as fh:

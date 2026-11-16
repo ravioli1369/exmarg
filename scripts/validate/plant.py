@@ -90,6 +90,16 @@ it was fitted on another campaign, campaign_key); the campaign records glitch_mo
 n_window, and the files hold ln_B_bar, ln_lambda_bar, ln_lambda_H_bar, ln_lambda_L_bar (as above), ln_c_H, ln_c_L
 (n,) and state_H, state_L (n, K) the noise ratio and posterior of the state of each detector, ln_glitch_I, wmax_I,
 w_inf, and no ln_lambda_g*.  The files of the two stages of one folder must be of the same campaign_key.
+
+Mergers in stage 1 (docs/2026-11-15_mergers_in_stage1.md).  When the store argument of the windows stage is a store
+folder (its header only is read: the ladder s of signal powers), the win files also hold ln_merger_H, ln_merger_L (n,
+n_window) float64, ln M_w of every window (pe.window_evidences with the population population(zmin) on GRID with the cut
+MDET, the ladder and ymin, --ymin allowed here), and the campaign records merger_population (population_settings: zmin,
+mdet_range, grid, ymin, s), a setting of the stage (STAGE_KEYS: the campaign_key and so the models fitted without mergers
+are those of the files without it).  windows_fit.py --nbar N > 0 fits the glitch model with these mergers and records
+nbar and merger_population in the model; the merger stage refuses such a model unless the population of its own run
+(its zmin, ymin, the ladder of its store) is that one, and records glitch_model_nbar.  A model fitted without mergers is
+taken as before.  scripts/validate/iterate.py runs the two stages in turn.
 """
 import argparse
 import glob
@@ -134,8 +144,8 @@ WINDOW_RHO = (3.0, 12.2)
 WINDOW_CHUNK = 8                            # segments filtered at once by window_evidences (its default)
 # the campaign settings of the merger stage alone, and those of the stages: campaign_key leaves them out
 MERGER_KEYS = ('grid', 'ymin', 'n_loud', 'n_random', 'glitch_settings', 'tables', 'shared_times', 'glitch_model',
-               'glitch_model_sha256', 'tables_asym', 'zmin_cut', 'asym_tol')
-STAGE_KEYS = ('stage', 'n_window', 'window_rho')
+               'glitch_model_sha256', 'tables_asym', 'zmin_cut', 'asym_tol', 'glitch_model_nbar')
+STAGE_KEYS = ('stage', 'n_window', 'window_rho', 'merger_population')
 PREFIX = dict(merger='plant', windows='win')
 
 
@@ -410,13 +420,16 @@ def window_bins(rho_min, rho_max):
 
 def reduce_windows(res, bins):
     """the per-segment arrays kept from a pe.window_evidences result: ln_window_I (n, n_window, bins.sum()) float32 on
-    the amplitude bins `bins` of RHO_EDGES, and the largest w over the templates wmax_I (n,)"""
+    the amplitude bins `bins` of RHO_EDGES, and the largest w over the templates wmax_I (n,); with the merger evidence
+    (window_evidences with a population) also ln_merger_I (n, n_window) float64"""
     if not np.array_equal(np.asarray(res['rho_edges'], float), RHO_EDGES):
         raise ValueError('window_evidences returned other amplitude bins than single.RHO_EDGES')
     out = {}
     for I in 'HL':
         out['ln_window_' + I] = np.asarray(res['ln_window_' + I])[:, :, bins].astype(np.float32)
         out['wmax_' + I] = np.asarray(res['wmax_' + I], float).max(axis=1)
+        if 'ln_merger_' + I in res:
+            out['ln_merger_' + I] = np.asarray(res['ln_merger_' + I], float)
     return out
 
 
@@ -445,17 +458,19 @@ def make_analysis(store, device, resident=False, chunk=CHUNK, ymin=None, shared_
     return factory
 
 
-def make_windows(device, n_window=N_WINDOW, chunk=WINDOW_CHUNK):
+def make_windows(device, n_window=N_WINDOW, chunk=WINDOW_CHUNK, population=None):
     """stage 1 of the window model behind the same interface: factory(segments) builds the bank on these segments and
-    returns win(segments) -> the dict of pe.window_evidences (no tables)"""
+    returns win(segments) -> the dict of pe.window_evidences (no tables), with the merger evidence of the population
+    (merger_population(settings)) when given"""
     from exmarg.search import mass_bank
     from exmarg.search import pe as pe_module
+    extra = {} if population is None else dict(population=population)
 
     def factory(seg0):
         bank = mass_bank(MASSES, seg0, device)
 
         def win(seg):
-            return pe_module.window_evidences(seg, bank, chunk=chunk, n_window=n_window)
+            return pe_module.window_evidences(seg, bank, chunk=chunk, n_window=n_window, **extra)
         return win
     return factory
 
@@ -548,16 +563,59 @@ def glitch_states(args):
 
 def stage_settings(cfg, args):
     """the campaign of the stage of args: the windows stage leaves out the settings of the merger stage (MERGER_KEYS)
-    and records stage, n_window and the range of the amplitude bins kept"""
+    and records stage, n_window and the range of the amplitude bins kept; when the store argument is a store folder,
+    also merger_population (population_settings of the campaign's zmin and ymin and the ladder of the store): the
+    windows stage then writes the merger evidence of each window"""
     if getattr(args, 'stage', 'merger') != 'windows':
         return cfg
-    cfg = {key: v for key, v in cfg.items() if key not in MERGER_KEYS}
-    return dict(cfg, stage='windows', n_window=args.n_window, window_rho=[args.window_rho_min, args.window_rho_max])
+    s = store_ladder(args.store)
+    out = {key: v for key, v in cfg.items() if key not in MERGER_KEYS}
+    out = dict(out, stage='windows', n_window=args.n_window, window_rho=[args.window_rho_min, args.window_rho_max])
+    if s is not None:
+        out['merger_population'] = population_settings(cfg['zmin'], cfg['ymin'], s)
+    return out
 
 
-def with_model(cfg, sha, n_window):
-    """the campaign of the merger stage with the window model of the file of SHA-256 sha"""
-    return dict(cfg, glitch_model='windows', glitch_model_sha256=sha, n_window=n_window)
+def is_store(path):
+    """a folder of redshift tables (bd_*.npz) or an unbiased cache"""
+    return os.path.isdir(path) and (bool(glob.glob(os.path.join(path, 'bd_*.npz'))) or is_cache(path))
+
+
+def store_ladder(store):
+    """the ladder of signal powers s of the store argument (comma-separated folders: those of the first, which the
+    mixture of pe_redshift requires to be the same in every store), or None when it names no store (e.g. 'none')"""
+    first = store.split(',')[0]
+    if not is_store(first):
+        return None
+    return np.asarray(read_header(first)['s'], float)
+
+
+def population_settings(zmin, ymin, s):
+    """the population that the merger evidence of stage 1 and the reduction of stage 2 average over, as JSON: the
+    cut of the population at zmin (population), MDET, GRID, ymin and the ladder s of the tables
+    (docs/2026-11-15_mergers_in_stage1.md, Sec. 4)"""
+    return json.loads(json.dumps(dict(zmin=float(zmin), mdet_range=list(MDET), grid=GRID, ymin=float(ymin),
+                                      s=[float(x) for x in np.asarray(s, float)])))
+
+
+def merger_population(settings):
+    """the population argument of pe.window_evidences from population_settings: the (m1, z) grid of GRID, its cell
+    weights population.population_weights on the population population(zmin) with the cut mdet_range, the ladder and
+    ymin"""
+    g = settings['grid']
+    z = np.linspace(0.02, g['zmax'], g['nz'])
+    m1 = np.geomspace(g['m1_range'][0], g['m1_range'][1], g['nm1'])
+    w = popavg.population_weights(m1, z, tuple(settings['mdet_range']), population(settings['zmin']))
+    return popavg.merger_population(m1, z, w, settings['s'], settings['ymin'])
+
+
+def with_model(cfg, sha, n_window, nbar=0.0):
+    """the campaign of the merger stage with the window model of the file of SHA-256 sha (and glitch_model_nbar, the
+    merger rate of its stage-1 fit, when that is above 0)"""
+    out = dict(cfg, glitch_model='windows', glitch_model_sha256=sha, n_window=n_window)
+    if nbar > 0:
+        out['glitch_model_nbar'] = float(nbar)
+    return out
 
 
 def campaign_key(cfg):
@@ -591,12 +649,23 @@ def read_model(path):
     return model, model['sha256']
 
 
-def glitch_model(path, cfg, n_window, ignore=()):
+def model_nbar(model):
+    """the merger rate at which the stage-1 fit of a glitch model was made (0 for a model without the entry)"""
+    return float(model.get('nbar', 0.0))
+
+
+def glitch_model(path, cfg, n_window, ignore=(), population=None):
     """the glitch settings of pe_redshift (model 'windows') from the file of windows_fit.py, for the run of campaign
     cfg: SystemExit when the file was modified, is not a window model on RHO_EDGES, has another n_window, or was fitted
-    on another campaign (campaign_key of its files against that of cfg, the keys of ignore aside).  returns (glitch
-    dict, the model's SHA-256)"""
+    on another campaign (campaign_key of its files against that of cfg, the keys of ignore aside); and for a model
+    fitted with mergers (nbar > 0) when population, the population_settings of this run, is not the population of its
+    merger evidence (merger_population of the model).  A model fitted without mergers needs no population.  returns
+    (glitch dict, the model's SHA-256)"""
     model, sha = read_model(path)
+    if model_nbar(model) > 0 and population != model.get('merger_population'):
+        theirs, mine = model.get('merger_population') or {}, population or {}
+        raise SystemExit('%s: the model was fitted with the mergers of another population (nbar %g; differs in %s)'
+                         % (path, model_nbar(model), _differ(mine, theirs) or 'the population of this run is not known'))
     if model.get('model') != 'windows' or not np.array_equal(np.asarray(model.get('rho_edges'), float), RHO_EDGES):
         raise SystemExit('%s: not a window model on the amplitude bins single.RHO_EDGES' % path)
     if model['n_window'] != n_window:
@@ -788,10 +857,11 @@ def main(argv=None, factory=None):
     windows = a.stage == 'windows'
     if a.chunk is None:
         a.chunk = WINDOW_CHUNK if windows else CHUNK
-    if windows and (a.glitch_model or a.plain or a.published_tables or a.shared_times or a.ymin is not None
-                    or a.zmin_cut or a.mmap):
-        p.error('--glitch-model, --plain, --published-tables, --shared-times, --ymin, --zmin-cut and --mmap are of the '
+    if windows and (a.glitch_model or a.plain or a.published_tables or a.shared_times or a.zmin_cut or a.mmap):
+        p.error('--glitch-model, --plain, --published-tables, --shared-times, --zmin-cut and --mmap are of the '
                 'merger stage')
+    if windows and a.ymin is not None and store_ladder(a.store) is None:
+        p.error('--ymin with the windows stage sets the population of its merger evidence: give the store')
     if a.asym is not None and a.curves is not None:
         p.error('--asym or --curves, not both')
     if not a.asym_tol >= 0:
@@ -811,10 +881,13 @@ def main(argv=None, factory=None):
     cfg = campaign(a)
     glitch = True
     if a.glitch_model:
-        glitch, sha = glitch_model(a.glitch_model, cfg, a.n_window)
-        cfg = with_model(cfg, sha, a.n_window)
+        s = store_ladder(a.store)
+        glitch, sha = glitch_model(a.glitch_model, cfg, a.n_window,
+                                   population=None if s is None else population_settings(cfg['zmin'], cfg['ymin'], s))
+        cfg = with_model(cfg, sha, a.n_window, model_nbar(read_model(a.glitch_model)[0]))
     if factory is None and windows:
-        factory = make_windows(a.device, a.n_window, a.chunk)
+        pop = cfg.get('merger_population')
+        factory = make_windows(a.device, a.n_window, a.chunk, None if pop is None else merger_population(pop))
     elif factory is None:
         for d in a.store.split(','):
             if not glob.glob(os.path.join(d, 'bd_*.npz')) and not is_cache(d):
