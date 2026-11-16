@@ -152,7 +152,8 @@ WINDOW_RHO = (3.0, 12.2)
 WINDOW_CHUNK = 8                            # segments filtered at once by window_evidences (its default)
 # the campaign settings of the merger stage alone, and those of the stages: campaign_key leaves them out
 MERGER_KEYS = ('grid', 'ymin', 'n_loud', 'n_random', 'glitch_settings', 'tables', 'shared_times', 'glitch_model',
-               'glitch_model_sha256', 'tables_asym', 'zmin_cut', 'asym_tol', 'signal_gain', 'glitch_model_nbar')
+               'glitch_model_sha256', 'tables_asym', 'zmin_cut', 'asym_tol', 'signal_gain', 'glitch_model_nbar',
+               'tables_cuts')
 STAGE_KEYS = ('stage', 'n_window', 'window_rho', 'merger_population')
 PREFIX = dict(merger='plant', windows='win')
 
@@ -555,7 +556,8 @@ def store_settings(args):
     several are given (one store must have the asym of every template, which the noise settings fix); asym_tol when it
     is passed (asym_tol()); zmin_cut when pe_redshift reads only the nodes of z >= zmin; tables_cuts, [zcut, wnet],
     the loudness cuts up to which the tables are answered for (store.read_header: cuts; the smallest over the
-    stores), when the stores record them: plant_fit.check_table_cuts refuses a selection beyond them"""
+    stores), when the stores record them: plant_fit.check_table_cuts refuses a selection beyond them.  All of them are
+    settings of the merger stage (MERGER_KEYS): the windows stage reads no table and records none"""
     if getattr(args, 'stage', 'merger') == 'windows':
         return {}
     out = {}

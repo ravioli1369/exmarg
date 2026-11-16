@@ -218,6 +218,40 @@ def test_unequal_windows_stage_takes_the_gain(tmp_path, monkeypatch):
         print('%s: %d banks, gains %s' % (tag, len(stub.gains), stub.gains[:2]))
 
 
+def test_unequal_week_with_stores_that_record_their_cuts(tmp_path):
+    """analyse.py, the two stages of the window model on own curves with two stores that record the loudness cuts
+    they are answered for (build_ratio.py's stage R; what the search runs on).  The windows stage, given the stores,
+    records no cuts; the merger stage (--glitch-model auto) takes the model of each variant, fitted on the window
+    evidences of the same campaign, and its files record tables_cuts [72, 84] and tables_asym; plant_fit.load reads
+    them and check_table_cuts accepts the selection 72 / 84 and refuses a louder veto.  Fires on: tables_cuts in the
+    campaign key (plant.MERGER_KEYS without it): every model is refused as fitted on another campaign"""
+    from test_analyse import UStub, write_unequal_week
+    from test_plant import make_model
+    from test_store import write_store
+    plant_fit = _script('plant_fit')
+    week = write_unequal_week(str(tmp_path / 'segments'))
+    stores = '%s,%s' % (write_store(str(tmp_path / 's0'), asym=0.0, cuts=(72.0, 84.0)),
+                        write_store(str(tmp_path / 's6'), asym=-0.6, cuts=(72.0, 84.0)))
+    out = tmp_path / 'u'
+    variants = ('rev', 'slide+0.5')
+    common = ['cpu', week, '--out', str(out), '--seed', '7', '--unequal', '--zmin', '0', '--epochs-per-file', '2',
+              '--variants', ','.join(variants)]
+    assert analyse.main([stores] + common + ['--stage', 'windows'], factory=GainWinStub().factory) == 0
+    for v in variants:
+        win = plant.read_meta(sorted((out / v).glob('win_*.npz'))[0])
+        assert 'tables_cuts' not in win and 'tables_asym' not in win
+        make_model(out / v / 'glitch_model.json', plant.campaign_key(win))
+    stub = UStub()
+    assert analyse.main([stores] + common + ['--glitch-model', 'auto'], factory=stub.factory) == 0
+    assert stub.calls
+    for v in variants:
+        cfg = plant_fit.load(str(out / v))[0]
+        assert cfg['tables_cuts'] == [72.0, 84.0] and cfg['tables_asym'] == [-0.6, 0.0] and cfg['noise'] == 'own curves'
+        plant_fit.check_table_cuts(cfg, 72.0, 84.0)
+        with pytest.raises(SystemExit, match='not examined'):
+            plant_fit.check_table_cuts(cfg, 98.0, 84.0)
+
+
 def test_batched_merger_stage_reads_a_model_with_mergers(tmp_path):
     """analyse.py's merger stage made in one pe_redshift_epochs pass per group (make_analysis: pe.batch) and the same
     calls made one by one (a pe without batch) write the same files bit for bit with a glitch model fitted with mergers

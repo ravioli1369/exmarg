@@ -1155,3 +1155,32 @@ def test_tables_cuts_are_recorded_and_enforced(tmp_path):
     for veto_w, w_net in ((98.0, 84.0), (72.0, 90.0), (72.0, None), (72.0, np.inf)):
         with pytest.raises(SystemExit, match='not examined'):
             plant_fit.check_table_cuts(cfg, veto_w, w_net)
+
+
+def test_window_model_with_a_store_that_records_its_cuts(tmp_path):
+    """the two stages of the window model with a store that records the loudness cuts it is answered for (the stores
+    of build_ratio.py's stage R).  The windows stage reads the header of the store only and records no cuts; the
+    merger stage records tables_cuts and takes the model fitted on the window evidences of the same campaign:
+    tables_cuts is a setting of the merger stage (plant.MERGER_KEYS), so the campaign_key of the two stages is the
+    same, and check_table_cuts reads it from the files of the merger stage.  A run of the merger stage into the same
+    folder with a store of other cuts is another campaign.  Fires on: tables_cuts left in the campaign key (every
+    model is then refused as fitted on another campaign as soon as the stores record their cuts)"""
+    from test_store import write_store
+    store = write_store(str(tmp_path / 'a'), asym=0.0, cuts=(72.0, 84.0))
+    out = tmp_path / 'm'
+    rest = ['cpu', '--nbar', '0.3', '--eps-H', '0.3', '--eps-L', '0.3', '--glitch-kind', 'mixed', '--control',
+            'segment-slide', '--seed', '5', '--out', str(out), '--n', '3', '--batch', '3']
+    assert plant.main([store] + rest + ['--start', '0', '--stage', 'windows'], factory=WinStub().factory) == 0
+    win = plant.read_meta(out / ('win_%010d_%010d.npz' % (0, 3)))
+    assert 'tables_cuts' not in win
+    path = out / 'glitch_model.json'
+    make_model(path, plant.campaign_key(win))
+    assert plant.main([store] + rest + ['--start', '0', '--glitch-model', str(path)], factory=Stub().factory) == 0
+    meta = plant.read_meta(out / ('plant_%010d_%010d.npz' % (0, 3)))
+    assert meta['tables_cuts'] == [72.0, 84.0] and plant.campaign_key(meta) == plant.campaign_key(win)
+    plant_fit.check_table_cuts(meta, 72.0, 84.0)
+    with pytest.raises(SystemExit, match='not examined'):
+        plant_fit.check_table_cuts(meta, 98.0, 84.0)
+    other = write_store(str(tmp_path / 'b'), asym=0.0, cuts=(60.0, 84.0))
+    with pytest.raises(SystemExit, match='another campaign.*tables_cuts'):
+        plant.main([other] + rest + ['--start', '3', '--glitch-model', str(path)], factory=Stub().factory)
