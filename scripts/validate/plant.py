@@ -72,7 +72,10 @@ The campaign records glitch_states = {H, L: [[f, q], ...], n_window}.
 
 Unequal noise curves (docs/2026-11-15_unequal_noise_design.md): --asym W puts the noise of detector I on sig2_I =
 sig2 / (1 +- W) (the same random numbers: every template then has w = W), --curves EPOCH on the two curves of a
-conditioned epoch file (strain.own_sig2); mergers and glitches keep their signals and SNR on those curves.  Recorded as
+conditioned epoch file (strain.own_sig2); mergers and glitches keep their signals and SNR on those curves.  The noise
+is drawn in the frequency domain on known curves, so the signal gain of the conditioning (strain.signal_gain) is 1:
+the planted signals carry none and the bank of the analysis takes none (it emulates conditioned data only in its
+curves, not in its estimation noise).  Recorded as
 noise {asym} or {curves, sha256}.  The store argument may list several folders (the mixture of pe_redshift, recorded as
 tables_asym), --asym-tol (default 0.05, with unequal curves or several stores; recorded, and asym_outside per segment),
 --zmin-cut (pe_redshift(zmin=--zmin)), --mmap (unbiased caches mapped).
@@ -94,8 +97,9 @@ w_inf, and no ln_lambda_g*.  The files of the two stages of one folder must be o
 Mergers in stage 1 (docs/2026-11-15_mergers_in_stage1.md).  When the store argument of the windows stage is a store
 folder (its header only is read: the ladder s of signal powers), the win files also hold ln_merger_H, ln_merger_L (n,
 n_window) float64, ln M_w of every window (pe.window_evidences with the population population(zmin) on GRID with the cut
-MDET, the ladder and ymin, --ymin allowed here), and the campaign records merger_population (population_settings: zmin,
-mdet_range, grid, ymin, s), a setting of the stage (STAGE_KEYS: the campaign_key and so the models fitted without mergers
+MDET, the ladder and ymin, --ymin allowed here; the weights of detector I on the model power kappa_I^2 u_I of a bank
+with signal gains, pe._model_power), and the campaign records merger_population (population_settings: zmin, mdet_range,
+grid, ymin, s, and signal_gain when the campaign has one, analyse.py --unequal), a setting of the stage (STAGE_KEYS: the campaign_key and so the models fitted without mergers
 are those of the files without it).  windows_fit.py --nbar N > 0 fits the glitch model with these mergers and records
 nbar and merger_population in the model; the merger stage refuses such a model unless the population of its own run
 (its zmin, ymin, the ladder of its store) is that one, and records glitch_model_nbar.  A model fitted without mergers is
@@ -144,7 +148,7 @@ WINDOW_RHO = (3.0, 12.2)
 WINDOW_CHUNK = 8                            # segments filtered at once by window_evidences (its default)
 # the campaign settings of the merger stage alone, and those of the stages: campaign_key leaves them out
 MERGER_KEYS = ('grid', 'ymin', 'n_loud', 'n_random', 'glitch_settings', 'tables', 'shared_times', 'glitch_model',
-               'glitch_model_sha256', 'tables_asym', 'zmin_cut', 'asym_tol', 'glitch_model_nbar')
+               'glitch_model_sha256', 'tables_asym', 'zmin_cut', 'asym_tol', 'signal_gain', 'glitch_model_nbar')
 STAGE_KEYS = ('stage', 'n_window', 'window_rho', 'merger_population')
 PREFIX = dict(merger='plant', windows='win')
 
@@ -572,7 +576,7 @@ def stage_settings(cfg, args):
     out = {key: v for key, v in cfg.items() if key not in MERGER_KEYS}
     out = dict(out, stage='windows', n_window=args.n_window, window_rho=[args.window_rho_min, args.window_rho_max])
     if s is not None:
-        out['merger_population'] = population_settings(cfg['zmin'], cfg['ymin'], s)
+        out['merger_population'] = population_settings(cfg['zmin'], cfg['ymin'], s, cfg.get('signal_gain'))
     return out
 
 
@@ -590,12 +594,17 @@ def store_ladder(store):
     return np.asarray(read_header(first)['s'], float)
 
 
-def population_settings(zmin, ymin, s):
+def population_settings(zmin, ymin, s, signal_gain=None):
     """the population that the merger evidence of stage 1 and the reduction of stage 2 average over, as JSON: the
     cut of the population at zmin (population), MDET, GRID, ymin and the ladder s of the tables
-    (docs/2026-11-15_mergers_in_stage1.md, Sec. 4)"""
-    return json.loads(json.dumps(dict(zmin=float(zmin), mdet_range=list(MDET), grid=GRID, ymin=float(ymin),
-                                      s=[float(x) for x in np.asarray(s, float)])))
+    (docs/2026-11-15_mergers_in_stage1.md, Sec. 4); and signal_gain when the campaign has one (analyse.py --unequal:
+    'epoch' or 'none'), since the merger evidence of detector I is that of the model power kappa_I^2 u_I
+    (pe._model_power)"""
+    out = dict(zmin=float(zmin), mdet_range=list(MDET), grid=GRID, ymin=float(ymin),
+               s=[float(x) for x in np.asarray(s, float)])
+    if signal_gain is not None:
+        out['signal_gain'] = signal_gain
+    return json.loads(json.dumps(out))
 
 
 def merger_population(settings):
@@ -882,8 +891,8 @@ def main(argv=None, factory=None):
     glitch = True
     if a.glitch_model:
         s = store_ladder(a.store)
-        glitch, sha = glitch_model(a.glitch_model, cfg, a.n_window,
-                                   population=None if s is None else population_settings(cfg['zmin'], cfg['ymin'], s))
+        glitch, sha = glitch_model(a.glitch_model, cfg, a.n_window, population=None if s is None else
+                                   population_settings(cfg['zmin'], cfg['ymin'], s, cfg.get('signal_gain')))
         cfg = with_model(cfg, sha, a.n_window, model_nbar(read_model(a.glitch_model)[0]))
     if factory is None and windows:
         pop = cfg.get('merger_population')

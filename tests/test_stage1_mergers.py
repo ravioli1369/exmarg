@@ -1,7 +1,8 @@
 """controls 1 to 4 of the mergers in the single-detector fit (docs/2026-11-15_mergers_in_stage1.md, Sec. 5):
 
 1. N = 0 changes nothing: fit_windows, window_evidences and the model file of windows_fit.py are those of the
-   committed code (HEAD below) bit for bit;
+   committed code bit for bit, of the branch before the mergers (ee47f02) and of the main branch it was merged with
+   (a79e07d: the batched tables and the signal gain; HEADS below);
 2. unit mean: the merger evidence M_w averages to 1 over Gaussian noise (Monte Carlo on white matched-filter outputs
    drawn here, and quadrature of the columns), and the weights W of the population sum to the fraction of the
    population that stage 2 covers (computed by stage 2's own node geometry and reduction);
@@ -41,7 +42,7 @@ import test_windows as tw
 import test_pe_windows as tpw
 
 ROOT = Path(__file__).resolve().parents[1]
-HEAD = 'ee47f02'                        # the branch before the mergers in stage 1
+HEADS = ('ee47f02', 'a79e07d')          # the branch before the mergers in stage 1; the main branch merged into it
 S_LADDER = np.load(ROOT / 'data' / 'tables' / 's_grid.npz')['s_nodes']       # the 53 nodes of the redshift tables
 
 
@@ -53,26 +54,28 @@ def _script(name, folder='validate'):
 
 
 @lru_cache(maxsize=None)
-def committed():
-    """the tree of HEAD (src and scripts) exported to a temporary folder, or None without git history; the environment
-    variable EXMARG_HEAD_TREE may name such an export instead (a copy of the code outside the repository)"""
+def committed(ref=HEADS[0]):
+    """the tree of the commit ref (src and scripts) exported to a temporary folder, or None without git history; the
+    environment variable EXMARG_TREE_<ref> (EXMARG_HEAD_TREE for the first of HEADS) may name such an export instead (a
+    copy of the code outside the repository)"""
     import tempfile
-    if os.environ.get('EXMARG_HEAD_TREE'):
-        return Path(os.environ['EXMARG_HEAD_TREE'])
-    out = Path(tempfile.mkdtemp(prefix='exmarg_head_'))
+    env = os.environ.get('EXMARG_TREE_' + ref) or (os.environ.get('EXMARG_HEAD_TREE') if ref == HEADS[0] else None)
+    if env:
+        return Path(env)
+    out = Path(tempfile.mkdtemp(prefix='exmarg_%s_' % ref))
     try:
-        tar = subprocess.run(['git', 'archive', HEAD, 'src', 'scripts'], cwd=ROOT, capture_output=True, check=True).stdout
+        tar = subprocess.run(['git', 'archive', ref, 'src', 'scripts'], cwd=ROOT, capture_output=True, check=True).stdout
         subprocess.run(['tar', '-x', '-C', str(out)], input=tar, check=True)
     except (OSError, subprocess.CalledProcessError):
         return None
     return out
 
 
-def committed_module(rel, name):
-    root = committed()
+def committed_module(rel, name, ref=HEADS[0]):
+    root = committed(ref)
     if root is None:
         pytest.skip('no git history to compare with')
-    spec = importlib.util.spec_from_file_location(name, root / rel)
+    spec = importlib.util.spec_from_file_location(name + '_' + ref, root / rel)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -85,14 +88,15 @@ def same(a, b):
 # ================================================================================ 1. N = 0 changes nothing
 
 
-def test_c1_fit_windows_unchanged():
+@pytest.mark.parametrize('ref', HEADS)
+def test_c1_fit_windows_unchanged(ref):
     """fit_windows without mergers (ln_M None, or nbar 0 with ln_M given) returns every number of the committed
     function bit for bit: the first 8000 segments of the toy of test_windows.py without and with its mergers (H, the
     default start), from a poor
     start, one and three states, a basis of three laws, and the small data of test_windows.stall_data.  Fires on: the
     SQUAREM cycles run until one gains less than 1e-3 nats (in place of 1e-2), which changes the path of the updates
     and with it the last bits of the maximum"""
-    old = committed_module('src/exmarg/search/mixture.py', 'exmarg.search._mixture_head')
+    old = committed_module('src/exmarg/search/mixture.py', 'exmarg.search._mixture_head', ref)
     rec = {k: {I: v['E' + I][:8000] for I in 'HL'} for k, v in tw.recovery_data().items() if k != 'flags'}
     rec = {k: {'E' + I: v[I] for I in 'HL'} for k, v in rec.items()}
     stall = tw.stall_data()
@@ -125,12 +129,13 @@ def tiny_population(bank, ladder, zmin=0.3):
     return popavg.merger_population(m1, z, w / w.sum(), ladder, 0.01)
 
 
-def test_c1_window_evidences_unchanged(tpw_data):
+@pytest.mark.parametrize('ref', HEADS)
+def test_c1_window_evidences_unchanged(tpw_data, ref):
     """pe.window_evidences without a population returns the arrays of the committed pe.py bit for bit (the four
     segments of test_pe_windows.py, uniform and given template weights); with a population the same arrays bit for
     bit, and ln_merger_H, ln_merger_L (4, 64) besides.  Fires on: the
     template weights pi_m dropped (uniform) when a population is given"""
-    old = committed_module('src/exmarg/search/pe.py', 'exmarg.search._pe_head_c1')
+    old = committed_module('src/exmarg/search/pe.py', 'exmarg.search._pe_head_c1', ref)
     c = tpw_data
     pop = tiny_population(c['bank'], S_LADDER)
     for pm in (None, np.array([0.2, 0.5, 0.3])):
@@ -141,7 +146,7 @@ def test_c1_window_evidences_unchanged(tpw_data):
         assert set(got) == set(want) | extra and same({k: got[k] for k in want}, want)
         assert got['ln_merger_H'].shape == (4, 64) and np.isfinite(got['ln_merger_L']).all()
     print('\nwindow_evidences: the arrays of %s bit for bit, with and without a population; covered fraction %.6f'
-          % (HEAD, got['merger_covered_H']))
+          % (ref, got['merger_covered_H']))
 
 
 @pytest.fixture(scope='module')
@@ -182,13 +187,14 @@ def write_toy_folder(folder, with_mergers):
     return cfg
 
 
-def test_c1_model_file_unchanged(tmp_path, capsys):
+@pytest.mark.parametrize('ref', HEADS)
+def test_c1_model_file_unchanged(tmp_path, capsys, ref):
     """windows_fit.py with --nbar 0 (and without --nbar) writes, byte for byte, the glitch_model.json that the
     committed windows_fit.py writes on win files of the windows stage as they were (no merger evidence); and the same
     file on files that also hold ln_merger_I and the merger_population of the campaign (the windows stage with the
     store: merger_population is a setting of the stage, not of the campaign key the model records).  Fires on: the
     model recording nbar 0 (the entry written whatever nbar)"""
-    root = committed()
+    root = committed(ref)
     if root is None:
         pytest.skip('no git history to compare with')
     wf = _script('windows_fit')
@@ -334,6 +340,66 @@ def test_c2_unit_mean():
     print('\ncolumns: largest |mean - 1| %.1e; M_w over %d windows: mean %.6f +- %.6f (%+.1f se); against the direct '
           'sum of Phi %.1e' % (np.abs(mean - 1).max(), M.size, M.mean(), se, (M.mean() - 1) / se, err))
     assert abs(M.mean() - 1.0) < 3 * se and se < 1e-3 and err < 3e-6
+
+
+def test_c2_merger_power_with_signal_gain(tpw_data):
+    """the merger evidence of a detector whose data carry a signal with kappa_I times the amplitude of the true strain
+    (the signal gain of the conditioning, bank.gain) is that of a signal of power kappa_I^2 u_I y^2 in the data's
+    statistic w_I = |z_I|^2 / u_I.  Planted truth: signals of strain amplitude y0 arriving with amplitude kappa_I (|R|
+    from the response distribution, uniform phase, a time uniform in window 0, white noise) give E[1/M_0] = 1, the
+    reciprocal identity E_signal[p_0 / p_1] = 1 of an exact likelihood ratio, within 3 standard errors, with the weights
+    of pe._merger_setup on a bank with gains (kappa_H 0.8, kappa_L 1.25); with the weights of the same bank without gains
+    (the power u_I y0^2) E[1/M_0] is off by more than 5.  The population is one cell whose y0 lands on a node of the
+    ladder for either power (W = 1 there), so that both M_0 are exact likelihood ratios of their models.  With real
+    segments, window_evidences on a bank with gains gives the window evidences of gains 1 bit for bit and other merger
+    evidences.  Fires on: _merger_setup reading bank.u_I (the data's power) in place of kappa_I^2 u_I"""
+    from types import SimpleNamespace
+    from exmarg.search.segments import D0
+    gains = dict(H=0.8, L=1.25)
+    u, M, m, z0 = np.array([4.0, 10.0, 25.0]), np.array([30.0, 60.0, 90.0]), 1, 3.0
+    y0 = float(D0 / pe._dl_of_z(z0)[0])
+    powers = sorted({u[m] * y0 ** 2} | {gains[I] ** 2 * u[m] * y0 ** 2 for I in 'HL'})
+    s = np.array([powers[0] / 2] + powers + [2 * powers[-1]])
+    m1 = M[m] / (2 * (1 + z0))
+    pop = popavg.merger_population(np.array([m1 / 1.1, m1, m1 * 1.1]), np.array([z0 - 0.1, z0, z0 + 0.1]),
+                                   np.eye(3)[1][:, None] * np.eye(3)[1][None, :], s, 0.0)
+    banks = dict(gain=SimpleNamespace(M=M, u_H=u, u_L=u, gain=gains), plain=SimpleNamespace(M=M, u_H=u, u_L=u))
+    q, wq = single.response_distribution()
+    rng = np.random.default_rng(20261116)
+    n, nwin = 40000, 8
+    lines, ok = [], True
+    for I in 'HL':
+        R = q[rng.choice(q.size, size=n, p=wq / wq.sum())]
+        z = (rng.standard_normal((n, nwin)) + 1j * rng.standard_normal((n, nwin))) / np.sqrt(2.0)
+        z[np.arange(n), rng.integers(nwin, size=n)] += gains[I] * y0 * np.sqrt(u[m]) * R * np.exp(2j * np.pi * rng.random(n))
+        lq = np.log(np.abs(z * np.sqrt(u[m]))).astype(np.float32)                 # bank.trajectories' layout
+        for name, bank in banks.items():
+            mg = pe._merger_setup(pop, bank, np)
+            Wfull = popavg.merger_weights(M, pe._model_power(bank, I), pop)
+            k = int(np.argmax(Wfull[m]))
+            row = list(mg['use_' + I]).index(m)
+            lnE = single.ln_evidence(lq, np.full(n, np.log(u[m])), mg['lnT'])
+            lnM = logsumexp(lnE + mg['ln_W_' + I][row][None, :], axis=1)
+            x = np.exp(-lnM)
+            mu, se = x.mean(), x.std(ddof=1) / np.sqrt(n)
+            lines.append('%s, bank %-5s: W = %.12f at the node of power %.4f (the signal: kappa^2 u y0^2 = %.4f); '
+                         'E[1/M_0] over %d planted signals %.5f +- %.5f (%+.1f se)' % (
+                             I, name, Wfull[m, k], s[k], gains[I] ** 2 * u[m] * y0 ** 2, n, mu, se, (mu - 1) / se))
+            assert abs(Wfull.sum() - 1.0) < 1e-12 and abs(Wfull[m, k] - 1.0) < 1e-12
+            assert abs(s[k] / (u[m] * y0 ** 2) - (gains[I] ** 2 if name == 'gain' else 1.0)) < 1e-12
+            ok &= abs(mu - 1) < 3 * se if name == 'gain' else abs(mu - 1) > 5 * se
+    c = tpw_data
+    plain = pe.window_evidences(c['segs'], c['bank'], n_window=64, population=tiny_population(c['bank'], S_LADDER))
+    gb = mass_bank(tpw.MASSES, c['segs'], gain=gains)
+    with_gain = pe.window_evidences(c['segs'], gb, n_window=64, population=tiny_population(gb, S_LADDER))
+    for I in 'HL':
+        assert np.array_equal(plain['ln_window_' + I], with_gain['ln_window_' + I])
+        assert np.array_equal(plain['wmax_' + I], with_gain['wmax_' + I])
+        dev = np.abs(plain['ln_merger_' + I] - with_gain['ln_merger_' + I]).max()
+        lines.append('%s, real segments: window evidences of gains 1 bit for bit; ln M_w differs by up to %.3g' % (I, dev))
+        assert dev > 1e-3
+    print('\n' + '\n'.join(lines))
+    assert ok, lines
 
 
 # ================================================================================ 3. the toy with known truth

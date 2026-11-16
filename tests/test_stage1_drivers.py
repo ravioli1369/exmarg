@@ -161,3 +161,156 @@ def test_iterate_dry_run(toy, tmp_path):
     assert lines[1].endswith('python plant.py tables gpu --glitch-model %s --out %s' % (model, os.path.join(out, 'pass1')))
     with pytest.raises(SystemExit):
         iterate.main([new, out, '--', 'python', 'plant.py'])
+
+
+# ----------------------------------------------------------------------------------------- after the merge of a79e07d
+
+
+class GainWinStub:
+    """pe.window_evidences in place for analyse.py's windows stage, with the merger evidence: arrays of its shapes
+    (zeros; wmax 1), and the gain of the segments each bank is built on (factory's seg0) recorded"""
+
+    def __init__(self):
+        self.gains = []
+
+    def factory(self, seg0):
+        self.gains.append(seg0.get('gain'))
+        return self.win
+
+    def win(self, seg, rows):
+        from exmarg.search.single import RHO_EDGES
+        n, nr, nm = np.size(rows), RHO_EDGES.size - 1, plant.MASSES.size
+        out = dict(rho_edges=RHO_EDGES.copy(), rows=np.asarray(rows))
+        for I in 'HL':
+            out.update({'ln_window_' + I: np.zeros((n, plant.N_WINDOW, nr)), 'wmax_' + I: np.ones((n, nm)),
+                        'ln_merger_' + I: np.zeros((n, plant.N_WINDOW))})
+        return out
+
+
+def test_unequal_windows_stage_takes_the_gain(tmp_path, monkeypatch):
+    """analyse.py --stage windows --unequal with the store (merger evidence): the bank of each epoch is built on segments
+    that carry the epoch's signal gain (strain.signal_gain), since the merger evidence of detector I is that of the
+    model power kappa_I^2 u_I (pe._model_power), and merger_population records signal_gain 'epoch'; with --no-gain no
+    gain and signal_gain 'none'; without the store (no merger evidence) no gain, as before the merge, and no
+    merger_population.  The window evidences themselves do not depend on the gain (test_stage1_mergers).  The gains of
+    the synthetic week are 1 to rounding, so strain.signal_gain is replaced by one of distinct values here"""
+    from test_analyse import write_unequal_week
+    week = write_unequal_week(str(tmp_path / 'segments'))
+    store = header_store(str(tmp_path / 'store'))
+    kappa = dict(H=0.97, L=0.95)
+    monkeypatch.setattr(analyse.strain, 'signal_gain', lambda ep: dict(kappa))
+    for tag, store_arg, extra, want in (('epoch', store, [], 'epoch'), ('nogain', store, ['--no-gain'], 'none'),
+                                        ('none', 'none', [], None)):
+        stub = GainWinStub()
+        out = tmp_path / tag
+        assert analyse.main([store_arg, 'cpu', week, '--out', str(out), '--seed', '7', '--stage', 'windows', '--unequal',
+                             '--variants', 'zero,rev'] + extra, factory=stub.factory) == 0
+        meta = plant.read_meta(sorted((out / 'zero').glob('win_*.npz'))[0])
+        if want == 'epoch':
+            assert stub.gains and all(g == kappa for g in stub.gains)
+            assert meta['merger_population']['signal_gain'] == 'epoch'
+            with np.load(sorted((out / 'zero').glob('win_*.npz'))[0]) as z:
+                assert 'ln_merger_H' in z.files
+        elif want == 'none':
+            assert all(g is None for g in stub.gains) and meta['merger_population']['signal_gain'] == 'none'
+        else:
+            assert all(g is None for g in stub.gains) and 'merger_population' not in meta
+        print('%s: %d banks, gains %s' % (tag, len(stub.gains), stub.gains[:2]))
+
+
+def test_batched_merger_stage_reads_a_model_with_mergers(tmp_path):
+    """analyse.py's merger stage made in one pe_redshift_epochs pass per group (make_analysis: pe.batch) and the same
+    calls made one by one (a pe without batch) write the same files bit for bit with a glitch model fitted with mergers
+    (nbar 0.02, the merger_population of the run) given for the variants zero and inj; the files record that model's
+    SHA-256 and glitch_model_nbar.  The same model is refused for rev, and for a run of another population (--zmin)"""
+    from exmarg.search import load_redshift_store
+    from test_analyse import WinStub
+    from test_pe_batch import same_files, small_week
+    from test_plant import make_model
+    from test_store import write_store
+    week = small_week(str(tmp_path / 'segments'))
+    store_dir = write_store(str(tmp_path / 'store'))
+    store = load_redshift_store(store_dir, unbiased=True)
+    win = tmp_path / 'win'
+    analyse.main(['none', 'cpu', week, '--out', str(win), '--seed', '7', '--epochs-per-file', '2', '--variants', 'zero,inj',
+                  '--stage', 'windows'], factory=WinStub().factory)
+    meta = plant.read_meta(sorted((win / 'zero').glob('win_*.npz'))[0])
+    model_path = tmp_path / 'model.json'
+    make_model(model_path, plant.campaign_key(meta))
+    m = json.load(open(model_path))
+    m.pop('sha256')
+    m.update(nbar=0.02, merger_population=plant.population_settings(0.99119, plant.default_ymin(),
+                                                                    plant.store_ladder(store_dir)))
+    sha = windows_fit.write_model(str(model_path), json.loads(json.dumps(m)))
+    batched = analyse.make_analysis(store, 'cpu', chunk=3, ymin=plant.default_ymin())
+
+    def one_by_one(seg0):
+        pe_ = batched(seg0)
+        return lambda *args: pe_(*args)                                  # no batch: analyse_calls calls one by one
+    outs = []
+    for name, factory in (('batched', batched), ('one_by_one', one_by_one)):
+        out = tmp_path / name
+        assert analyse.main([store_dir, 'cpu', week, '--out', str(out), '--seed', '7', '--epochs-per-file', '2',
+                             '--variants', 'zero,inj', '--chunk', '3', '--glitch-model', str(model_path)],
+                            factory=factory) == 0
+        outs.append(out)
+    n = same_files(*outs)
+    meta = plant.read_meta(sorted((outs[0] / 'zero').glob('plant_*.npz'))[0])
+    assert meta['glitch_model_sha256'] == sha and meta['glitch_model_nbar'] == 0.02
+    with pytest.raises(SystemExit, match='not for the variant rev'):
+        analyse.main([store_dir, 'cpu', week, '--out', str(tmp_path / 'rev'), '--seed', '7', '--variants', 'rev',
+                      '--glitch-model', str(model_path)], factory=batched)
+    with pytest.raises(SystemExit, match='another population'):
+        analyse.main([store_dir, 'cpu', week, '--out', str(tmp_path / 'z'), '--seed', '7', '--variants', 'zero',
+                      '--zmin', '0.5', '--glitch-model', str(model_path)], factory=batched)
+    print('\na model fitted with mergers: %d arrays bit for bit equal, batched and one by one' % n)
+
+
+def run_committed_plant(tree, argv, cwd):
+    """scripts/validate/plant.py of an exported tree, in a process of its own (its own src first on the path)"""
+    import subprocess
+    import sys
+    r = subprocess.run([sys.executable, str(tree / 'scripts' / 'validate' / 'plant.py')] + argv, cwd=cwd,
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-2000:]
+
+
+def same_win_files(a, b, prefix):
+    """the files of prefix in folders a and b: the same names and members, every array bit for bit, the meta but run"""
+    import glob
+    names = sorted(os.path.basename(f) for f in glob.glob(os.path.join(a, prefix + '_*.npz')))
+    assert names and names == sorted(os.path.basename(f) for f in glob.glob(os.path.join(b, prefix + '_*.npz')))
+    n = 0
+    for name in names:
+        with np.load(os.path.join(a, name)) as x, np.load(os.path.join(b, name)) as y:
+            assert x.files == y.files, name
+            ma, mb = (json.loads(str(z['meta'])) for z in (x, y))
+            ma.pop('run'), mb.pop('run')
+            assert ma == mb, name
+            for key in x.files:
+                if key != 'meta':
+                    assert np.array_equal(x[key], y[key], equal_nan=x[key].dtype.kind == 'f'), (name, key)
+                    n += 1
+    return n
+
+
+def test_plant_default_outputs_as_main(tmp_path):
+    """plant.py's default outputs are those of the main branch merged in (a79e07d, its tree in a process of its own):
+    the windows stage without a store (2 segments, the plant's bank and window evidences on the CPU), and the merger
+    stage with the default glitch terms on a small store (write_store, 2 segments): every array bit for bit, the meta
+    but the run's record"""
+    from test_store import write_store
+    tree = tm.committed('a79e07d')
+    if tree is None:
+        pytest.skip('no git history to compare with')
+    store = write_store(str(tmp_path / 'store'))
+    base = ['--n', '2', '--batch', '2', '--nbar', '0.5', '--seed', '3', '--glitch-states', '0.9:0.01,0.1:0.1',
+            '--gamma', '4', '--rho-min', '5', '--zmin', '0.5']
+    n = 0
+    for stage, store_arg, extra, prefix in (('windows', 'none', ['--stage', 'windows'], 'win'),
+                                            ('merger', store, ['--chunk', '2'], 'plant')):
+        a, b = tmp_path / ('main_' + stage), tmp_path / ('merged_' + stage)
+        run_committed_plant(tree, [store_arg, 'cpu'] + base + extra + ['--out', str(a)], str(tmp_path))
+        assert plant.main([store_arg, 'cpu'] + base + extra + ['--out', str(b)]) == 0
+        n += same_win_files(str(a), str(b), prefix)
+    print('\nplant.py, windows stage without a store and merger stage: %d arrays bit for bit those of a79e07d' % n)

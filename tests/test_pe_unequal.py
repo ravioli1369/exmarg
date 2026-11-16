@@ -433,9 +433,9 @@ def shaped():
     seen = []
     real = pe._store_values
 
-    def spy(bank, traj, e, *args):
-        seen.append((e["asym"], e["use"].copy()))
-        return real(bank, traj, e, *args)
+    def spy(store, reads, *args):
+        seen.extend((r["e"]["asym"], r["e"]["use"].copy()) for r in reads)
+        return real(store, reads, *args)
     pe._store_values = spy
     try:
         windows = node_values(c, WINDOWS, rows)

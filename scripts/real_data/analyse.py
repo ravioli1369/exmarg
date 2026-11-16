@@ -34,7 +34,11 @@ epoch (they share the noise curve; the bank of plant.MASSES is built on it):
                  optimal network SNR is computed with the epoch's sig2.
 The random numbers of a segment are keyed by its GPS second (plant.stream(seed, gps, use)), those of pe_redshift by the
 epoch's GPS and a fixed row per variant and segment, so every variant of every segment is the same whatever --part and
---variants are.  The chunk passed to pe_redshift is capped there by the free GPU memory (pe._fit_chunk).
+--variants are.  Merger stage: the pe_redshift calls of all the epochs of an output group (those described here and
+under --glitch-model) are made at once, as the epochs of one pe_redshift_epochs call, each with its own bank, rows, seed
+and glitch settings: the tables are copied to the GPU once per chunk of the group's segments instead of once per call,
+and every array is that of the calls made one by one, bit for bit.  The chunk (--chunk, segments of the whole group) is
+capped there by the free GPU memory (pe._fit_chunk).
 
 Output: <out>/<variant>/plant_<first k>_<end k>.npz, one per group of --epochs-per-file epochs (groups cut at multiples
 of it in the manifest; --part i/n takes the groups i n_group / n to (i + 1) n_group / n, contiguous in time), written
@@ -76,6 +80,15 @@ segment's epoch in asym_outside).  --zmin (default 0.99119; 0: the whole populat
 and of the injections; for every variant but inj (whose injections are drawn from it) a setting of the merger stage
 only, so the window models of a windows stage serve merger stages of any --zmin.  --zmin-cut: pe_redshift(zmin=--zmin),
 the nodes that z >= zmin needs alone (the same results there).  Without these options nothing changes.
+
+Signal gain (strain.signal_gain; src/exmarg/strain.py).  With estimated spectra the conditioning scales a signal in the
+data of detector I, on its own curve, by kappa_I (0.97283 for the median of N = 32 and 66 neighbour blocks), a number of
+the epoch and detector.  With --unequal the bank of each epoch takes these gains (the model's template of detector I is
+kappa_I a; bank.MassBank, pe), and the injections of inj are multiplied by them, so that they are what a real signal is
+in these data.  --no-gain: the model without them (a control; recorded as signal_gain none, the default as epoch; a
+setting of the merger stage, plant.MERGER_KEYS: the window evidences do not depend on it; the merger evidence of a
+windows stage run with the store does, being that of the model power kappa_I^2 u_I, so that stage's bank takes the
+gains too and its merger_population records signal_gain).
 
 Mergers in stage 1 (docs/2026-11-15_mergers_in_stage1.md).  --stage windows with the store folder in place of none also
 writes ln_merger_H, ln_merger_L, the merger evidence of each window for the population of --zmin, GRID, MDET, ymin and
@@ -261,11 +274,13 @@ def extra_seed(seed, gps_epoch, seg, name):
     return plant.stream(seed, int(round(gps_epoch)) + (2 * abs(m) - (m < 0)) * 2 ** 24, 'pe')
 
 
-def injections(cfg, ep, rows, sampler, sig2=None):
+def injections(cfg, ep, rows, sampler, sig2=None, gain=None):
     """the mergers injected into the segments rows of the epoch ep: (signal {I: (n, n_freq) complex}, truth dict of
     (n,) arrays merger, m1, z, y, snr), presence and (m1, z) from plant.mergers keyed by the GPS second, the signal of
-    pp.simulate (seed plant.stream(seed, gps, 'noise')) with y less that with y = 0, snr the optimal network SNR with
-    the noise curve of each detector, sig2 {I: (n_freq,)} (default the epoch's sig2 for both)"""
+    pp.simulate (seed plant.stream(seed, gps, 'noise')) with y less that with y = 0, times gain[I] when given (the
+    signal gain of the epoch, strain.signal_gain: a signal added to conditioned data must carry it to be what a real
+    signal is in them; simulated segments drawn in the frequency domain have gain 1), snr the optimal network SNR of
+    that signal with the noise curve of each detector, sig2 {I: (n_freq,)} (default the epoch's sig2 for both)"""
     sig2 = {I: ep['sig2'] for I in 'HL'} if sig2 is None else sig2
     gps = [int(round(float(ep['gps'][i]))) for i in rows]
     present, m1, z, y = plant.mergers(dict(seed=cfg['seed'], nbar=cfg['nbar_inj']), gps, sampler)
@@ -284,20 +299,28 @@ def injections(cfg, ep, rows, sampler, sig2=None):
         a, b = one(y[j]), one(0.0)
         for I in 'HL':
             h[I][j] = a['d_' + I][0] - b['d_' + I][0]
+            if gain is not None and gain[I] != 1.0:
+                h[I][j] = gain[I] * h[I][j]
         snr[j] = np.sqrt(sum(2.0 * np.sum(np.abs(h[I][j]) ** 2 / sig2[I]) for I in 'HL'))
     truth = dict(merger=present, m1=np.where(present, m1, np.nan), z=np.where(present, z, np.nan), y=y, snr=snr)
     return h, truth
 
 
-def variants(cfg, ep, names, sampler, own=False):
+def variants(cfg, ep, names, sampler, own=False, gain=False):
     """the selected segments of the epoch ep in each variant of names: ({variant: segments dict}, rows (n,) their
     indices in the epoch, injection truth or None).  own: the data of each detector on its own curve (strain.own_curves,
-    sig2_H and sig2_L), else the equalized data on the epoch's one curve sig2"""
+    sig2_H and sig2_L), else the equalized data on the epoch's one curve sig2.  With own, the injections of inj carry
+    the epoch's signal gain kappa_I (strain.signal_gain: the amplitude a real signal has in these data), and with gain
+    also every variant's dict holds it under 'gain' for the bank of the analysis (make_analysis)"""
     rows = np.flatnonzero(selected(ep))
     base = dict(f=ep['f'], nu=ep['nu'], T=ep['T'], fmin=ep['fmin'], fmax=ep['fmax'])
+    kappa = None
     if own:
         o = strain.own_curves(ep)
         base.update(d_H=o['H'][0][rows], d_L=o['L'][0][rows], sig2_H=o['H'][1], sig2_L=o['L'][1])
+        kappa = strain.signal_gain(ep) if (gain or 'inj' in names) else None
+        if gain:
+            base['gain'] = dict(kappa)
     elif 'sig2' not in ep:
         raise ValueError('the epoch has sig2_H and sig2_L: the published tables need one noise curve (equal_noise), '
                          'or analyse it with --unequal')
@@ -319,7 +342,8 @@ def variants(cfg, ep, names, sampler, own=False):
         elif v == 'inj':
             whole_samples(base, SHIFTS['slide+0.5'])
             slid = controls.time_slide(base, SHIFTS['slide+0.5'])
-            h, inj = injections(cfg, ep, rows, sampler, {I: base.get('sig2_' + I, base.get('sig2')) for I in 'HL'})
+            h, inj = injections(cfg, ep, rows, sampler, {I: base.get('sig2_' + I, base.get('sig2')) for I in 'HL'},
+                                kappa)
             out[v] = dict(slid, d_H=slid['d_H'] + h['H'], d_L=slid['d_L'] + h['L'])
         else:
             raise ValueError('unknown variant %r' % v)
@@ -327,33 +351,46 @@ def variants(cfg, ep, names, sampler, own=False):
 
 
 def make_analysis(store, device, resident=False, chunk=CHUNK, ymin=None, zmin=None, asym_tol=None):
-    """factory(segments) builds the bank of plant.MASSES on the epoch's noise curves and returns pe(segments, seed, rows,
+    """factory(segments) builds the bank of plant.MASSES on the epoch's noise curves, with the signal gain the segments
+    carry (segments['gain'], set by variants with gain; gains 1 without it), and returns pe(segments, seed, rows,
     glitch=True) -> the pe_redshift dict (glitch=True, or the dict of the window model) of those rows of the segments,
     on plant.GRID; store one store or a list (the mixture), zmin and asym_tol those of pe_redshift (each given only when
-    not None)"""
-    from exmarg.search import mass_bank, pe_redshift
+    not None).  pe.epoch(segments, seed, rows, glitch=True) is the same call as an epoch of pe_redshift_epochs, and
+    pe.batch(epochs) analyses such epochs (of any epoch's bank) in one pass over the tables: [the dict of each]"""
+    from exmarg.search import mass_bank, pe_redshift, pe_redshift_epochs
     cut = {k: v for k, v in (('zmin', zmin), ('asym_tol', asym_tol)) if v is not None}
+    settings = dict(chunk=chunk, resident=resident, ymin=ymin, mdet_range=plant.MDET, **cut, **plant.GRID)
 
     def factory(seg0):
-        bank = mass_bank(plant.MASSES, seg0, device)
+        bank = mass_bank(plant.MASSES, seg0, device, gain=seg0.get('gain'))
 
         def pe(seg, seed, rows, glitch=True):
-            return pe_redshift(seg, bank, store, rows=rows, chunk=chunk, resident=resident, seed=seed, ymin=ymin,
-                               mdet_range=plant.MDET, glitch=glitch, **cut, **plant.GRID)
+            return pe_redshift(seg, bank, store, rows=rows, seed=seed, glitch=glitch, **settings)
+        pe.epoch = lambda seg, seed, rows, glitch=True: dict(segments=seg, bank=bank, rows=rows, seed=seed, glitch=glitch)
+        pe.batch = lambda epochs: pe_redshift_epochs(epochs, store, **settings)
         return pe
     return factory
+
+
+def analyse_calls(calls):
+    """the pe dicts of the calls [(pe, args)] of a group of epochs, in order: in one pass over the tables (pe.batch of
+    every call's pe.epoch(*args)) when every pe offers it, else call by call, pe(*args)"""
+    if calls and all(hasattr(pe, 'batch') and hasattr(pe, 'epoch') for pe, _ in calls):
+        return calls[0][0].batch([pe.epoch(*args) for pe, args in calls])
+    return [pe(*args) for pe, args in calls]
 
 
 def make_windows(device, n_window=plant.N_WINDOW, chunk=plant.WINDOW_CHUNK, population=None):
     """stage 1 of the window model: factory(segments) builds the bank of plant.MASSES on the epoch's noise curve and
     returns win(segments, rows) -> the dict of pe.window_evidences of those rows (no tables), with the merger evidence
-    of the population (plant.merger_population(settings)) when given"""
+    of the population (plant.merger_population(settings)) when given; the bank then takes the signal gain the segments
+    carry (segments['gain'], variants with gain), which the merger evidence depends on and the window evidences do not"""
     from exmarg.search import mass_bank
     from exmarg.search import pe as pe_module
     extra = {} if population is None else dict(population=population)
 
     def factory(seg0):
-        bank = mass_bank(plant.MASSES, seg0, device)
+        bank = mass_bank(plant.MASSES, seg0, device, gain=seg0.get('gain') if population is not None else None)
 
         def win(seg, rows):
             return pe_module.window_evidences(seg, bank, rows=rows, chunk=chunk, n_window=n_window, **extra)
@@ -390,7 +427,7 @@ def load_models(a, cfgs):
         if nbar > 0 and v not in WITH_MERGERS:
             raise SystemExit('%s: a model fitted with mergers (nbar %g) is not for the variant %s: the time-slid, '
                              'time-reversed and phase-randomized data keep the model without mergers' % (path, nbar, v))
-        pop = None if s is None else plant.population_settings(a.zmin, cfg['ymin'], s)
+        pop = None if s is None else plant.population_settings(a.zmin, cfg['ymin'], s, cfg.get('signal_gain'))
         ignore = merger_only(v) if a.glitch_model == 'auto' else VARIANT_KEYS + ('zmin',)
         out[v] = plant.glitch_model(path, cfg, a.n_window, ignore=ignore, population=pop) + (nbar,)
     return out
@@ -415,6 +452,7 @@ def campaign(a, seg_dir, variant, sha=None, model_nbar=0.0):
                glitch_settings='pe default')
     if a.unequal:
         cfg['noise'] = 'own curves'
+        cfg['signal_gain'] = 'none' if a.no_gain else 'epoch'
     cfg.update(plant.store_settings(a))
     cfg = plant.stage_settings(cfg, a)
     if sha is not None:
@@ -456,6 +494,34 @@ def merger_shared(res):
                 glitch_window=np.asarray(res.get('glitch_window', np.nan), float))
 
 
+def merger_calls(seg, seed, rows, slots, n, need, models, alone):
+    """the pe calls of one epoch in the merger stage: [(args of pe, targets)], targets [(variant, the slice of the
+    dict's segments that is the variant's, or None: all of them)].  With a model per variant (models) one call per
+    variant, at its slots or (alone) on its own epoch-sized stack; else one call for the variants with slots, each the
+    slice of its slots, and one per variant without slots (alone), with the default glitch settings"""
+    if models:
+        return [((seg, seed, slots[v], models[v][0]) if v in slots else alone(v) + (rows, models[v][0]), [(v, None)])
+                for v in need]
+    out = []
+    if slots:
+        take = np.concatenate([slots[v] for v in slots])
+        out.append(((seg, seed, take), [(v, slice(j * n, (j + 1) * n)) for j, v in enumerate(slots)]))
+    return out + [(alone(v) + (rows,), [(v, None)]) for v in need if v not in slots]
+
+
+def merger_arrays(res, targets, pop):
+    """{variant: the per-segment arrays of plant.reduce} of one pe dict for its targets (merger_calls)"""
+    out = {}
+    for v, part in targets:
+        if part is None:
+            out[v] = plant.reduce(res, pop, plant.MDET)
+            continue
+        per_call = {k: res[k] for k in ('asym_outside',) if k in res}
+        out[v] = plant.reduce(dict(m1=res['m1'], z=res['z'], **per_call,
+                                   **{key: np.asarray(res[key])[part] for key in PER_SEGMENT}), pop, plant.MDET)
+    return out
+
+
 def run(a, factory, log=print):
     """the groups of epochs of this part, every requested variant; returns the paths written"""
     names = [v for v in VARIANTS if v in a.variants] + [v for v in a.variants if v not in VARIANTS]
@@ -463,6 +529,7 @@ def run(a, factory, log=print):
     os.makedirs(a.out, exist_ok=True)
     record_selection(a.out, sel)
     windows = a.stage == 'windows'
+    merger_evidence = windows and plant.store_ladder(a.store) is not None     # the windows stage with the store
     prefix = plant.PREFIX[a.stage]
     cfgs = {v: campaign(a, a.segments, v) for v in names}
     models = load_models(a, cfgs) if a.glitch_model else None
@@ -487,12 +554,14 @@ def run(a, factory, log=print):
         acc = {v: [] for v in need}
         t_build = t_pe = 0.0
         n_rows = 0
+        calls, books = [], []           # merger stage: the group's pe calls; per epoch its bookkeeping and the targets
         for e in range(e0, e1):
             if sel[e]['n_selected'] == 0:
                 continue
             t0 = time.time()
             ep = strain.read_epoch(os.path.join(a.segments, sel[e]['name']))
-            var, rows, inj = variants(params, ep, need, sampler, a.unequal)
+            var, rows, inj = variants(params, ep, need, sampler, a.unequal,
+                                      a.unequal and not a.no_gain and (not windows or merger_evidence))
             n, ns = rows.size, int(np.asarray(ep['gps']).size)
             extra = [v for v in need if v not in VARIANTS]
             # the variants of VARIANTS at the fixed slots VARIANTS.index(v) ns + row of one stack; the windows stage has
@@ -516,44 +585,37 @@ def run(a, factory, log=print):
                 for I in 'HL':
                     pad[I][rows] = var[v]['d_' + I]
                 return dict(var[v], d_H=pad['H'], d_L=pad['L']), extra_seed(a.seed, float(ep['gps_epoch']), var[v], v)
+            book = {v: dict(epoch_arrays(ep, rows, n, inj if v == 'inj' else None), k=sel[e]['k'] + np.arange(n))
+                    for v in need}
             if windows:                                 # every variant in one call, sliced
                 res = pe(seg, take)
                 arrays = {v: plant.reduce_windows(dict(rho_edges=res['rho_edges'], **{
                     key: np.asarray(res[key])[j * n:(j + 1) * n] for key in WINDOW_KEYS + MERGER_KEYS if key in res}),
                     bins) for j, v in enumerate(need)}
                 shared = plant.window_shared(bins)
-            elif models:                                # a model per variant: a call per variant, the same rows
-                arrays = {}
                 for v in need:
-                    if v in slots:
-                        res = pe(seg, seed, slots[v], models[v][0])
-                    else:
-                        one, seed_v = alone(v)
-                        res = pe(one, seed_v, rows, models[v][0])
-                    arrays[v] = plant.reduce(res, pop, plant.MDET)
-                shared = merger_shared(res)
-            else:
-                arrays = {}
-                if slots:
-                    res = pe(seg, seed, take)
-                    per_call = {k: res[k] for k in ('asym_outside',) if k in res}
-                    arrays = {v: plant.reduce(dict(m1=res['m1'], z=res['z'], **per_call, **{
-                        key: np.asarray(res[key])[j * n:(j + 1) * n] for key in PER_SEGMENT}), pop, plant.MDET)
-                        for j, v in enumerate(slots)}
-                for v in extra:
-                    one, seed_v = alone(v)
-                    res = pe(one, seed_v, rows)
-                    arrays[v] = plant.reduce(res, pop, plant.MDET)
-                shared = merger_shared(res)
-            del res
-            t2 = time.time()
-            for v in need:
-                arrays[v].update(epoch_arrays(ep, rows, n, inj if v == 'inj' else None))
-                arrays[v]['k'] = sel[e]['k'] + np.arange(n)
-                acc[v].append(arrays[v])
+                    acc[v].append(dict(arrays[v], **book[v]))
+                del res
+            else:                                       # the calls of every epoch of the group, made below at once
+                c = merger_calls(seg, seed, rows, slots, n, need, models, alone)
+                calls += [(pe, args) for args, _ in c]
+                books.append((book, [targets for _, targets in c]))
             t_build += t1 - t0
-            t_pe += t2 - t1
+            t_pe += time.time() - t1
             n_rows += n * len(need)
+        if calls:                                       # merger stage: one pass over the tables for the whole group
+            t1 = time.time()
+            results = iter(analyse_calls(calls))
+            for book, targets in books:
+                arrays = {}
+                for tg in targets:
+                    res = next(results)
+                    arrays.update(merger_arrays(res, tg, pop))
+                for v in need:
+                    acc[v].append(dict(arrays[v], **book[v]))
+            shared = merger_shared(res)
+            del res, results, calls
+            t_pe += time.time() - t1
         for v in need:
             parts = acc[v]
             arrays = {key: np.concatenate([p[key] for p in parts]) for key in parts[0] if key != 'w_inf_cells'}
@@ -609,7 +671,11 @@ def parser():
                    help='pe_redshift reads only the nodes the redshifts z >= --zmin need (the same results there)')
     p.add_argument('--unequal', action='store_true',
                    help='each detector on its own noise curve (strain.own_curves: no step 5); needs stores that cover '
-                        'the u_H/u_L of the templates')
+                        'the u_H/u_L of the templates.  The model carries the signal gain of each epoch '
+                        '(strain.signal_gain), and so do the injections of inj')
+    p.add_argument('--no-gain', action='store_true',
+                   help='with --unequal: the model without the signal gain (gains 1; a control: the injections of inj '
+                        'still carry it); recorded as signal_gain none')
     p.add_argument('--asym-tol', type=float, default=plant.ASYM_TOL,
                    help='with --unequal or several stores: a template whose asymmetry lies outside the stores\' range by at '
                         'most this is read from the end store (default %g; recorded, and the number of such templates '
@@ -640,6 +706,8 @@ def parse(argv=None):
         p.error('--ymin with the windows stage sets the population of its merger evidence: give the store')
     if not a.zmin >= 0:
         p.error('need zmin >= 0')
+    if a.no_gain and not a.unequal:
+        p.error('--no-gain is an option of --unequal (the equalized data have no gain model)')
     if not a.asym_tol >= 0:
         p.error('need asym-tol >= 0')
     if not (0 <= a.window_rho_min < a.window_rho_max):
