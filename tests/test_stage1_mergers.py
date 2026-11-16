@@ -462,10 +462,13 @@ def test_c3_objective_and_maximum():
     relative, on the toy with mergers at the true N; and its maximum is that of an independent optimizer: on the first
     4000 segments with a basis of three laws (rho^-1.5, -2.5, -4 from 2, so that the planted laws are inside the
     simplex of the basis weights and the maximum is interior), scipy's L-BFGS-B on objective() in softmax
-    coordinates from another start reaches a ln L at most 1e-6 above fit_windows', with f, q and the basis weights
-    within 3e-3 of it.  Its gradient and Hessian agree with central differences of ln L and of the gradient to 1e-8
-    and 1e-6 relative.  Fires on: the zone of kappa taken as the window alone in mixture.py (zone 0): ln L off by 0.15
-    nats (3e-7 relative)"""
+    coordinates from another start, with the gradient from central differences, reaches a ln L within 1e-6 of
+    fit_windows', with f, q and the basis weights within 1e-4 of it (measured: 2e-8 and at most 6e-6 on three
+    platforms; with scipy's default one-sided differences the noise of the gradient stops L-BFGS-B 5e-4 to 4e-3 nats
+    short of the maximum, by an amount that depends on the platform).  Its gradient and Hessian agree with central
+    differences of ln L and of the gradient (step 3e-7) to 1e-8 and 1e-6 relative (measured 8e-10 and 2e-8: the error
+    of the differences, which falls as the step squared down to there).  Fires on: the zone of kappa taken as the
+    window alone in mixture.py (zone 0): ln L off by 0.15 nats (3e-7 relative)"""
     ev = tw.recovery_data()['model']
     lines = []
     for I in 'HL':
@@ -484,7 +487,7 @@ def test_c3_objective_and_maximum():
         a = np.stack([softmax(np.r_[0.0, v[3:5]]), softmax(np.r_[0.0, v[5:7]])])
         return f, q, a
     fun = lambda v: -math.fsum(objective(E, lnM, *unpack(v)[:2], unpack(v)[2] @ basis, NB)) / n
-    res = minimize(fun, np.array([-1.0, -5.0, -1.0, 0.5, 0.0, 0.0, 0.5]), method='L-BFGS-B',
+    res = minimize(fun, np.array([-1.0, -5.0, -1.0, 0.5, 0.0, 0.0, 0.5]), method='L-BFGS-B', jac='3-point',
                    options=dict(ftol=1e-15, gtol=1e-10, maxiter=5000))
     f, q, a = unpack(res.x)
     o = np.argsort(q)
@@ -494,7 +497,7 @@ def test_c3_objective_and_maximum():
     lines.append('basis of 3 laws, %d segments: fit_windows ln L %.6f (%d updates, converged %s); L-BFGS-B %.6f (gap '
                  '%+.2e), largest parameter difference %.1e' % (n, r['lnl'], r['n_iter'], r['converged'], -res.fun * n,
                                                                 gap, dpar))
-    assert r['converged'] and gap < 1e-6 and dpar < 3e-3, lines[-1]
+    assert r['converged'] and abs(gap) < 1e-6 and dpar < 1e-4, lines[-1]
     base = mixture._Windows(E, basis, False, 1024)
     m = mixture._WindowsMerger(base, lnM, NB, tw.ZONE)
     rng = np.random.default_rng(3)
@@ -504,8 +507,8 @@ def test_c3_objective_and_maximum():
     H = m.hessian(ev0)
     I_ = np.eye(x.size)
     gl = lambda y: np.concatenate([m(y, 2)['Q'], m(y, 2)['G'].T.ravel()])
-    gfd = np.array([(m(x + 1e-6 * I_[j], 2)['lnl'] - m(x - 1e-6 * I_[j], 2)['lnl']) / 2e-6 for j in range(x.size)])
-    Hfd = np.array([(gl(x + 1e-6 * I_[j]) - gl(x - 1e-6 * I_[j])) / 2e-6 for j in range(x.size)])
+    gfd = np.array([(m(x + 3e-7 * I_[j], 2)['lnl'] - m(x - 3e-7 * I_[j], 2)['lnl']) / 6e-7 for j in range(x.size)])
+    Hfd = np.array([(gl(x + 3e-7 * I_[j]) - gl(x - 3e-7 * I_[j])) / 6e-7 for j in range(x.size)])
     eg, eh = np.abs(g - gfd).max() / np.abs(g).max(), np.abs(H - Hfd).max() / np.abs(H).max()
     lines.append('gradient against central differences %.1e, Hessian %.1e (relative to the largest entry)' % (eg, eh))
     print('\n' + '\n'.join(lines))
