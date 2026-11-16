@@ -328,7 +328,7 @@ def flag_entries(T, V, s_H, s_L, s_ref, beta, delta, zcut, gap_max, n_max=N_MAX,
     if outside.any():
         lt = np.full(W.shape, -np.inf)
         lt[outside] = ln_tail(W[outside], s_H + s_L, n_max)
-        with np.errstate(divide='ignore'):
+        with np.errstate(divide='ignore', invalid='ignore'):     # a lag without sky and no bound: -inf + inf, not flagged
             trunc = np.log(omega)[:, None, None, None] + lt[None, None] - T > np.log(tol)
     flags = sky & need[None, None] & (cancel | trunc)
     counts = dict(need=int(need.sum()) * int((omega > 0).sum()) * T.shape[1],
