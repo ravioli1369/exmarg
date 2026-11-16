@@ -54,10 +54,11 @@ The window model (docs/glitch_likelihood.md, Sec. 4a), in two stages:
     python scripts/real_data/analyse.py none gpu data/segments/O3b_v2 --out runs/week_w --stage windows
     python scripts/validate/windows_fit.py runs/week_w/<variant>                 # for every variant
     python scripts/real_data/analyse.py tables/redshift gpu data/segments/O3b_v2 --out runs/week_w --glitch-model auto
---stage windows (no tables; the store argument is not read): the same selection, variants, groups and k, through
+--stage windows (no tables; of the store argument only the lags of its header, for wnet: 'none' writes no wnet, and
+the fits then apply the single-detector veto alone): the same selection, variants, groups and k, through
 pe.window_evidences(n_window=--n-window) of all the variants of an epoch in one call, into
 <out>/<variant>/win_<first k>_<end k>.npz, the members of plant.py's win files (ln_window_H, ln_window_L float32 on the
-bins that overlap [--window-rho-min, --window-rho-max], window_rho_edges, window_bin0, wmax_H, wmax_L) with the
+bins that overlap [--window-rho-min, --window-rho-max], window_rho_edges, window_bin0, wmax_H, wmax_L, wnet) with the
 per-segment arrays above; the meta is the campaign without the settings of the merger stage, with stage 'windows',
 n_window and window_rho.  --glitch-model auto: each variant through pe_redshift with the model of
 <out>/<variant>/glitch_model.json, fitted on its own single-detector data (the campaign_key of its files that of the
@@ -367,9 +368,10 @@ def analyse_calls(calls):
     return [pe(*args) for pe, args in calls]
 
 
-def make_windows(device, n_window=plant.N_WINDOW, chunk=plant.WINDOW_CHUNK):
+def make_windows(device, n_window=plant.N_WINDOW, chunk=plant.WINDOW_CHUNK, lags=None):
     """stage 1 of the window model: factory(segments) builds the bank of plant.MASSES on the epoch's noise curve and
-    returns win(segments, rows) -> the dict of pe.window_evidences of those rows (no tables)"""
+    returns win(segments, rows) -> the dict of pe.window_evidences of those rows (no tables; with lags, those of the
+    tables, also wnet)"""
     from exmarg.search import mass_bank
     from exmarg.search import pe as pe_module
 
@@ -377,13 +379,19 @@ def make_windows(device, n_window=plant.N_WINDOW, chunk=plant.WINDOW_CHUNK):
         bank = mass_bank(plant.MASSES, seg0, device)
 
         def win(seg, rows):
-            return pe_module.window_evidences(seg, bank, rows=rows, chunk=chunk, n_window=n_window)
+            return pe_module.window_evidences(seg, bank, rows=rows, chunk=chunk, n_window=n_window,
+                                              **({} if lags is None else dict(lags=lags)))
         return win
     return factory
 
 
 PER_SEGMENT = plant.KEYS + ('ln_glitch_H', 'ln_glitch_L', 'wmax_H', 'wmax_L')
 WINDOW_KEYS = ('ln_window_H', 'ln_window_L', 'wmax_H', 'wmax_L')
+NET = ('wnet',)                 # sliced with the keys above when the result has it (pe_redshift, window_evidences(lags))
+
+
+def _with_net(keys, res):
+    return keys + tuple(k for k in NET if k in res)
 
 
 def merger_only(variant):
@@ -490,7 +498,8 @@ def merger_arrays(res, targets, pop):
             continue
         per_call = {k: res[k] for k in ('asym_outside',) if k in res}
         out[v] = plant.reduce(dict(m1=res['m1'], z=res['z'], **per_call,
-                                   **{key: np.asarray(res[key])[part] for key in PER_SEGMENT}), pop, plant.MDET)
+                                   **{key: np.asarray(res[key])[part] for key in _with_net(PER_SEGMENT, res)}), pop,
+                             plant.MDET)
     return out
 
 
@@ -561,7 +570,7 @@ def run(a, factory, log=print):
             if windows:                                 # every variant in one call, sliced
                 res = pe(seg, take)
                 arrays = {v: plant.reduce_windows(dict(rho_edges=res['rho_edges'], **{
-                    key: np.asarray(res[key])[j * n:(j + 1) * n] for key in WINDOW_KEYS}), bins)
+                    key: np.asarray(res[key])[j * n:(j + 1) * n] for key in _with_net(WINDOW_KEYS, res)}), bins)
                     for j, v in enumerate(need)}
                 shared = plant.window_shared(bins)
                 for v in need:
@@ -699,7 +708,7 @@ def main(argv=None, factory=None):
     """factory: replaces the analysis with the tables (tests)"""
     p, a = parse(argv)
     if factory is None and a.stage == 'windows':
-        factory = make_windows(a.device, a.n_window, a.chunk)
+        factory = make_windows(a.device, a.n_window, a.chunk, plant.store_lags(a.store))
     elif factory is None:
         for d in a.store.split(','):
             if not glob.glob(os.path.join(d, 'bd_*.npz')) and not plant.is_cache(d):

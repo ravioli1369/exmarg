@@ -11,7 +11,8 @@ The files.  Every win_<first>_<end>.npz of the folder, of one campaign (the meta
 'windows'), each holding the segments first .. end - 1, together a contiguous range of k once each; for a variant of the
 week (meta source 'strain') the whole selection, k = 0 .. n_selected - 1 of <folder>/../selection.txt.
 
-The fit.  A segment whose wmax_H or wmax_L exceeds --veto-w is set aside in both detectors (as plant_fit.py sets it
+The fit.  A segment whose wmax_H or wmax_L exceeds --veto-w, or whose wnet exceeds --w-net (84; inf: off; files
+without wnet: said, and the single-detector veto alone), is set aside in both detectors (as plant_fit.py sets it
 aside).  For each detector mixture.fit_windows on ln E_w[k] of the stored amplitude bins inside [--rho-min, --rho-max]
 (the law is zero outside), with --n-state states and --basis bins (a free weight per bin) or power (the law of a state a
 mixture of the laws rho^-g, g in GAMMAS, each normalized on those bins); 1, 2 and 3 states are fitted too, for the
@@ -22,7 +23,8 @@ rho_edges (single.RHO_EDGES); per detector H, L: f (K,), q (K,), pi_k (K rows ov
 the fitted bins), a (K, n_basis) the weights of the basis, err_f, err_q, err_a (fit_windows, from its Hessian; null
 where not finite), lnl, n_iter, n_parameters; fits {H, L: [{n_state, lnl, n_parameters, converged, n_iter}] for 1, 2,
 3 states}; settings {veto_w, rho_min, rho_max, n_state, basis, gammas (power) or null, fitted_bins [first, end) of
-rho_edges, fitted_edges}; segments {files, first, end, total, used, set_aside, set_aside_H, set_aside_L}; campaign
+rho_edges, fitted_edges, and w_net when the network cut acted}; segments {files, first, end, total, used, set_aside,
+set_aside_H, set_aside_L, and set_aside_net when it acted}; campaign
 (plant.campaign_key of the files: the same for both stages of a campaign); sha256 of the rest (plant.model_sha256, the
 JSON with sorted keys and no spaces).  f, q and pi_k are the arguments of single.window_posterior.
 """
@@ -51,6 +53,7 @@ summarize = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(summarize)
 
 VETO_W = 72.0
+W_NET = 84.0                    # the network cut of plant_fit.py: wnet above it is set aside too (inf: off)
 RHO = (4.0, 12.2)
 N_STATE = 2
 RECORD = (1, 2, 3)
@@ -188,7 +191,7 @@ def describe(cfg):
 
 
 def fit(folder, n_state=N_STATE, basis='bins', rho_min=RHO[0], rho_max=RHO[1], veto_w=VETO_W, zone=ZONE,
-        record=RECORD):
+        record=RECORD, w_net=W_NET):
     """the fits and the model of the folder: dict lines (the report), model (the content of glitch_model.json without
     its sha256), ok (the fits of the model written converged), fits {I: {K: fit_windows result}}, keep (n,), cols, data"""
     if basis not in ('bins', 'power'):
@@ -211,8 +214,11 @@ def fit(folder, n_state=N_STATE, basis='bins', rho_min=RHO[0], rho_max=RHO[1], v
     B = None if basis == 'bins' else power_basis(fe)
     nb = cols.sum() if B is None else B.shape[0]
     n = d['k'].size
-    loud = {I: d['wmax_' + I] > veto_w for I in 'HL'}
-    keep = ~(loud['H'] | loud['L'])
+    v = summarize.plant_fit.veto(d, veto_w, w_net)
+    if not v['applied'] and w_net is not None and w_net != np.inf:
+        lack = summarize.plant_fit._lacking(folder, 'wnet', 'win_*.npz')
+        v['note'] += ' (%d of %d files lack it)' % (lack, len(paths))
+    loud, keep = {I: v['loud_' + I] for I in 'HL'}, v['keep']
     Ks = sorted(set(record) | {n_state})
     R = {}
     for I in 'HL':
@@ -225,8 +231,11 @@ def fit(folder, n_state=N_STATE, basis='bins', rho_min=RHO[0], rho_max=RHO[1], v
          '%d segments in %d files, k %d to %d; %d windows%s; evidences stored on rho %.4g to %.4g'
          % (n, len(paths), d['k'][0], d['k'][-1], nw, ' of %.4g s' % (cfg['T'] / nw) if 'T' in cfg else '',
             edges[0], edges[-1]),
-         'loudness veto: set aside %d segments whose wmax_H or wmax_L exceeds %g (H %d, L %d); fitted on %d'
-         % ((~keep).sum(), veto_w, loud['H'].sum(), loud['L'].sum(), keep.sum()),
+         'loudness veto: set aside %d segments whose wmax_H or wmax_L exceeds %g (H %d, L %d)%s; fitted on %d'
+         % ((~keep).sum(), veto_w, loud['H'].sum(), loud['L'].sum(), ' or wnet exceeds %g (%d, %d of them by this '
+            'alone)' % (w_net, v['net'].sum(), (v['net'] & ~loud['H'] & ~loud['L']).sum()) if v['applied'] else '',
+            keep.sum()),
+         'network cut %s' % ('on: wnet > %g' % w_net if v['applied'] else v['note']),
          'fitted bins: %d, rho %.4g to %.4g (the law is zero outside); amplitude basis: %s' % (
              cols.sum(), fe[0], fe[-1], 'a free weight per bin' if B is None else
              'the laws rho^-g, g in %s, each normalized on these bins' % ', '.join('%g' % g for g in GAMMAS))]
@@ -290,6 +299,9 @@ def fit(folder, n_state=N_STATE, basis='bins', rho_min=RHO[0], rho_max=RHO[1], v
                                used=int(keep.sum()), set_aside=int((~keep).sum()), set_aside_H=int(loud['H'].sum()),
                                set_aside_L=int(loud['L'].sum())),
                  campaign=plant.campaign_key(cfg))
+    if v['applied']:                # recorded only when it acted: without it the model is that of the single veto
+        model['settings']['w_net'] = float(w_net)
+        model['segments']['set_aside_net'] = int(v['net'].sum())
     model = json.loads(json.dumps(model))
     slow = ['%s with %d states' % (I, K) for I in 'HL' for K in Ks if not R[I][K]['converged']]
     if not ok:
@@ -317,6 +329,9 @@ def main(argv=None):
     p.add_argument('folder', help='the folder of the win_*.npz files of one campaign or variant')
     p.add_argument('--veto-w', type=float, default=VETO_W,
                    help='set aside a segment whose wmax_H or wmax_L exceeds this')
+    p.add_argument('--w-net', type=float, default=W_NET,
+                   help='network cut: also set aside a segment whose wnet exceeds this (default %g; inf: off; files '
+                        'without wnet: said, and not applied)' % W_NET)
     p.add_argument('--rho-min', type=float, default=RHO[0], help='the fitted bins: those inside [rho-min, rho-max]')
     p.add_argument('--rho-max', type=float, default=RHO[1])
     p.add_argument('--n-state', type=int, default=N_STATE, help='states of the model written (1, 2, 3 are fitted too)')
@@ -330,7 +345,7 @@ def main(argv=None):
     if not (0 <= a.rho_min < a.rho_max) or a.n_state < 1 or a.zone < 0:
         p.error('need 0 <= rho-min < rho-max, n-state >= 1, zone >= 0')
     r = fit(a.folder, a.n_state, a.basis, a.rho_min, a.rho_max, a.veto_w, a.zone,
-            tuple(int(x) for x in a.record.split(',') if x))
+            tuple(int(x) for x in a.record.split(',') if x), a.w_net)
     print('\n'.join(r['lines']), flush=True)
     if not r['ok']:
         return 1

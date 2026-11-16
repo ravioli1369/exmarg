@@ -7,6 +7,10 @@ again here, pass.
     python scripts/real_data/summarize.py runs/week --recorded
     python scripts/real_data/summarize.py runs/week --extra-slides      # also the other time slides of the folder
 
+--w-net (default plant_fit.W_NET = 84; inf: off) and --f-det (default 0) are those of plant_fit.py: the network cut
+joins the loudness veto (files without wnet: said in the header, and not applied), and the detected fraction of that
+selection, which has to be measured on a plant with the same cut, enters nbar of the window model; both are printed.
+
 One row per variant (plant_fit.report on <out>/<variant>): segments kept and set aside by the loudness veto, nbar and
 its error with the Gaussian likelihood and with the mixture (joint power-law fit, the first --rho-min), the fitted
 eps_H, eps_L, gamma_H, gamma_L, the end and maximum of the evidence curve of each likelihood, and the verdict on the
@@ -232,7 +236,7 @@ def fit(out, variant, a, expected=None):
     if not glob.glob(os.path.join(path, 'plant_*.npz')):
         return None
     return plant_fit.report(path, veto_w=a.veto_w, w_inf_max=a.w_inf_max, rho_mins=a.rho_min, monitor_cut=a.monitor_cut,
-                            expected=expected)
+                            expected=expected, w_net=a.w_net, f_det=a.f_det)
 
 
 def main(argv=None):
@@ -241,12 +245,20 @@ def main(argv=None):
     p.add_argument('--recorded', action='store_true', help='after the controls pass, also the week as recorded')
     p.add_argument('--rho-min', type=float, nargs='+', default=None, help='as plant_fit.py (default 5 4.5 6)')
     p.add_argument('--veto-w', type=float, default=plant_fit.VETO_W)
+    p.add_argument('--w-net', type=float, default=plant_fit.W_NET,
+                   help='network cut, as plant_fit.py: wnet above this is set aside too (default %g; inf: off; files '
+                        'without wnet: said, and the single-detector veto alone)' % plant_fit.W_NET)
+    p.add_argument('--f-det', type=float, default=0.0,
+                   help='the detected fraction f of the selection (veto and network cut) in nbar of the window model: '
+                        'measure it on a plant with the same cut (plant_fit.py prints it); default 0, none')
     p.add_argument('--w-inf-max', type=float, default=plant_fit.W_INF_MAX)
     p.add_argument('--monitor-cut', type=float, default=None, help='as plant_fit.py: set aside segments with a band '
                    'power this many widths above the median')
     p.add_argument('--extra-slides', action='store_true', help='also fit every other slide* folder of <out>, with the '
                    'criteria of the slid weeks, as rows marked (extra) after the frozen ones')
     a = p.parse_args(argv)
+    if not a.f_det < 1:
+        p.error('need f-det < 1')
     extra = extra_slides(a.out) if a.extra_slides else []
     n_selected, campaign = check_week(a.out, ORDER + tuple(extra), (RECORDED,) if a.recorded else ())
     results = {}
@@ -255,9 +267,13 @@ def main(argv=None):
         print('fitted %s' % v if results[v] is not None else 'no files in %s' % os.path.join(a.out, v), flush=True)
     rho = next((r['rho_min'] for r in results.values() if r is not None), None)
     windows = any(r is not None and r.get('model') == 'windows' for r in results.values())
-    print('\nthe week, in the order fixed before the first run; loudness veto w > %g%s, %s; '
+    nets = sorted({(r['veto']['note'] or 'on') if 'veto' in r else 'not reported' for r in results.values()
+                   if r is not None})
+    print('\nthe week, in the order fixed before the first run; loudness veto w > %g%s, network cut wnet > %g (%s); '
+          'detected fraction f = %g in nbar of the window model (%s); %s; '
           'evidence: ln of the evidence ratio against no mergers, prior uniform in ln nbar on [%g, %g]\n'
-          % (a.veto_w, '' if a.monitor_cut is None else ', band-power cut at %g widths' % a.monitor_cut,
+          % (a.veto_w, '' if a.monitor_cut is None else ', band-power cut at %g widths' % a.monitor_cut, a.w_net,
+             '; '.join(nets), a.f_det, 'given with --f-det' if a.f_det else 'the default: no detected fraction',
              'the window model of each variant\'s own data (glitch parameters of stage 1)' if windows else
              'glitch law from rho_min %s' % plant_fit._f(rho, '%g'), plant_fit.PRIOR[0], plant_fit.PRIOR[1]))
     print('\n'.join(table([row(v, results[v]) for v in ORDER], windows)), flush=True)
