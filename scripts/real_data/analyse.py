@@ -86,7 +86,20 @@ data of detector I, on its own curve, by kappa_I (0.97283 for the median of N = 
 the epoch and detector.  With --unequal the bank of each epoch takes these gains (the model's template of detector I is
 kappa_I a; bank.MassBank, pe), and the injections of inj are multiplied by them, so that they are what a real signal is
 in these data.  --no-gain: the model without them (a control; recorded as signal_gain none, the default as epoch; a
-setting of the merger stage only, plant.MERGER_KEYS: the window stage does not depend on it).
+setting of the merger stage, plant.MERGER_KEYS: the window evidences do not depend on it; the merger evidence of a
+windows stage run with the store does, being that of the model power kappa_I^2 u_I, so that stage's bank takes the
+gains too and its merger_population records signal_gain).
+
+Mergers in stage 1 (docs/2026-11-15_mergers_in_stage1.md).  --stage windows with the store folder in place of none also
+writes ln_merger_H, ln_merger_L, the merger evidence of each window for the population of --zmin, GRID, MDET, ymin and
+the ladder of the store (plant.py, "Mergers in stage 1"), and records merger_population.  A glitch model fitted with
+mergers (windows_fit.py --nbar N > 0, on the variants zero and inj only) is refused for the variants pr, rev and the
+slides, whose model is that without mergers (Sec. 3 of the note), and for a run of another population; the iteration of
+the two stages on one variant:
+    python scripts/real_data/analyse.py tables/redshift gpu data/segments/O3b_v2 --out runs/week_w --stage windows
+    python scripts/validate/iterate.py runs/week_w/zero runs/week_iter --passes 2 --results zero -- python \
+        scripts/real_data/analyse.py tables/redshift gpu data/segments/O3b_v2 --variants zero --glitch-model {model} \
+        --out {out}
 """
 import argparse
 import glob
@@ -367,23 +380,28 @@ def analyse_calls(calls):
     return [pe(*args) for pe, args in calls]
 
 
-def make_windows(device, n_window=plant.N_WINDOW, chunk=plant.WINDOW_CHUNK):
+def make_windows(device, n_window=plant.N_WINDOW, chunk=plant.WINDOW_CHUNK, population=None):
     """stage 1 of the window model: factory(segments) builds the bank of plant.MASSES on the epoch's noise curve and
-    returns win(segments, rows) -> the dict of pe.window_evidences of those rows (no tables)"""
+    returns win(segments, rows) -> the dict of pe.window_evidences of those rows (no tables), with the merger evidence
+    of the population (plant.merger_population(settings)) when given; the bank then takes the signal gain the segments
+    carry (segments['gain'], variants with gain), which the merger evidence depends on and the window evidences do not"""
     from exmarg.search import mass_bank
     from exmarg.search import pe as pe_module
+    extra = {} if population is None else dict(population=population)
 
     def factory(seg0):
-        bank = mass_bank(plant.MASSES, seg0, device)
+        bank = mass_bank(plant.MASSES, seg0, device, gain=seg0.get('gain') if population is not None else None)
 
         def win(seg, rows):
-            return pe_module.window_evidences(seg, bank, rows=rows, chunk=chunk, n_window=n_window)
+            return pe_module.window_evidences(seg, bank, rows=rows, chunk=chunk, n_window=n_window, **extra)
         return win
     return factory
 
 
 PER_SEGMENT = plant.KEYS + ('ln_glitch_H', 'ln_glitch_L', 'wmax_H', 'wmax_L')
 WINDOW_KEYS = ('ln_window_H', 'ln_window_L', 'wmax_H', 'wmax_L')
+MERGER_KEYS = ('ln_merger_H', 'ln_merger_L')          # the merger evidence of the windows stage (with the store)
+WITH_MERGERS = ('zero', 'inj')                          # the variants whose glitch model may be fitted with mergers
 
 
 def merger_only(variant):
@@ -394,20 +412,30 @@ def merger_only(variant):
 
 
 def load_models(a, cfgs):
-    """{variant: (the glitch settings of pe_redshift, the model's SHA-256)} of --glitch-model for the variants of cfgs
-    (their campaigns without the model): 'auto', each variant's own <out>/<variant>/glitch_model.json fitted on its
-    campaign (merger_only aside); a file, that model for every variant, fitted on a variant of the same campaign
-    (VARIANT_KEYS and zmin aside).  plant.glitch_model refuses a modified file, another n_window or another campaign"""
-    if a.glitch_model == 'auto':
-        return {v: plant.glitch_model(os.path.join(a.out, v, MODEL), cfg, a.n_window, ignore=merger_only(v))
-                for v, cfg in cfgs.items()}
-    return {v: plant.glitch_model(a.glitch_model, cfg, a.n_window, ignore=VARIANT_KEYS + ('zmin',))
-            for v, cfg in cfgs.items()}
+    """{variant: (the glitch settings of pe_redshift, the model's SHA-256, the nbar of its stage-1 fit)} of
+    --glitch-model for the variants of cfgs (their campaigns without the model): 'auto', each variant's own
+    <out>/<variant>/glitch_model.json fitted on its campaign (merger_only aside); a file, that model for every variant,
+    fitted on a variant of the same campaign (VARIANT_KEYS and zmin aside).  plant.glitch_model refuses a modified
+    file, another n_window, another campaign, or a model fitted with mergers (nbar > 0) of another population than
+    that of this run; and a model fitted with mergers is refused for the time-slid, time-reversed and phase-randomized
+    variants, whose glitch model is that without mergers (docs/2026-11-15_mergers_in_stage1.md, Sec. 3)"""
+    s = plant.store_ladder(a.store)
+    out = {}
+    for v, cfg in cfgs.items():
+        path = os.path.join(a.out, v, MODEL) if a.glitch_model == 'auto' else a.glitch_model
+        nbar = plant.model_nbar(plant.read_model(path)[0]) if os.path.exists(path) else 0.0
+        if nbar > 0 and v not in WITH_MERGERS:
+            raise SystemExit('%s: a model fitted with mergers (nbar %g) is not for the variant %s: the time-slid, '
+                             'time-reversed and phase-randomized data keep the model without mergers' % (path, nbar, v))
+        pop = None if s is None else plant.population_settings(a.zmin, cfg['ymin'], s, cfg.get('signal_gain'))
+        ignore = merger_only(v) if a.glitch_model == 'auto' else VARIANT_KEYS + ('zmin',)
+        out[v] = plant.glitch_model(path, cfg, a.n_window, ignore=ignore, population=pop) + (nbar,)
+    return out
 
 
-def campaign(a, seg_dir, variant, sha=None):
+def campaign(a, seg_dir, variant, sha=None, model_nbar=0.0):
     """the settings of one variant's files (the same in every file of it): of the merger stage, with the window model
-    of SHA-256 sha when given, or of the windows stage (a.stage)"""
+    of SHA-256 sha when given (fitted at the merger rate model_nbar), or of the windows stage (a.stage)"""
     digest = manifest_digest(seg_dir)
     nbar = None if variant == 'zero' else a.nbar_inj if variant == 'inj' else 0.0
     cfg = dict(version=VERSION, source='strain', segments=os.path.basename(os.path.normpath(seg_dir)),
@@ -428,7 +456,7 @@ def campaign(a, seg_dir, variant, sha=None):
     cfg.update(plant.store_settings(a))
     cfg = plant.stage_settings(cfg, a)
     if sha is not None:
-        cfg = plant.with_model(cfg, sha, a.n_window)
+        cfg = plant.with_model(cfg, sha, a.n_window, model_nbar)
     return json.loads(json.dumps(cfg))
 
 
@@ -501,11 +529,12 @@ def run(a, factory, log=print):
     os.makedirs(a.out, exist_ok=True)
     record_selection(a.out, sel)
     windows = a.stage == 'windows'
+    merger_evidence = windows and plant.store_ladder(a.store) is not None     # the windows stage with the store
     prefix = plant.PREFIX[a.stage]
     cfgs = {v: campaign(a, a.segments, v) for v in names}
     models = load_models(a, cfgs) if a.glitch_model else None
     if models:
-        cfgs = {v: campaign(a, a.segments, v, models[v][1]) for v in names}
+        cfgs = {v: campaign(a, a.segments, v, models[v][1], models[v][2]) for v in names}
     for v in names:
         os.makedirs(os.path.join(a.out, v), exist_ok=True)
         plant.check_folder(os.path.join(a.out, v), cfgs[v], ignore=merger_only(v))
@@ -532,7 +561,7 @@ def run(a, factory, log=print):
             t0 = time.time()
             ep = strain.read_epoch(os.path.join(a.segments, sel[e]['name']))
             var, rows, inj = variants(params, ep, need, sampler, a.unequal,
-                                      a.unequal and not a.no_gain and not windows)
+                                      a.unequal and not a.no_gain and (not windows or merger_evidence))
             n, ns = rows.size, int(np.asarray(ep['gps']).size)
             extra = [v for v in need if v not in VARIANTS]
             # the variants of VARIANTS at the fixed slots VARIANTS.index(v) ns + row of one stack; the windows stage has
@@ -561,8 +590,8 @@ def run(a, factory, log=print):
             if windows:                                 # every variant in one call, sliced
                 res = pe(seg, take)
                 arrays = {v: plant.reduce_windows(dict(rho_edges=res['rho_edges'], **{
-                    key: np.asarray(res[key])[j * n:(j + 1) * n] for key in WINDOW_KEYS}), bins)
-                    for j, v in enumerate(need)}
+                    key: np.asarray(res[key])[j * n:(j + 1) * n] for key in WINDOW_KEYS + MERGER_KEYS if key in res}),
+                    bins) for j, v in enumerate(need)}
                 shared = plant.window_shared(bins)
                 for v in need:
                     acc[v].append(dict(arrays[v], **book[v]))
@@ -671,8 +700,10 @@ def parse(argv=None):
         p.error('--variants: %s' % err)
     if a.chunk is None:
         a.chunk = plant.WINDOW_CHUNK if a.stage == 'windows' else CHUNK
-    if a.stage == 'windows' and (a.glitch_model or a.ymin is not None or a.zmin_cut or a.mmap):
-        p.error('--glitch-model, --ymin, --zmin-cut and --mmap are of the merger stage')
+    if a.stage == 'windows' and (a.glitch_model or a.zmin_cut or a.mmap):
+        p.error('--glitch-model, --zmin-cut and --mmap are of the merger stage')
+    if a.stage == 'windows' and a.ymin is not None and plant.store_ladder(a.store) is None:
+        p.error('--ymin with the windows stage sets the population of its merger evidence: give the store')
     if not a.zmin >= 0:
         p.error('need zmin >= 0')
     if a.no_gain and not a.unequal:
@@ -699,7 +730,10 @@ def main(argv=None, factory=None):
     """factory: replaces the analysis with the tables (tests)"""
     p, a = parse(argv)
     if factory is None and a.stage == 'windows':
-        factory = make_windows(a.device, a.n_window, a.chunk)
+        s = plant.store_ladder(a.store)
+        pop = None if s is None else plant.merger_population(plant.population_settings(
+            a.zmin, plant.default_ymin() if a.ymin is None else a.ymin, s))
+        factory = make_windows(a.device, a.n_window, a.chunk, pop)
     elif factory is None:
         for d in a.store.split(','):
             if not glob.glob(os.path.join(d, 'bd_*.npz')) and not plant.is_cache(d):
