@@ -216,7 +216,7 @@ def test_gains_one_bit_identical(pe_base, glitch):
         base = all_outputs(pe_base, c["segs"], b0, stores, glitch)
         for bank in (b0, b1):
             now = all_outputs(pe, c["segs"], bank, stores, glitch)
-            assert set(now) == set(base)
+            assert set(now) - {"pe_redshift wnet", "pe_intrinsic wnet"} == set(base)     # wnet: added after BASE
             for k in base:
                 assert same(now[k], base[k]), k
             n += len(base)

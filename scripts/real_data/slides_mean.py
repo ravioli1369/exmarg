@@ -7,12 +7,15 @@ frozen set; summarize.py has the verdicts, this script the numbers that say how 
 Every folder slide<+ or ->seconds of <out> must be complete (summarize.check_week: each segment k = 0 .. n_selected - 1
 once, one campaign) and a control of the week (meta control = the folder, nbar 0, no merger known); another folder
 named slide*, a folder that is not a slide, or <out> being a variant folder, is refused.  The recorded week, pr, rev and
-inj are never opened (only the slide folders are read, and only k, wmax_H, wmax_L and ln_B_bar or ln_lambda_bar).
+inj are never opened (only the slide folders are read, and only k, wmax_H, wmax_L, wnet and ln_B_bar or
+ln_lambda_bar).
 
 The statistic is Bbar of the window model (ln_B_bar) in files that carry it, else, in files of the mixture, the Gaussian
 Lambda_bar (ln_lambda_bar; said in the output); every slide must carry the same (a mixture of the two is refused).  A
-segment is set aside when wmax_H or wmax_L exceeds --veto-w, as plant_fit.py does.  Per slide: the kept segments, the
-mean of B - 1 with its standard error (std / sqrt n, the segments taken as independent), the number of segments that
+segment is set aside when wmax_H or wmax_L exceeds --veto-w or wnet exceeds --w-net (84; inf: off; files without wnet:
+said, and the single-detector veto alone), as plant_fit.py does; --f-det (default 0) is the detected fraction of that
+selection in every nbar (plant_fit.nbar_fit), and with the cut the null mean of B - 1 is -f.  Per slide: the kept
+segments, the mean of B - 1 with its standard error (std / sqrt n, the segments taken as independent), the number of segments that
 carry half of sum |B - 1|, the largest ln B and its k, and nbar and its error (plant_fit.nbar_fit, maximizing sum ln(1 +
 nbar (B - 1)), the error from the curvature).
 
@@ -55,9 +58,10 @@ def slide_folders(out):
     return sorted(names, key=lambda v: float(v[5:]))
 
 
-def read_slide(out, variant, veto_w):
-    """the kept segments of one slide in order of k: dict k, ln (ln of the statistic), stat ('window' or 'gauss'), and
-    n_all; SystemExit when the files are not those of a slide control of the week"""
+def read_slide(out, variant, veto_w, w_net=None):
+    """the kept segments of one slide in order of k: dict k, ln (ln of the statistic), stat ('window' or 'gauss'),
+    n_all and net (the network cut in words: on, off, or why not applied; plant_fit.veto with w_net); SystemExit when
+    the files are not those of a slide control of the week"""
     files = sorted(glob.glob(os.path.join(out, variant, 'plant_*.npz')))
     parts, stat = [], None
     for path in files:
@@ -69,17 +73,20 @@ def read_slide(out, variant, veto_w):
             if stat not in (None, this):
                 raise SystemExit('%s: the files of %s do not all carry the same statistic' % (path, variant))
             stat = this
-            part = {key: np.asarray(z[key]) for key in KEYS}
+            part = {key: np.asarray(z[key]) for key in KEYS + tuple(k for k in ('wnet',) if k in z.files)}
             part['ln'] = np.asarray(z['ln_B_bar' if this == 'window' else 'ln_lambda_bar'], float)
         if meta.get('control') != variant or meta.get('nbar') != 0 or meta.get('merger_truth') != 'none':
             raise SystemExit('%s: not a time slide control of the week (meta control %r, nbar %r, merger_truth %r)'
                              % (path, meta.get('control'), meta.get('nbar'), meta.get('merger_truth')))
         parts.append(part)
-    d = {key: np.concatenate([p[key] for p in parts]) for key in parts[0]}
+    d = {key: np.concatenate([p[key] for p in parts]) for key in set.intersection(*(set(p) for p in parts))}
     order = np.argsort(d['k'], kind='stable')
     d = {key: v[order] for key, v in d.items()}
-    keep = (d['wmax_H'] <= veto_w) & (d['wmax_L'] <= veto_w)
-    return dict(k=d['k'][keep], ln=d['ln'][keep], stat=stat, n_all=int(d['k'].size))
+    v = plant_fit.veto(d, veto_w, w_net)
+    keep = v['keep']
+    lack = sum('wnet' not in p for p in parts)
+    net = 'on' if v['applied'] else v['note'] + (' (%d of %d files lack it)' % (lack, len(parts)) if lack else '')
+    return dict(k=d['k'][keep], ln=d['ln'][keep], stat=stat, n_all=int(d['k'].size), net=net)
 
 
 def blocks_of(k, n, G):
@@ -99,13 +106,14 @@ def jackknife(estimate, blocks):
     return full, float(np.sqrt((g - 1) / g * np.sum((reps - reps.mean()) ** 2))), reps
 
 
-def analyse(out, veto_w=plant_fit.VETO_W, G=BLOCKS):
+def analyse(out, veto_w=plant_fit.VETO_W, G=BLOCKS, w_net=plant_fit.W_NET, f_det=0.0):
     """the numbers of every slide of out and of all together: dict n_selected, slides {name: dict kept, aside, mean, se,
     half, max, k_max, nbar, err}, stat, pooled dict pairs, mean, jack_mean, naive_se, nbar, jack_nbar, curv_nbar,
-    blocks; lines (the text)"""
+    blocks; lines (the text).  w_net: the network cut (plant_fit.veto); f_det: the detected fraction of every
+    nbar_fit"""
     names = slide_folders(out)
     n, _ = summarize.check_week(out, names)
-    data = {v: read_slide(out, v, veto_w) for v in names}
+    data = {v: read_slide(out, v, veto_w, w_net) for v in names}
     stats = {d['stat'] for d in data.values()}
     if len(stats) > 1:
         raise SystemExit('%s: slides of the window model (%s) and of the mixture (%s) cannot be pooled' % (
@@ -116,14 +124,17 @@ def analyse(out, veto_w=plant_fit.VETO_W, G=BLOCKS):
     L = ['the time slides of %s: %s; %d selected segments per slide' % (out, ', '.join(names), n),
          'statistic %s%s; segments with wmax_H or wmax_L above %g set aside' % (
              sym, ' of the window model (ln_B_bar)' if stat == 'window' else ' of the Gaussian likelihood (ln_lambda_bar): '
-             'these files carry the mixture, not the window model, so only the Gaussian likelihood is used', veto_w), '',
+             'these files carry the mixture, not the window model, so only the Gaussian likelihood is used', veto_w),
+         'network cut wnet > %g: %s' % (w_net, '; '.join('%s %s' % (v, data[v]['net']) for v in names)),
+         'detected fraction f = %g in nbar (%s); with the cut the null mean of %s - 1 is -f, not 0' % (
+             f_det, 'given with --f-det' if f_det else 'the default: none', sym), '',
          '%-12s %6s %-20s %-13s %8s %11s %6s   %s' % ('slide', 'kept', 'mean(%s - 1) +- se' % sym, 'mean / se',
                                                      'half-sum', 'max ln %s' % sym[0], 'at k', 'nbar +- error')]
     slides = {}
     for v in names:
         d = data[v]
         mu, se, c = plant_fit.mean_se(plant_fit._excess(d['ln']))
-        fit = plant_fit.nbar_fit(d['ln'])
+        fit = plant_fit.nbar_fit(d['ln'], f_det)
         i = int(np.argmax(d['ln']))
         slides[v] = dict(kept=c, aside=d['n_all'] - c, mean=mu, se=se, half=plant_fit.heavy_tail(d['ln']),
                          max=float(d['ln'][i]), k_max=int(d['k'][i]), nbar=fit['nbar'], err=fit['err']['nbar'],
@@ -138,10 +149,10 @@ def analyse(out, veto_w=plant_fit.VETO_W, G=BLOCKS):
     with np.errstate(over='ignore', invalid='ignore'):
         mean = lambda m: float(x[m].mean())
         mu, jse, _ = jackknife(mean, blk)
-        nb = lambda m: plant_fit.nbar_fit(ln[m])['nbar']
+        nb = lambda m: plant_fit.nbar_fit(ln[m], f_det)['nbar']
         nbar, jnb, _ = jackknife(nb, blk)
     naive = plant_fit.mean_se(x)[1]
-    curv = plant_fit.nbar_fit(ln)
+    curv = plant_fit.nbar_fit(ln, f_det)
     pooled = dict(pairs=int(ln.size), mean=mu, jack_mean=jse, naive_se=naive, nbar=nbar, jack_nbar=jnb,
                   curv_nbar=curv['err']['nbar'], blocks=int(np.unique(blk).size), edge=curv['edge'])
     L += ['', 'all %d slides together, %d (segment, slide) pairs; delete-one-block jackknife over %d blocks of consecutive k '
@@ -161,10 +172,17 @@ def main(argv=None):
                    'exceeds this (as plant_fit.py)')
     p.add_argument('--blocks', type=int, default=BLOCKS, help='blocks of consecutive k of the jackknife (default %d)'
                    % BLOCKS)
+    p.add_argument('--w-net', type=float, default=plant_fit.W_NET,
+                   help='network cut, as plant_fit.py (default %g; inf: off; files without wnet: said, and not applied)'
+                        % plant_fit.W_NET)
+    p.add_argument('--f-det', type=float, default=0.0,
+                   help='the detected fraction of the selection in nbar (from a plant with the same cut; default 0)')
     a = p.parse_args(argv)
     if a.blocks < 2:
         p.error('need blocks >= 2')
-    print('\n'.join(analyse(a.out, a.veto_w, a.blocks)['lines']), flush=True)
+    if not a.f_det < 1:
+        p.error('need f-det < 1')
+    print('\n'.join(analyse(a.out, a.veto_w, a.blocks, a.w_net, a.f_det)['lines']), flush=True)
     return 0
 
 

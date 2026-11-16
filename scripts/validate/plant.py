@@ -54,6 +54,8 @@ settings, the same in every file, and under 'run' the device, host, timings), rh
     w_inf_cells (n_cell, 2)              (m1, z) grid indices of those cells, over the batch (not per segment)
     ln_glitch_H, ln_glitch_L (n, n_rho)  ln of the template average, uniform weights, of E_I[m, k]
     wmax_H, wmax_L                       largest w over the templates
+    wnet                                 largest w_H(t + tau) + w_L(t) over the templates (pe_redshift's wnet: every
+                                         arrival time and lag of the tables; the network cut of plant_fit.py)
     merger, m1, z, y, snr                the merger planted in segment k (m1, z nan, y and snr 0 when absent)
     merger_H, merger_L, coherent         a merger signal in the H, L data after the control; coherent: aligned in both
     glitch_I, kind_I, rho_I, t0_I        the glitch in the data of detector I after the control (t0 moved with it)
@@ -80,12 +82,14 @@ noise {asym} or {curves, sha256}.  The store argument may list several folders (
 tables_asym), --asym-tol (default 0.05, with unequal curves or several stores; recorded, and asym_outside per segment),
 --zmin-cut (pe_redshift(zmin=--zmin)), --mmap (unbiased caches mapped).
 
-Stage 1 of the window model, --stage windows (no tables; the store argument is not read): the same segments, batches
+Stage 1 of the window model, --stage windows (no tables; of the store argument only its header is read, when it names
+a store folder or cache: the lags, for wnet, and the ladder of the merger evidence below; with 'none' the files have
+neither, and plant_fit.py and windows_fit.py apply the single-detector veto alone): the same segments, batches
 and controls, through pe.window_evidences(n_window=--n-window) on the bank of the analysis, into
 win_<first>_<end>.npz next to the plant files of the campaign, with meta (the campaign without the settings of the
 merger stage, and stage 'windows', n_window, window_rho), window_rho_edges (n_bin + 1,) the edges of the amplitude bins
 of RHO_EDGES that overlap [--window-rho-min, --window-rho-max], window_bin0 the index of the first, and per segment k,
-the truth arrays as above, wmax_H, wmax_L and
+the truth arrays as above, wmax_H, wmax_L, wnet (with the lags) and
     ln_window_H, ln_window_L (n, n_window, n_bin) float32   ln E_w[k] of each window on those bins
 windows_fit.py fits them and writes glitch_model.json.  Stage 2, --glitch-model glitch_model.json: pe_redshift with
 glitch=dict(model='windows', ...) of that file (refused when the file was modified, its n_window is not --n-window or
@@ -388,7 +392,8 @@ def simulate_batch(cfg, first, end, sampler):
 
 def reduce(res, pop, mdet_range=MDET):
     """the per-segment arrays kept from a pe_redshift result (glitch=True): ln Lbar of the six ln_lambda grids on the
-    population pop, w_inf and w_inf_cells, ln of the template average of E_I (n, n_rho) and the largest w.  With the
+    population pop, w_inf and w_inf_cells, ln of the template average of E_I (n, n_rho), the largest w and, when res
+    has it, the largest wnet over the templates.  With the
     window model (ln_B in res): ln Lbar of the grids KEYS_W, w_inf over the cells where ln_lambda or ln_B is not
     finite, and ln_c_I (n,), state_I (n, K) as given.  With asym_outside in res (pe_redshift with asym_tol) that number
     for every segment"""
@@ -411,6 +416,8 @@ def reduce(res, pop, mdet_range=MDET):
         if windows:
             out['ln_c_' + I] = np.asarray(res['ln_c_' + I], float)
             out['state_' + I] = np.asarray(res['state_' + I], float)
+    if 'wnet' in res:
+        out['wnet'] = np.asarray(res['wnet'], float).max(axis=1)
     return out
 
 
@@ -425,7 +432,8 @@ def window_bins(rho_min, rho_max):
 def reduce_windows(res, bins):
     """the per-segment arrays kept from a pe.window_evidences result: ln_window_I (n, n_window, bins.sum()) float32 on
     the amplitude bins `bins` of RHO_EDGES, and the largest w over the templates wmax_I (n,); with the merger evidence
-    (window_evidences with a population) also ln_merger_I (n, n_window) float64"""
+    (window_evidences with a population) also ln_merger_I (n, n_window) float64; wnet (n,), the largest over the
+    templates, when res has it (window_evidences with lags)"""
     if not np.array_equal(np.asarray(res['rho_edges'], float), RHO_EDGES):
         raise ValueError('window_evidences returned other amplitude bins than single.RHO_EDGES')
     out = {}
@@ -434,6 +442,8 @@ def reduce_windows(res, bins):
         out['wmax_' + I] = np.asarray(res['wmax_' + I], float).max(axis=1)
         if 'ln_merger_' + I in res:
             out['ln_merger_' + I] = np.asarray(res['ln_merger_' + I], float)
+    if 'wnet' in res:
+        out['wnet'] = np.asarray(res['wnet'], float).max(axis=1)
     return out
 
 
@@ -462,13 +472,14 @@ def make_analysis(store, device, resident=False, chunk=CHUNK, ymin=None, shared_
     return factory
 
 
-def make_windows(device, n_window=N_WINDOW, chunk=WINDOW_CHUNK, population=None):
+def make_windows(device, n_window=N_WINDOW, chunk=WINDOW_CHUNK, population=None, lags=None):
     """stage 1 of the window model behind the same interface: factory(segments) builds the bank on these segments and
     returns win(segments) -> the dict of pe.window_evidences (no tables), with the merger evidence of the population
-    (merger_population(settings)) when given"""
+    (merger_population(settings)) when given, and wnet with lags (those of the tables)"""
     from exmarg.search import mass_bank
     from exmarg.search import pe as pe_module
-    extra = {} if population is None else dict(population=population)
+    extra = dict({} if population is None else dict(population=population), **({} if lags is None else
+                                                                                dict(lags=lags)))
 
     def factory(seg0):
         bank = mass_bank(MASSES, seg0, device)
@@ -477,6 +488,21 @@ def make_windows(device, n_window=N_WINDOW, chunk=WINDOW_CHUNK, population=None)
             return pe_module.window_evidences(seg, bank, chunk=chunk, n_window=n_window, **extra)
         return win
     return factory
+
+
+def store_lags(store, log=print):
+    """the lags of the tables named by the store argument (comma-separated folders or unbiased caches; the header only),
+    for the wnet of the windows stage; None, said in the log, when it names none ('none' or a folder without tables);
+    SystemExit when the folders have different lags"""
+    dirs = [d for d in store.split(',') if d and (glob.glob(os.path.join(d, 'bd_*.npz')) or is_cache(d))]
+    if not dirs:
+        log('%s  %s holds no tables: the windows stage writes no wnet (the network cut of plant_fit.py and '
+            'windows_fit.py needs it; give the store folder for its lags)' % (stamp(), store), flush=True)
+        return None
+    lags = [np.asarray(read_header(d)['tau_idx'], int).ravel() for d in dirs]
+    if any(not np.array_equal(x, lags[0]) for x in lags[1:]):
+        raise SystemExit('the store folders %s have different lags' % ', '.join(dirs))
+    return lags[0]
 
 
 def batches(start, n, batch):
@@ -896,7 +922,8 @@ def main(argv=None, factory=None):
         cfg = with_model(cfg, sha, a.n_window, model_nbar(read_model(a.glitch_model)[0]))
     if factory is None and windows:
         pop = cfg.get('merger_population')
-        factory = make_windows(a.device, a.n_window, a.chunk, None if pop is None else merger_population(pop))
+        factory = make_windows(a.device, a.n_window, a.chunk, None if pop is None else merger_population(pop),
+                               store_lags(a.store))
     elif factory is None:
         for d in a.store.split(','):
             if not glob.glob(os.path.join(d, 'bd_*.npz')) and not is_cache(d):

@@ -783,7 +783,10 @@ def run_factors(a):
         d = os.path.join(a.runs, 'simstrain_' + arm, 'zero')
         cfg, _, dd, runs, _ = pf.load(d)
         idx = np.array([where[int(round(g))] for g in dd['gps']])
-        data[arm] = dict(lnL=dd['ln_lambda_bar'], keep=(dd['wmax_H'] <= pf.VETO_W) & (dd['wmax_L'] <= pf.VETO_W),
+        w_net = pf.W_NET if a.w_net is None else a.w_net
+        cut = pf.veto(dd, pf.VETO_W, w_net)
+        print('%s: network cut %s' % (arm, 'on, wnet > %g' % w_net if cut['applied'] else cut['note']), flush=True)
+        data[arm] = dict(lnL=dd['ln_lambda_bar'], keep=cut['keep'],
                          idx=idx, t_pe=float(np.mean([r['t_pe'] for r in runs])), wmax_H=dd['wmax_H'],
                          wmax_L=dd['wmax_L'], w_inf=dd['w_inf'])
     n = tr['gps'].size
@@ -1155,7 +1158,8 @@ def run_gain(a):
 
 def run_pairs(a):
     """Nbar of every arm and the paired ratios between arms (any names, as runs/simstrain_<name>/zero), with block
-    jackknife errors on the segments every arm keeps (veto wmax_I <= 72 in all of them): overall, by detector-frame total
+    jackknife errors on the segments every arm keeps (veto wmax_I <= 72 and the network cut wnet <= --w-net in all of
+    them): overall, by detector-frame total
     mass of the equal-mass merger (bins at the quartiles of the planted mergers, fixed before any fit; a bin keeps every
     merger-free segment and the mergers of the bin) and by arrival time t_H in the segment; the unit mean of every arm
     (merger-free segments; all segments of a noise-only arm, whose name starts with N) and of the merger-free segments
@@ -1173,7 +1177,10 @@ def run_pairs(a):
         idx = np.array([where[int(round(g))] for g in dd['gps']])
         lnL, keep = np.full(n, np.nan), np.zeros(n, bool)
         lnL[idx] = dd['ln_lambda_bar']
-        keep[idx] = (dd['wmax_H'] <= pf.VETO_W) & (dd['wmax_L'] <= pf.VETO_W)
+        w_net = pf.W_NET if a.w_net is None else a.w_net
+        cut = pf.veto(dd, pf.VETO_W, w_net)
+        print('%s: network cut %s' % (arm, 'on, wnet > %g' % w_net if cut['applied'] else cut['note']), flush=True)
+        keep[idx] = cut['keep']
         full[arm] = (lnL, keep)
         own = np.flatnonzero(keep)
         r = pf.nbar_fit(lnL[own])
@@ -1343,6 +1350,7 @@ def main(argv=None):
     q.add_argument('--pairs', required=True, help='X/Y,...: Nbar_X / Nbar_Y on the segments every arm keeps')
     q.add_argument('--predict', default='', help='X/Y=value,...: predictions written down before the runs')
     q.add_argument('--blocks', type=int, default=64)
+    q.add_argument('--w-net', type=float, default=None, help='network cut (default plant_fit.W_NET; inf: off)')
     q = sub.add_parser('owncheck')
     q.add_argument('root')
     q.add_argument('out')
@@ -1357,6 +1365,7 @@ def main(argv=None):
     q.add_argument('out')
     q.add_argument('--arms', default='N,A,B,C,D')
     q.add_argument('--blocks', type=int, default=64)
+    q.add_argument('--w-net', type=float, default=None, help='network cut (default plant_fit.W_NET; inf: off)')
     a = p.parse_args(argv)
     return dict(spectrum=run_spectrum, generate=run_generate, controls=run_controls, control3=run_control3,
                 gain=run_gain, owncheck=run_owncheck, pairs=run_pairs, factors=run_factors)[a.cmd](a)

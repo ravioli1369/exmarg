@@ -596,10 +596,10 @@ def test_default_path_unchanged(data, pe_head, which):
             for sgl in ((False, True) if glitch is None else (False,)):
                 a = getattr(pe, name)(*args, glitch=glitch, single=sgl, **extra, **kw)
                 b = getattr(pe_head, name)(*args, glitch=glitch, single=sgl, **extra, **kw)
-                assert set(a) == set(b)
-                for k in a:
+                assert set(a) - {"wnet"} == set(b)                   # wnet: added after the committed pe.py
+                for k in b:
                     assert np.array_equal(np.asarray(a[k]), np.asarray(b[k])), (name, k)
-                n += len(a)
+                n += len(b)
     print("\nglitch setting %d: %d arrays bit for bit equal to the committed pe.py" % (which, n))
 
 

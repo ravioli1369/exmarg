@@ -61,7 +61,7 @@ def test_windows_stage_writes_merger_evidence(tmp_path, capsys):
     name = 'win_0000000000_0000000002.npz'
     with np.load(os.path.join(out_s, name)) as a, np.load(os.path.join(out_n, name)) as b:
         ma, mb = json.loads(str(a['meta'])), json.loads(str(b['meta']))
-        assert set(a.files) == set(b.files) | {'ln_merger_H', 'ln_merger_L'}
+        assert set(a.files) == set(b.files) | {'ln_merger_H', 'ln_merger_L', 'wnet'}       # wnet: the lags of the store
         for k in b.files:
             if k != 'meta':
                 assert np.array_equal(a[k], b[k], equal_nan=a[k].dtype.kind == "f"), k
@@ -275,15 +275,16 @@ def run_committed_plant(tree, argv, cwd):
     assert r.returncode == 0, r.stderr[-2000:]
 
 
-def same_win_files(a, b, prefix):
-    """the files of prefix in folders a and b: the same names and members, every array bit for bit, the meta but run"""
+def same_win_files(a, b, prefix, new=('wnet',)):
+    """the files of prefix in folders a and b: the same names and members, every array bit for bit, the meta but run;
+    the files of b may hold the members new besides (wnet, of the network cut, after a79e07d), not compared"""
     import glob
     names = sorted(os.path.basename(f) for f in glob.glob(os.path.join(a, prefix + '_*.npz')))
     assert names and names == sorted(os.path.basename(f) for f in glob.glob(os.path.join(b, prefix + '_*.npz')))
     n = 0
     for name in names:
         with np.load(os.path.join(a, name)) as x, np.load(os.path.join(b, name)) as y:
-            assert x.files == y.files, name
+            assert set(y.files) - set(x.files) <= set(new) and [f for f in y.files if f in x.files] == x.files, name
             ma, mb = (json.loads(str(z['meta'])) for z in (x, y))
             ma.pop('run'), mb.pop('run')
             assert ma == mb, name

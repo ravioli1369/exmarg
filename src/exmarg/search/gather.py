@@ -27,6 +27,10 @@ and of the L arrival time t (glitch_likelihood.md Sec. 4), the same pass
 also sums exp(lnS + lkH(t + tau)), exp(lnS + lkL(t)) and
 exp(lnS + lkH(t + tau) + lkL(t)): the table is read once per arrival time
 and only the accumulation is done four times.
+
+network_max gives, per template, the largest W = w_H(t + tau) + w_L(t),
+w_I = |z_I|^2 / u_I, over every arrival time and lag the gather can read:
+the tables are accurate (1e-3 in ln, order 120) only up to a bound on W.
 """
 
 import numpy as np
@@ -460,6 +464,46 @@ def gather_gpu(traj, tables, mass_ids, lna, tab_ids, block=256, times=None, time
             cp.ascontiguousarray(sel, cp.int32), cp.ascontiguousarray(lw, cp.float32), lkH, lkL, om, os_)
     fn((nmass, ntau), (block,), args, shared_mem=shm)
     return _variants(cp.asnumpy(_lse_lags(om, os_, n_time, cp)), nv, ns)
+
+
+def network_max(lqH, lqL, ln_uH, ln_uL, tau_idx, xp=np, block=256):
+    """wnet (n_template,) float64 on the device of xp: per template the largest w_L(t) + w_H(t + tau) over every
+    arrival time t (all n_time of them, not a selection) and every lag tau of tau_idx (those the gather reads), t + tau
+    circular in the segment as in the gather, w_I = exp(2 ln|z_I| - ln u_I) = |z_I|^2 / u_I in float64 (the formula of
+    single._wmax).  Exact: w_L(t) + M_H(t) with M_H(t) = max over the lags of w_H(t + tau), the running maximum of
+    ln|z_H| over the lag window, by doubling for contiguous lags (two overlapping windows of 2^k samples, as
+    select_times), lag by lag otherwise; exp is monotone, so the maximum of ln|z_H| gives that of w_H.
+
+    lqH, lqL   (n_template, n_time) ln|z_I| (bank.trajectories), unscaled, on the device of xp
+    ln_uH, ln_uL  (n_template,) ln u_I, the power of the template in detector I (bank.u_H, bank.u_L)
+    tau_idx    the lags of the tables (samples, any order)
+    block      templates at once (bounds the temporary memory)"""
+    nm, nt = lqH.shape
+    lags = np.unique(np.asarray(tau_idx).ravel().astype(int))
+    lo, hi = int(lags[0]), int(lags[-1])
+    contiguous = lags.size == hi - lo + 1
+    k = int(np.floor(np.log2(hi - lo + 1)))
+    uH = xp.asarray(np.asarray(ln_uH, np.float64))
+    uL = xp.asarray(np.asarray(ln_uL, np.float64))
+    out = xp.empty(nm, xp.float64)
+    for a in range(0, nm, block):
+        b = min(a + block, nm)
+        if contiguous:
+            W = lqH[a:b]
+            for i in range(k):                      # W(t) = max of ln|z_H| over t .. t + 2^(i+1) - 1
+                W = xp.maximum(W, xp.roll(W, -(1 << i), axis=1))
+            mx = xp.maximum(xp.roll(W, -lo, axis=1), xp.roll(W, -(hi - (1 << k) + 1), axis=1))
+            del W
+        else:
+            mx = xp.roll(lqH[a:b], -lo, axis=1)
+            for tau in lags[1:]:
+                mx = xp.maximum(mx, xp.roll(lqH[a:b], -int(tau), axis=1))
+        wH = xp.exp(2.0 * mx.astype(xp.float64) - uH[a:b, None])
+        del mx
+        wL = xp.exp(2.0 * lqL[a:b].astype(xp.float64) - uL[a:b, None])
+        out[a:b] = (wL + wH).max(axis=1)
+        del wH, wL
+    return out
 
 
 def select_times(traj, tau_idx, n_loud, n_random, seed, xp=np, block=256, shared=False):

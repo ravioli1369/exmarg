@@ -38,6 +38,7 @@ from test_pe_windows import add_glitch, law
 
 ROOT = Path(__file__).resolve().parents[1]
 COMMITTED = "ee47f02"                       # pe.py before pe_redshift_epochs
+NEW = {"wnet"}                              # outputs added after COMMITTED (with single or glitch)
 S_NODES = (0.5, 2.0, 8.0)
 MIX = (-0.45, -0.30, -0.15)
 GRID = dict(nz=40, nm1=30, m1_range=(10.0, 60.0))
@@ -133,11 +134,13 @@ def test_batched_equals_per_epoch(committed, case):
         got = pe.pe_redshift_epochs(eps, st, chunk=chunk, **COMMON, **kw)
         assert len(got) == len(eps)
         for (name, _, _), r, (old, new) in zip(names, got, refs):
-            assert set(r) == set(old) == set(new), (case, name)
-            for k in r:
+            assert set(r) == set(new) and set(r) - NEW == set(old), (case, name)
+            for k in old:
                 assert bitwise(r[k], old[k]), (case, chunk, name, k)
                 assert bitwise(new[k], old[k]), (case, name, k)
                 n += 1
+            for k in set(r) - set(old):                 # added after COMMITTED: batched as the call of one epoch
+                assert bitwise(r[k], new[k]), (case, chunk, name, k)
     if kw.get("asym_tol"):
         assert [r["asym_outside"] for r in got] == [2, 2, 0]
     print("\n%s: %d arrays bit for bit equal to the per-epoch calls" % (case, n))
@@ -181,9 +184,10 @@ def small_week(folder, n=2):
     return folder
 
 
-def same_files(a, b):
+def same_files(a, b, new=('wnet',)):
     """every result file of folder a is in folder b with the same members in the same order, every array the same bit
-    for bit and the same meta but for the run's own record (times, process): the number of arrays compared"""
+    for bit and the same meta but for the run's own record (times, process): the number of arrays compared.  The files
+    of a may hold the members new (wnet, added after COMMITTED) besides, which are then not compared"""
     import glob
     import json
     import os
@@ -192,12 +196,12 @@ def same_files(a, b):
     n = 0
     for name in names:
         with np.load(os.path.join(a, name)) as x, np.load(os.path.join(b, name)) as y:
-            assert x.files == y.files, name
+            assert set(x.files) - set(y.files) <= set(new) and [f for f in x.files if f in y.files] == y.files, name
             ma, mb = (json.loads(str(z['meta'])) for z in (x, y))
             ra, rb = ma.pop('run'), mb.pop('run')
             assert ma == mb and {k: ra[k] for k in ('first', 'end', 'epochs', 'chunk')} == {
                 k: rb[k] for k in ('first', 'end', 'epochs', 'chunk')}, name
-            for key in x.files:
+            for key in y.files:
                 if key != 'meta':
                     assert bitwise(x[key], y[key]), (name, key)
                     n += 1
