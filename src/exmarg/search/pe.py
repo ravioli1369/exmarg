@@ -775,6 +775,7 @@ def _epochs_values(jobs, groups, block, resident, n_loud, n_random, shared_times
                                               shared=shared_times) if n_loud > 0 else None)
             if g is not None:                               # the rows of the one-detector sums were read above
                 g = {k: v for k, v in g.items() if k not in ("H", "L")}
+                g["tw"] = _gather.checked_weights(g["tw"], bank.n_time, xp)   # checked once, not at every launch
             gw.append(g)
             del t
         traj.drop()
@@ -1062,7 +1063,7 @@ def pe_redshift_epochs(epochs, store, chunk=8, zmax=8.0, nz=1600, m1_range=(3.0,
     if not eps:
         return []
     store = stores[0] if len(stores) == 1 else stores
-    kept = max((8 * ep["bank"].u.size * (n_loud + n_random) if n_loud > 0 else 0) + 16 * ep["bank"].n_time
+    kept = max((8 * ep["bank"].u.size * (n_loud + n_random) if n_loud > 0 else 0) + 8 * ep["bank"].n_time
                for ep in eps)                             # the arrival times (sel, lw) and time weights of a segment
     chunk = _fit_chunk([ep["bank"] for ep in eps], store, chunk, nodes_per_launch, resident, kept)
     for part in _epoch_chunks([ep["seg"]["rows"].size for ep in eps], chunk):

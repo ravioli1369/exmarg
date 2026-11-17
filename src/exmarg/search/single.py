@@ -46,6 +46,7 @@ V = DV * np.arange(NV)
 VLOUD = 2.0                                  # arrival times with larger v are summed one by one
 RHO_EDGES = np.concatenate([np.arange(0.0, 8.0, 0.5), np.geomspace(8.0, 200.0, 24)])
 _CACHE = {}
+NEAR_KERNEL = True                           # ln_near_fraction on the GPU in one kernel (False: lag by lag)
 
 
 def _i0e(xp):
@@ -611,10 +612,29 @@ def ln_near_fraction(ln_near, lags, xp=np):
     of the probability that the glitch is near the time t + tau, from ln(1 - kbar) (n_time,) of
     glitch_time_weights, in the log domain: ln o_H(t) of the L arrival time t is ln_near_fraction(ln_near_H, lags),
     ln o_L(t') of the H arrival time t' ln_near_fraction(ln_near_L, -lags).  returns (n_time,)"""
+    lags = np.asarray(lags, int).ravel()
+    if xp is not np and NEAR_KERNEL:                     # the same sums in the same order, in one kernel
+        if "near" not in _CACHE:
+            _CACHE["near"] = xp.ElementwiseKernel(
+                "raw float64 x, raw int64 lags, int64 nl, int64 n, float64 none", "float64 out",
+                """
+                double acc = none;                       // -inf: no term yet
+                for (long long k = 0; k < nl; ++k) {
+                    long long j = (i + lags[k]) % n;
+                    if (j < 0) j += n;
+                    const double b = x[j];
+                    const double m = (acc > b) ? acc : b;
+                    acc = (m == none) ? m : m + log1p(exp(-fabs(acc - b)));
+                }
+                out = acc;
+                """, "ln_near_fraction")
+        acc = _CACHE["near"](ln_near, xp.asarray(lags, xp.int64), lags.size, ln_near.size, -np.inf,
+                             size=ln_near.size)
+        return acc.reshape(ln_near.shape) - np.log(lags.size)
     acc = xp.full(ln_near.shape, -np.inf)
-    for tau in np.asarray(lags, int).ravel():
+    for tau in lags:
         acc = _logaddexp(acc, xp.roll(ln_near, -int(tau)), xp)
-    return acc - np.log(np.asarray(lags).size)
+    return acc - np.log(lags.size)
 
 
 def amplitude_weights(edges=RHO_EDGES, gamma=4.0, rho_min=4.0):

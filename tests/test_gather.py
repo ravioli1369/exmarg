@@ -274,3 +274,27 @@ def test_nan_time_weights(case):
     ok = lkH.copy()
     ok[7] = -np.inf
     assert np.all(np.isfinite(gather_cpu(**a, time_weights=(ok, lkL))))
+
+
+def test_checked_weights(case):
+    """the time weights checked once per segment (gather.checked_weights) are what _weights makes of the pair at
+    every launch (float64 on the CPU, clipped at LK_MIN), and gather_cpu with them returns the same bytes; they are
+    passed through for the same n_time and type only; None stays None and a NaN is the same error"""
+    from exmarg.search import gather
+    a, lkH, lkL = case
+    lkL = lkL.copy()
+    lkL[5] = -np.inf
+    n = lkH.size
+    chk = gather.checked_weights((lkH, lkL), n, np)
+    plain = gather._weights((lkH, lkL), n, np, np.float64)
+    assert isinstance(chk, tuple) and all(x.dtype == np.float64 and x.tobytes() == y.tobytes() for x, y in zip(chk, plain))
+    assert chk[1][5] == gather.LK_MIN and all(x is y for x, y in zip(gather._weights(chk, n, np, np.float64), chk))
+    assert gather._weights(chk, n, np, np.float32)[0].dtype == np.float32
+    with pytest.raises(ValueError, match="shape"):
+        gather._weights(chk, n + 1, np, np.float64)
+    assert gather_cpu(**a, time_weights=chk).tobytes() == gather_cpu(**a, time_weights=(lkH, lkL)).tobytes()
+    assert gather.checked_weights(None, n, np) is None
+    bad = lkH.copy()
+    bad[3] = np.nan
+    with pytest.raises(ValueError, match=r"lkH has 1 NaN.*\[3\]"):
+        gather.checked_weights((bad, lkL), n, np)

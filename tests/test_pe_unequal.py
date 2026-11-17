@@ -788,3 +788,56 @@ def test_gpu_agrees_with_cpu(shaped):
         for k in ("ln_c_H", "ln_c_L", "ln_window_H", "ln_window_L", "wmax_H", "wmax_L"):
             lines.append("zmin %s %s: %.1e" % (zmin, k, close(np.asarray(b[k]), np.asarray(a[k]), 2e-4)))
     print("\nGPU against CPU, largest error relative to max(1, |x|): " + ", ".join(lines))
+
+
+def test_gpu_shortcuts(shaped, monkeypatch):
+    """on a GPU (skipped without one), two shortcuts that must not change a result.
+    (a) ln_near_fraction in one kernel (single.NEAR_KERNEL) is the lag-by-lag sum bit for bit, with -inf entries and
+    lags of either sign, and the CPU's to rounding; the sum over the opposite lags differs (the comparison can fail).
+    pe_redshift with the kernel and lag by lag: the same within the scatter of two GPU runs (1e-5 relative to
+    max(1, |x|) for the gathers, whose float32 sums the kernel takes in an order it does not fix; 1e-10 for the
+    arrays without a gather, float64 sums with atomic adds).
+    (b) The time weights checked once per segment (gather.checked_weights) are the arrays _weights makes at every
+    launch, they are passed through unchanged, and a NaN is still an error that names the weights"""
+    try:
+        import cupy as cp
+        cp.cuda.runtime.getDeviceCount()
+    except Exception as err:
+        pytest.skip("no GPU (%s)" % err)
+    from exmarg.search import gather
+    c = shaped
+    bank_g = mass_bank(MASSES, c["segs"], "gpu")
+    kw = dict(ymin=YMIN, nodes_per_launch=2, n_loud=256, n_random=256, glitch=WINDOWS, **REDSHIFT)
+    assert single.NEAR_KERNEL
+    a = pe.pe_redshift(c["segs"], bank_g, c["stores"], **kw)
+    monkeypatch.setattr(single, "NEAR_KERNEL", False)
+    d = pe.pe_redshift(c["segs"], bank_g, c["stores"], **kw)
+    lines = ["%s %.1e" % (k, close(a[k], d[k], 1e-5)) for k in ("ln_lambda", "ln_B")]
+    for k in ("ln_lambda_H", "ln_lambda_L", "ln_c_H", "ln_c_L", "ln_window_H", "ln_window_L", "wmax_H", "wmax_L"):
+        close(np.asarray(a[k]), np.asarray(d[k]), 1e-10)
+    rng = np.random.default_rng(5)
+    x = rng.normal(-3.0, 4.0, 1024)
+    x[rng.integers(0, 1024, 40)] = -np.inf
+    xg = cp.asarray(x)
+    for lags in (np.arange(-20, 21), -np.arange(-20, 21), np.array([3]), np.array([-1000, 0, 2047])):
+        monkeypatch.setattr(single, "NEAR_KERNEL", False)
+        loop = single.ln_near_fraction(xg, lags, cp)
+        monkeypatch.setattr(single, "NEAR_KERNEL", True)
+        fused = single.ln_near_fraction(xg, lags, cp)
+        assert fused.shape == loop.shape and cp.asnumpy(fused).tobytes() == cp.asnumpy(loop).tobytes()
+        np.testing.assert_allclose(cp.asnumpy(fused), single.ln_near_fraction(x, lags), rtol=1e-13, atol=1e-13)
+    assert not np.array_equal(cp.asnumpy(single.ln_near_fraction(xg, np.arange(1, 9), cp)),
+                              cp.asnumpy(single.ln_near_fraction(xg, -np.arange(1, 9), cp)))
+    lk = (cp.asarray(rng.normal(-5.0, 3.0, 1024)), cp.asarray(np.where(rng.random(1024) < 0.1, -np.inf, -1.0)))
+    plain = gather._weights(lk, 1024, cp, cp.float32)
+    chk = gather.checked_weights(lk, 1024, cp)
+    again = gather._weights(chk, 1024, cp, cp.float32)
+    assert all(y is z for y, z in zip(chk, again)) and all(y.dtype == cp.float32 for y in chk)
+    assert all(cp.asnumpy(y).tobytes() == cp.asnumpy(z).tobytes() for y, z in zip(plain, chk))
+    assert float(chk[1].min()) == np.float32(gather.LK_MIN) and gather.checked_weights(None, 1024, cp) is None
+    other = gather._weights(chk, 1024, cp, cp.float64)                # another dtype: made again, not passed through
+    assert other[0].dtype == cp.float64 and other[0] is not chk[0]
+    bad = (cp.asarray(np.where(np.arange(1024) == 7, np.nan, -1.0)), lk[1])
+    with pytest.raises(ValueError, match=r"lkH has 1 NaN.*\[7\]"):
+        gather.checked_weights(bad, 1024, cp)
+    print("\nGPU, ln_near_fraction in one kernel against lag by lag, relative to max(1, |x|): " + ", ".join(lines))

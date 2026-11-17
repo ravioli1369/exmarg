@@ -141,11 +141,29 @@ def _offsets(lna, beta):
     return (np.ascontiguousarray(lna, np.float64) - float(beta[0])) / float(beta[1] - beta[0])
 
 
+class _Checked(tuple):
+    """a pair of time weights that _weights has checked and clipped, for the (n_time, dtype) of its attribute key"""
+
+
+def checked_weights(time_weights, n_time, xp):
+    """the time weights of a segment as its gathers take them (_weights: float64 on the CPU, float32 on the GPU),
+    marked so that the launches of the segment do not check and clip them again; None for None"""
+    if time_weights is None:
+        return None
+    dtype = np.float64 if xp is np else xp.float32
+    out = _Checked(_weights(time_weights, n_time, xp, dtype))
+    out.key = (int(n_time), np.dtype(dtype))
+    return out
+
+
 def _weights(time_weights, n_time, xp, dtype):
     """(lkH, lkL) as (n_time,) arrays of xp and dtype clipped at LK_MIN (-inf is a zero weight), or (None, None);
-    a NaN is an error.  The CPU takes float64 (float32 rounds ln kbar near -3000 by 1e-4), the GPU float32"""
+    a NaN is an error.  The CPU takes float64 (float32 rounds ln kbar near -3000 by 1e-4), the GPU float32.
+    A pair of checked_weights for this n_time and dtype is returned as it is"""
     if time_weights is None:
         return None, None
+    if isinstance(time_weights, _Checked) and time_weights.key == (int(n_time), np.dtype(dtype)):
+        return tuple(time_weights)
     lk = []
     for name, w in zip(("lkH", "lkL"), time_weights):
         w = xp.asarray(w, dtype)
@@ -398,13 +416,20 @@ def _static(ns, nv):
     return 2 * 4 * 32 * ns * nv
 
 
+_SHARED = {}               # device id -> the shared memory a block may ask for (bytes), read once
+
+
 def _chunk(nphi, static=0):
     """arrival times sorted per pass: the largest power of two whose shared memory, next to the kernel's
-    static bytes, fits the device"""
+    static bytes, fits the device.  (Sizing it for the arrival times a block visits, 2048 instead of 8192, lets a
+    multiprocessor run more blocks at once and was measured slower on an RTX 4090: 29 s against 24 s for the same
+    256 segments, 2026-11-17.)"""
     import cupy as cp
-    limit = cp.cuda.Device().attributes["MaxSharedMemoryPerBlockOptin"]
+    dev = cp.cuda.Device()
+    if dev.id not in _SHARED:
+        _SHARED[dev.id] = dev.attributes["MaxSharedMemoryPerBlockOptin"]
     ch = 16384
-    while 7 * ch + 4 * nphi + 256 + static > limit:
+    while 7 * ch + 4 * nphi + 256 + static > _SHARED[dev.id]:
         ch //= 2
     return ch
 
