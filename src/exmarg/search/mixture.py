@@ -541,6 +541,7 @@ def _tangent(free, blocks):
 
 
 STALL_TOL = 1e-5            # nats: the predicted gain below which a fit that cannot raise ln L any more has converged
+SMALL = 1e-8                # of its block (which sums to 1): an entry below it is removed to first order in ln L
 
 
 class _WindowsMerger(_Windows):
@@ -712,8 +713,11 @@ def _climb(model, x, K, blocks, tol, max_iter):
                 break
             with np.errstate(all='ignore'):
                 w, V = np.linalg.eigh(-(Z.T @ H @ Z))
+                pg = Z.T @ g
+                if not np.abs(w).max() > 0 and np.abs(pg).max() <= 1e-12 * max(1.0, np.abs(g).max()):
+                    break                                                  # ln L does not depend on what is left free
                 w = np.maximum(np.abs(w), 1e-12 * np.abs(w).max())         # an ascent also where not concave
-                d = Z @ (V @ ((V.T @ (Z.T @ g)) / w))
+                d = Z @ (V @ ((V.T @ pg) / w))
             out = (x <= 0) & (d < 0) & free
             if not out.any():
                 break
@@ -741,7 +745,25 @@ def _climb(model, x, K, blocks, tol, max_iter):
             t *= 0.5
         if not moved:
             if not squarem():
-                converged = dec < STALL_TOL                                # no step raises ln L any more: its rounding
+                # no step raises ln L any more.  Entries that the EM update is taking to zero (its factor g / mu below
+                # 1) never get there by its geometric steps, and the Newton step, which knows no boundary, keeps
+                # predicting a gain for them.  What such an entry can still give is x (mu - g), to first order (for
+                # an entry below SMALL of its block).  The entries that together can give less than tol are put at
+                # zero, their limit, when the model confirms that ln L is not lower there by tol; the fit goes on
+                # without them
+                gain = np.where((x > 0) & (x < SMALL) & (g < mu), x * (mu - g), np.inf)
+                gain[:K] = np.inf
+                order = np.argsort(gain)
+                n_small = int(np.searchsorted(np.cumsum(gain[order]), tol))
+                if n_small:
+                    xn = x.copy()
+                    xn[order[:n_small]] = 0.0
+                    xn = norm(xn)
+                    evn = model(xn, K, hess=True)
+                    if evn['lnl'] > ev['lnl'] - tol:
+                        accept(xn, evn)
+                        continue
+                converged = dec < STALL_TOL                                # only its rounding is left
                 break
             ev = model(x, K, hess=True)
     return x, ev, trace, n_iter, converged

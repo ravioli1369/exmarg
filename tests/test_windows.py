@@ -663,3 +663,59 @@ def test_fit_windows_stall_converged(monkeypatch):
     monkeypatch.setattr(mixture._Windows, '__call__', real)
     free = mixture.fit_windows(E, start=stall_start(E, r, near))
     assert free['converged'] and free['n_iter'] > 0 and abs(free['lnl'] - r['lnl']) < 1e-6
+
+
+def boundary_data(glitches=True, seed=3):
+    """ln E_w[k] (600, 8, 4) as stall_data, with the glitches (probability 0.3 per window in 30 percent of the
+    segments, none in the others) in the first bin only; glitches False: none at all"""
+    rng = np.random.default_rng(seed)
+    n, nw, nk = 600, 8, 4
+    q = np.where(rng.random(n) < 0.3, 0.3, 0.0)
+    has = (rng.random((n, nw)) < q[:, None]) & glitches
+    base = rng.normal(-0.8, 0.4, (n, nw, 1)) + np.linspace(-0.3, 0.3, nk)[None, None]
+    boost = np.full((n, nw, nk), -np.inf)
+    boost[:, :, 0] = rng.normal(2.0, 0.7, (n, nw))
+    return np.where(has[..., None], np.logaddexp(base, boost), base)
+
+
+def test_fit_windows_at_the_boundary(monkeypatch):
+    """a maximum on the boundary is a converged fit (the phase-randomized week of real data, which has almost no
+    glitch, ended 'not converged' in two ways).  (1) No glitch at all: every q goes to zero, ln L = 0 no longer depends
+    on anything left free (the fractions of two equal states), and the fit has converged; before, the Newton step in
+    that flat space was 0 / 0.  (2) Weights that the EM update is taking to zero: at the maximum of data whose
+    glitches are all in one bin the other weights and the q of the quiet state are exactly zero.  From that maximum
+    with 1e-14 in their place, and with the model evaluation capped at its starting value and STALL_TOL = 0 (so that
+    no step raises ln L and the stall rule alone never accepts), the fit puts them at zero, their limit, and
+    converges to the same maximum; with 3e-9 in their place (small entries that together could still give more than
+    tol) and with 1e-6 (not small) it does not, and neither does the fit that leaves the tiny weights where they are
+    (the rule taken out)"""
+    E0 = boundary_data(glitches=False)
+    r0 = mixture.fit_windows(E0)
+    assert r0['converged'] and np.all(r0['q'] == 0) and abs(r0['lnl']) < 1e-9, (r0['converged'], r0['q'], r0['lnl'])
+    E = boundary_data()
+    r = mixture.fit_windows(E)
+    quiet, noisy = np.argsort(r['q'])
+    assert r['converged'] and r['q'][quiet] == 0 and np.all(r['a'][noisy, 1:] == 0) and r['lnl'] > 50
+
+    def start(tiny):
+        a = np.where(r['a'] > 0, r['a'], tiny)
+        return dict(f=r['f'], q=np.where(r['q'] > 0, r['q'], tiny), a=a / a.sum(axis=1, keepdims=True))
+    real, cap = mixture._Windows.__call__, {}
+
+    def capped(self, x, K, hess=False):
+        out = real(self, x, K, hess)
+        out['lnl'] = min(out['lnl'], cap.setdefault('lnl', out['lnl']))
+        return out
+    monkeypatch.setattr(mixture, 'STALL_TOL', 0.0)
+    monkeypatch.setattr(mixture._Windows, '__call__', capped)
+    res = {}
+    for tiny in (1e-14, 3e-9, 1e-6):
+        cap.clear()
+        res[tiny] = mixture.fit_windows(E, start=start(tiny))
+    monkeypatch.setattr(mixture._Windows, '__call__', real)
+    s = res[1e-14]
+    print('\nfrom 1e-14: converged %s, q %s, weights of the noisy state %s; from 1e-6: converged %s'
+          % (s['converged'], s['q'], s['a'][np.argmax(s['q'])], res[1e-6]['converged']))
+    assert s['converged'] is True and s['q'].min() == 0 and np.all(s['a'][np.argmax(s['q']), 1:] == 0)
+    assert abs(s['q'].max() - r['q'].max()) < 1e-9 and np.abs(np.sort(s['f']) - np.sort(r['f'])).max() < 1e-9
+    assert res[3e-9]['converged'] is False and res[1e-6]['converged'] is False
