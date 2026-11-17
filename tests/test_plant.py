@@ -1157,6 +1157,93 @@ def test_tables_cuts_are_recorded_and_enforced(tmp_path):
             plant_fit.check_table_cuts(cfg, veto_w, w_net)
 
 
+def test_campaign_records_the_kind_of_tables(tmp_path, monkeypatch):
+    """the merger stage of plant.py records tables 'as built' by default and with --published-tables (the default since
+    2026-11-17; refused with --unbias), 'unbiased' with --unbias; so does analyse.py (its default, --unbias); the
+    windows stage of both records no tables and refuses --unbias.  load_stores asks load_redshift_store for the kind
+    explicitly (unbiased False or True, never None, so that a cache of the other kind is refused).  A run of one kind
+    into the folder of the other stops as another campaign (differs in tables); so does a run of either kind into a
+    folder of files written before the entry (none: read with unbias; 'published': as built), which plant_fit.load still
+    reads.  Fires on: store_settings without the tables entry (the files of the two kinds are then one campaign)"""
+    from types import SimpleNamespace
+    import exmarg.search as search
+    from test_analyse import analyse
+    from test_store import write_store
+    assert config('--nbar', '0')['tables'] == 'as built'
+    assert config('--nbar', '0', '--published-tables')['tables'] == 'as built'
+    assert config('--nbar', '0', '--unbias')['tables'] == 'unbiased'
+    assert 'tables' not in config('--nbar', '0', '--stage', 'windows') and 'tables' in plant.MERGER_KEYS
+    for extra in (['--unbias', '--published-tables'], ['--unbias', '--stage', 'windows']):
+        with pytest.raises(SystemExit):
+            plant.main(['store', 'cpu', '--nbar', '0', '--n', '1', '--out', str(tmp_path / 'x')] + extra)
+    ana = lambda *extra: analyse.parse(['store', 'cpu', 'segs', '--out', 'x'] + list(extra))[1]
+    assert analyse.plant.store_settings(ana())['tables'] == 'as built'
+    assert analyse.plant.store_settings(ana('--unbias'))['tables'] == 'unbiased'
+    assert analyse.plant.store_settings(ana('--stage', 'windows')) == {}
+    with pytest.raises(SystemExit):
+        ana('--unbias', '--stage', 'windows')
+    asked = []
+
+    def load(d, **kw):
+        asked.append(kw['unbiased'])
+        return SimpleNamespace(s=np.ones(1), asym=0.0, unbiased=kw['unbiased'])
+    monkeypatch.setattr(search, 'load_redshift_store', load)
+    for extra, kind in (([], False), (['--unbias'], True), (['--mmap'], False), (['--mmap', '--unbias'], True)):
+        args = plant.parser().parse_args(['a,b', 'cpu', '--nbar', '0', '--n', '1', '--out', 'x'] + extra)
+        assert [s.unbiased for s in plant.load_stores(args)] == [kind, kind] and asked[-2:] == [kind, kind]
+    assert all(type(x) is bool for x in asked)
+    monkeypatch.undo()
+    store = write_store(str(tmp_path / 'a'))
+    out = tmp_path / 'm'
+    rest = ['cpu', '--nbar', '0.3', '--seed', '5', '--n', '3', '--batch', '3']
+    assert plant.main([store] + rest + ['--out', str(out)], factory=Stub().factory) == 0
+    path = out / ('plant_%010d_%010d.npz' % (0, 3))
+    meta = plant.read_meta(path)
+    assert meta['tables'] == 'as built'
+    with pytest.raises(SystemExit, match='another campaign.*tables'):
+        plant.main([store] + rest + ['--out', str(out), '--start', '3', '--unbias'], factory=Stub().factory)
+    with np.load(path) as f:
+        arrays = {key: f[key] for key in f.files if key != 'meta'}
+    for tag, entry in (('old', None), ('published', 'published')):
+        folder = tmp_path / tag
+        folder.mkdir()
+        cfg = {key: v for key, v in meta.items() if key not in ('run', 'tables')}
+        plant.write_batch(str(folder / path.name), cfg if entry is None else dict(cfg, tables=entry), meta['run'],
+                          arrays)
+        assert plant_fit.load(str(folder))[0].get('tables') == entry
+        for extra in ([], ['--unbias']):
+            with pytest.raises(SystemExit, match='another campaign.*tables'):
+                plant.main([store] + rest + ['--out', str(folder), '--start', '3'] + extra, factory=Stub().factory)
+
+
+def test_drivers_refuse_a_cache_of_the_other_kind(tmp_path, capsys):
+    """plant.py and analyse.py stop before any work (exit status 2, the reason on stderr, no output folder) on a cache
+    of the other kind than the run reads: --unbias with a cache as built, the default with an unbiased cache (alone, or
+    after a cache as built in a list of stores, with --mmap), and on --mmap --unbias of a store folder, whose tables
+    would have to be corrected in memory.  Fires on: plant.store_problem not comparing the kinds"""
+    from exmarg.search.store import write_cache
+    from test_analyse import analyse
+    from test_store import write_store
+    src = write_store(str(tmp_path / 'store'))
+    built = write_cache(src, str(tmp_path / 'built'), readers=2)
+    unb = write_cache(src, str(tmp_path / 'unb'), readers=2, unbiased=True)
+    out = str(tmp_path / 'out')
+    rest = ['cpu', '--nbar', '0.3', '--n', '1', '--out', out]
+    for main, argv, reason in (
+            (plant.main, [built] + rest + ['--unbias'], 'cache of the tables as built'),
+            (plant.main, [unb] + rest, 'cache of the tables unbiased'),
+            (plant.main, ['%s,%s' % (built, unb)] + rest + ['--mmap'], '%s is a cache of the tables unbiased' % unb),
+            (plant.main, [src] + rest + ['--mmap', '--unbias'], 'is a store folder'),
+            (analyse.main, [built, 'cpu', 'segments', '--out', out, '--unbias'], 'cache of the tables as built'),
+            (analyse.main, [unb, 'cpu', 'segments', '--out', out, '--mmap'], 'cache of the tables unbiased')):
+        with pytest.raises(SystemExit) as stop:
+            main(argv)
+        assert stop.value.code == 2 and reason in capsys.readouterr().err, argv
+    assert not os.path.exists(out)
+    assert plant.store_problem(built, False, True) is None and plant.store_problem(unb, True, True) is None
+    assert plant.store_problem(src, False, True) is None and plant.store_problem(src, True) is None
+
+
 def test_window_model_with_a_store_that_records_its_cuts(tmp_path):
     """the two stages of the window model with a store that records the loudness cuts it is answered for (the stores
     of build_ratio.py's stage R).  The windows stage reads the header of the store only and records no cuts; the

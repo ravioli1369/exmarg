@@ -291,7 +291,7 @@ def test_batched_merger_stage_reads_a_model_with_mergers(tmp_path):
     from test_store import write_store
     week = small_week(str(tmp_path / 'segments'))
     store_dir = write_store(str(tmp_path / 'store'))
-    store = load_redshift_store(store_dir, unbiased=True)
+    store = load_redshift_store(store_dir)
     win = tmp_path / 'win'
     analyse.main(['none', 'cpu', week, '--out', str(win), '--seed', '7', '--epochs-per-file', '2', '--variants', 'zero,inj',
                   '--stage', 'windows'], factory=WinStub().factory)
@@ -336,9 +336,11 @@ def run_committed_plant(tree, argv, cwd):
     assert r.returncode == 0, r.stderr[-2000:]
 
 
-def same_win_files(a, b, prefix, new=('wnet',)):
+def same_win_files(a, b, prefix, new=('wnet',), tables=None):
     """the files of prefix in folders a and b: the same names and members, every array bit for bit, the meta but run;
-    the files of b may hold the members new besides (wnet, of the network cut, after a79e07d), not compared"""
+    the files of b may hold the members new besides (wnet, of the network cut, after a79e07d), not compared; with
+    tables, the meta of b holds tables = that and the meta of a none (the entry is recorded in every merger-stage run
+    since 2026-11-17), and the rest of the meta is compared"""
     import glob
     names = sorted(os.path.basename(f) for f in glob.glob(os.path.join(a, prefix + '_*.npz')))
     assert names and names == sorted(os.path.basename(f) for f in glob.glob(os.path.join(b, prefix + '_*.npz')))
@@ -348,6 +350,8 @@ def same_win_files(a, b, prefix, new=('wnet',)):
             assert set(y.files) - set(x.files) <= set(new) and [f for f in y.files if f in x.files] == x.files, name
             ma, mb = (json.loads(str(z['meta'])) for z in (x, y))
             ma.pop('run'), mb.pop('run')
+            if tables is not None:
+                assert 'tables' not in ma and mb.pop('tables') == tables, name
             assert ma == mb, name
             for key in x.files:
                 if key != 'meta':
@@ -357,10 +361,11 @@ def same_win_files(a, b, prefix, new=('wnet',)):
 
 
 def test_plant_default_outputs_as_main(tmp_path):
-    """plant.py's default outputs are those of the main branch merged in (a79e07d, its tree in a process of its own):
-    the windows stage without a store (2 segments, the plant's bank and window evidences on the CPU), and the merger
-    stage with the default glitch terms on a small store (write_store, 2 segments): every array bit for bit, the meta
-    but the run's record"""
+    """plant.py's outputs are those of the main branch merged in (a79e07d, its tree in a process of its own): the
+    windows stage without a store (2 segments, the plant's bank and window evidences on the CPU), and the merger stage
+    with the default glitch terms on a small store (write_store, 2 segments), with --unbias, the default of a79e07d
+    (which read the tables with unbias and recorded no tables entry): every array bit for bit, the meta but the run's
+    record and the tables entry (unbiased here)"""
     from test_store import write_store
     tree = tm.committed('a79e07d')
     if tree is None:
@@ -369,10 +374,10 @@ def test_plant_default_outputs_as_main(tmp_path):
     base = ['--n', '2', '--batch', '2', '--nbar', '0.5', '--seed', '3', '--glitch-states', '0.9:0.01,0.1:0.1',
             '--gamma', '4', '--rho-min', '5', '--zmin', '0.5']
     n = 0
-    for stage, store_arg, extra, prefix in (('windows', 'none', ['--stage', 'windows'], 'win'),
-                                            ('merger', store, ['--chunk', '2'], 'plant')):
+    for stage, store_arg, extra, now, prefix in (('windows', 'none', ['--stage', 'windows'], [], 'win'),
+                                                 ('merger', store, ['--chunk', '2'], ['--unbias'], 'plant')):
         a, b = tmp_path / ('main_' + stage), tmp_path / ('merged_' + stage)
         run_committed_plant(tree, [store_arg, 'cpu'] + base + extra + ['--out', str(a)], str(tmp_path))
-        assert plant.main([store_arg, 'cpu'] + base + extra + ['--out', str(b)]) == 0
-        n += same_win_files(str(a), str(b), prefix)
+        assert plant.main([store_arg, 'cpu'] + base + extra + now + ['--out', str(b)]) == 0
+        n += same_win_files(str(a), str(b), prefix, tables='unbiased' if now else None)
     print('\nplant.py, windows stage without a store and merger stage: %d arrays bit for bit those of a79e07d' % n)

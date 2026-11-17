@@ -327,7 +327,7 @@ def test_driver_batched_equals_committed(tmp_path, committed, committed_driver, 
     from test_plant import make_model
     from test_store import write_store
     week = small_week(str(tmp_path / 'segments'))
-    store = load_redshift_store(write_store(str(tmp_path / 'store')), unbiased=True)
+    store = load_redshift_store(write_store(str(tmp_path / 'store')))
     new = analyse.make_analysis(store, 'cpu', chunk=3, ymin=plant.default_ymin())
     monkeypatch.setattr(search, 'pe_redshift', committed.pe_redshift)        # what the committed driver binds
     old = committed_driver.make_analysis(store, 'cpu', chunk=3, ymin=plant.default_ymin())

@@ -24,10 +24,19 @@ segment k with L of segment k + 1), 'phase-randomize', 'time-reverse'.
 
 The analysis.  pe_redshift(glitch=True, chunk=128) with its default fiducial glitch law and window, on 120 equal-mass
 templates of total mass 20 to 400 (detector frame), m1 in (4, 200) on 150 points, z up to 10 on 150 points (notebook 7),
-the tables loaded with unbiased=True, ymin = D0 / D_L(10) (1 - 1e-6) so that the store reaches the end of the z grid:
-pe_redshift's smallest y is ymin (1 + 5e-10), and at ymin = D0 / D_L(10) the row z = 10 (weight 1.3e-4) was left out;
-its default 0.1267 (z = 8) would leave out 6.7e-3 (--ymin to change it; w_inf below records what is left out).
+the tables read as built (Tables, below), ymin = D0 / D_L(10) (1 - 1e-6) so that the store reaches the end of the z
+grid: pe_redshift's smallest y is ymin (1 + 5e-10), and at ymin = D0 / D_L(10) the row z = 10 (weight 1.3e-4) was left
+out; its default 0.1267 (z = 8) would leave out 6.7e-3 (--ymin to change it; w_inf below records what is left out).
 Every ln Lambda grid is then averaged over the same restricted population (population.ln_lambda_bar).
+
+Tables.  The merger stage reads the tables as built (store.load_redshift_store(unbiased=False)), as the authors' method
+does.  --unbias reads them with the correction of store.unbias, which lowers the merger rate (16384 segments with
+mergers planted at nbar 0.30: 0.2543 with it, 0.2985 as built; src/exmarg/search/store.py); it is kept for comparisons.
+The campaign of the merger stage records the kind, tables 'as built' or 'unbiased', so that files of the two kinds are
+never one campaign.  Files written before 2026-11-17 record no tables entry when they were read with unbias, and
+tables 'published' when read as built; a run of today into their folder is refused as another campaign.
+--published-tables, which then turned the correction off, is now the default and changes nothing (not with --unbias).
+--mmap maps a cache (scripts/real_data/store_cache.py) of the kind asked for, or a store folder as built.
 
 Seeds.  Each use of random numbers by segment k has a stream of its own, numpy.random.default_rng(stream(seed, k, use))
 with stream = use 2^60 + seed 2^40 + k, distinct for every (seed, k, use) (seed < 2^20, k < 2^40), below 2^63 and
@@ -80,7 +89,7 @@ the planted signals carry none and the bank of the analysis takes none (it emula
 curves, not in its estimation noise).  Recorded as
 noise {asym} or {curves, sha256}.  The store argument may list several folders (the mixture of pe_redshift, recorded as
 tables_asym), --asym-tol (default 0.05, with unequal curves or several stores; recorded, and asym_outside per segment),
---zmin-cut (pe_redshift(zmin=--zmin)), --mmap (unbiased caches mapped).
+--zmin-cut (pe_redshift(zmin=--zmin)), --mmap (the tables mapped from disk, Tables above).
 
 Stage 1 of the window model, --stage windows (no tables; of the store argument only its header is read, when it names
 a store folder or cache: the lags, for wnet, and the ladder of the merger evidence below; with 'none' the files have
@@ -130,7 +139,7 @@ from exmarg.search import controls, population as popavg
 from exmarg.search.pe import _dl_of_z
 from exmarg.search.segments import D0
 from exmarg.search.single import RHO_EDGES
-from exmarg.search.store import is_cache, read_header
+from exmarg.search.store import TABLE_KINDS, cache_unbiased, is_cache, read_header
 
 T, FMIN, FMAX = 8.0, 20.0, 512.0
 MASSES = np.geomspace(20.0, 400.0, 120)
@@ -492,7 +501,7 @@ def make_windows(device, n_window=N_WINDOW, chunk=WINDOW_CHUNK, population=None,
 
 
 def store_lags(store, log=print):
-    """the lags of the tables named by the store argument (comma-separated folders or unbiased caches; the header only),
+    """the lags of the tables named by the store argument (comma-separated folders or caches; the header only),
     for the wnet of the windows stage; None, said in the log, when it names none ('none' or a folder without tables);
     SystemExit when the folders have different lags"""
     dirs = [d for d in store.split(',') if d and (glob.glob(os.path.join(d, 'bd_*.npz')) or is_cache(d))]
@@ -525,8 +534,6 @@ def campaign(args):
                control=args.control, shift=SHIFT, T=T, fmin=FMIN, fmax=FMAX, zmin=args.zmin, mdet_range=MDET,
                bank=(float(MASSES[0]), float(MASSES[-1]), MASSES.size), grid=GRID, ymin=ymin, n_loud=1024,
                n_random=1024, glitch_settings='pe default')
-    if getattr(args, 'published_tables', False):
-        cfg['tables'] = 'published'
     if getattr(args, 'shared_times', False):
         cfg['shared_times'] = True
     if getattr(args, 'asym', None) is not None:
@@ -551,16 +558,41 @@ def asym_tol(args):
     return float(args.asym_tol) if several or unequal else None
 
 
+def tables_kind(args):
+    """the kind of the tables a merger-stage run reads, as its campaign records it: 'unbiased' with --unbias (the tables
+    through store.unbias), 'as built' otherwise"""
+    return TABLE_KINDS[bool(getattr(args, 'unbias', False))]
+
+
+def store_problem(d, unbias, mmap=False):
+    """why the folder d cannot serve a merger-stage run that reads the tables with unbias (unbias True) or as built,
+    mapped (mmap) or not: it holds no tables, or it is a cache of the other kind, or (mapped, with unbias) it is a
+    store folder, whose tables would have to be corrected in memory; None when it can"""
+    if not glob.glob(os.path.join(d, 'bd_*.npz')) and not is_cache(d):
+        return 'no bd_*.npz (or cache) in %s' % d
+    unbias = bool(unbias)
+    if is_cache(d) and cache_unbiased(d) != unbias:
+        return ('%s is a cache of the tables %s (its cache.json), and this run reads them %s (%s): give a cache of '
+                'that kind (scripts/real_data/store_cache.py%s) or the store folder'
+                % (d, TABLE_KINDS[not unbias], TABLE_KINDS[unbias], '--unbias' if unbias else 'without --unbias',
+                   ' --unbiased' if unbias else ''))
+    if mmap and unbias and not is_cache(d):
+        return ('%s is a store folder: --mmap --unbias maps a cache written with unbias (scripts/real_data/'
+                'store_cache.py --unbiased)' % d)
+    return None
+
+
 def store_settings(args):
-    """the campaign entries of the tables of a merger-stage run: tables_asym, the sorted asym of the store folders, when
-    several are given (one store must have the asym of every template, which the noise settings fix); asym_tol when it
+    """the campaign entries of the tables of a merger-stage run: tables, their kind (tables_kind: 'as built' or
+    'unbiased'), in every run; tables_asym, the sorted asym of the store folders, when several are given (one store
+    must have the asym of every template, which the noise settings fix); asym_tol when it
     is passed (asym_tol()); zmin_cut when pe_redshift reads only the nodes of z >= zmin; tables_cuts, [zcut, wnet],
     the loudness cuts up to which the tables are answered for (store.read_header: cuts; the smallest over the
     stores), when the stores record them: plant_fit.check_table_cuts refuses a selection beyond them.  All of them are
     settings of the merger stage (MERGER_KEYS): the windows stage reads no table and records none"""
     if getattr(args, 'stage', 'merger') == 'windows':
         return {}
-    out = {}
+    out = dict(tables=tables_kind(args))
     dirs = [d for d in args.store.split(',') if d]
     if len(dirs) > 1:
         out['tables_asym'] = sorted(float(read_header(d)['asym']) for d in dirs)
@@ -579,16 +611,16 @@ def store_settings(args):
 
 def load_stores(args):
     """the store folders of args.store (comma separated): one store, or the list of them; page-locked on the GPU unless
-    mapped (args.mmap: the folders must be unbiased caches), unbiased unless args.published_tables"""
+    mapped (args.mmap); the tables as built, or with unbias with args.unbias (a cache of the other kind is refused)"""
     from exmarg.search import load_redshift_store
     out = []
     for d in args.store.split(','):
         t = time.time()
         out.append(load_redshift_store(d, pinned=(args.device == 'gpu' and not args.mmap), mmap=args.mmap,
-                                       unbiased=not getattr(args, 'published_tables', False)))
-        print('%s  store %s loaded, %d nodes, asym %g%s (%.0f s)' % (stamp(), d, out[-1].s.size, out[-1].asym,
-                                                                     ', mapped' if args.mmap else '', time.time() - t),
-              flush=True)
+                                       unbiased=bool(getattr(args, 'unbias', False))))
+        print('%s  store %s loaded, %d nodes, asym %g, tables %s%s (%.0f s)'
+              % (stamp(), d, out[-1].s.size, out[-1].asym, TABLE_KINDS[out[-1].unbiased],
+                 ', mapped' if args.mmap else '', time.time() - t), flush=True)
     return out[0] if len(out) == 1 else out
 
 
@@ -617,7 +649,7 @@ def stage_settings(cfg, args):
 
 
 def is_store(path):
-    """a folder of redshift tables (bd_*.npz) or an unbiased cache"""
+    """a folder of redshift tables (bd_*.npz) or a cache of them"""
     return os.path.isdir(path) and (bool(glob.glob(os.path.join(path, 'bd_*.npz'))) or is_cache(path))
 
 
@@ -827,8 +859,9 @@ def run(cfg, out, start, n, batch, factory, plain=False, info=None, log=print, g
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('store', help='folder of the redshift tables (bd_*.npz) or its unbiased cache; or several, comma '
-                                 'separated, of distinct asym: the mixture of the two that bracket each template')
+    p.add_argument('store', help='folder of the redshift tables (bd_*.npz) or a cache of them (store_cache.py); or '
+                                 'several, comma separated, of distinct asym: the mixture of the two that bracket each '
+                                 'template')
     p.add_argument('device', choices=('gpu', 'cpu'))
     p.add_argument('--n', type=int, required=True, help='number of segments of this run')
     p.add_argument('--start', type=int, default=0, help='index of the first segment')
@@ -852,8 +885,12 @@ def parser():
     p.add_argument('--plain', action='store_true', help='also run pe_redshift without glitch, to record its cost')
     p.add_argument('--shared-times', action='store_true',
                    help='the same random arrival times for every template (recorded in the campaign)')
+    p.add_argument('--unbias', action='store_true',
+                   help='read the tables with the unbias correction (store.unbias), for comparisons: it lowers the '
+                        'merger rate; recorded in the campaign as tables unbiased (default: as built)')
     p.add_argument('--published-tables', action='store_true',
-                   help='read the tables as published, without unbias (a comparison; recorded in the campaign)')
+                   help='the tables as built, now the default: changes nothing (kept so that older command lines run; '
+                        'not with --unbias)')
     p.add_argument('--glitch-states', default=None, metavar='F1:Q1,F2:Q2',
                    help='glitches of the window model in both detectors: state probabilities f and glitch probability '
                         'q per window in each state (not with --eps-H, --eps-L)')
@@ -878,8 +915,8 @@ def parser():
                    help='unequal curves or several stores: a template whose asymmetry lies outside the stores\' range by '
                         'at most this is read from the end store (default %g; recorded)' % ASYM_TOL)
     p.add_argument('--mmap', action='store_true',
-                   help='map the tables from disk (the store folders must be unbiased caches, '
-                        'store.write_unbiased_cache): the jobs of a machine share them')
+                   help='map the tables from disk: caches of the kind asked for (store_cache.py, as built by default, '
+                        'with --unbiased for --unbias) or store folders as built; the jobs of a machine share them')
     p.add_argument('--out', required=True, help='directory of the result files')
     return p
 
@@ -902,9 +939,10 @@ def main(argv=None, factory=None):
     windows = a.stage == 'windows'
     if a.chunk is None:
         a.chunk = WINDOW_CHUNK if windows else CHUNK
-    if windows and (a.glitch_model or a.plain or a.published_tables or a.shared_times or a.zmin_cut or a.mmap):
-        p.error('--glitch-model, --plain, --published-tables, --shared-times, --zmin-cut and --mmap are of the '
-                'merger stage')
+    if windows and (a.glitch_model or a.plain or a.unbias or a.published_tables or a.shared_times or a.zmin_cut
+                    or a.mmap):
+        p.error('--glitch-model, --plain, --unbias, --published-tables, --shared-times, --zmin-cut and --mmap are of '
+                'the merger stage')
     if windows and a.ymin is not None and store_ladder(a.store) is None:
         p.error('--ymin with the windows stage sets the population of its merger evidence: give the store')
     if a.asym is not None and a.curves is not None:
@@ -913,8 +951,8 @@ def main(argv=None, factory=None):
         p.error('need asym-tol >= 0')
     if a.asym is not None and not -1.0 < a.asym < 1.0:
         p.error('need -1 < asym < 1')
-    if a.mmap and a.published_tables:
-        p.error('--mmap maps unbiased caches: not with --published-tables')
+    if a.unbias and a.published_tables:
+        p.error('--published-tables reads the tables as built (the default): not with --unbias')
     if windows and not (0 <= a.window_rho_min < a.window_rho_max):
         p.error('need 0 <= window-rho-min < window-rho-max')
     try:
@@ -936,8 +974,9 @@ def main(argv=None, factory=None):
                                store_lags(a.store))
     elif factory is None:
         for d in a.store.split(','):
-            if not glob.glob(os.path.join(d, 'bd_*.npz')) and not is_cache(d):
-                p.error('no bd_*.npz (or unbiased cache) in %s' % d)
+            problem = store_problem(d, a.unbias, a.mmap)
+            if problem:
+                p.error(problem)
 
         def factory(seg):
             return make_analysis(load_stores(a), a.device, a.resident, a.chunk, cfg['ymin'], a.shared_times,
