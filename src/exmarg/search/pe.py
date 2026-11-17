@@ -79,6 +79,12 @@ WINDOWS = dict(model="windows", n_window=64, zone=1, pi_m=None, H=None, L=None) 
 STATE = ("f", "q", "pi_k")                          # the settings of one detector in model='windows'
 SUM_TOL = 1e-6                                      # how far from 1 the sum of a law may be
 ASYM_TOL = 1e-9                                     # how far a template's w may be from the asym of the one store
+# The single-detector merger term at the boundary point of each template (its own signal power): from a table of Phi
+# made once per bank (single.MergerTable, True) or computed at every segment (single.ln_merger_at, False).  The two
+# use the same interpolation and agree to rounding (tests/test_single.py, tests/test_pe_batch.py); the table saves
+# 0.07 s per segment of the full bank on a GPU.  None: the table on the GPU, and on the CPU the computation per
+# segment, whose results are bit for bit those of before the table
+BOUNDARY_TABLES = None
 
 
 def _dl_of_z(z):
@@ -231,9 +237,12 @@ def _mix(xs, plan):
     return out
 
 
-def _fit_chunk(bank, store, chunk, nodes_per_launch, resident):
-    """GPU: the number of segments filtered at once, at most chunk, so that their trajectories
-    (16 n_template n_time bytes each; bank may be a list of banks: the largest) fit next to the tables on the device"""
+def _fit_chunk(bank, store, chunk, nodes_per_launch, resident, kept=None):
+    """GPU: the number of segments of one pass over the tables, at most chunk, so that what the pass keeps of each on
+    the device fits next to the tables: its trajectories (16 n_template n_time bytes each; bank may be a list of
+    banks: the largest), or kept bytes when given (pe_redshift_epochs, which keeps the arrival times and the time
+    weights of a segment and filters it again at every launch: the trajectories of two segments are then set aside
+    for the one at work)"""
     banks = list(bank) if isinstance(bank, (list, tuple)) else [bank]
     if banks[0].device == "cpu":
         return chunk
@@ -246,12 +255,40 @@ def _fit_chunk(bank, store, chunk, nodes_per_launch, resident):
     else:
         free -= nodes_per_launch * max(sizes)
     per_segment = max(16 * b.u.size * b.n_time for b in banks)
+    if kept is not None:
+        free -= 2 * per_segment
+        per_segment = max(int(kept), 1)
     return max(1, min(chunk, int(0.6 * free / per_segment)))
 
 
 def _filter(bank, seg, e):
     return bank.trajectories({I: seg["d_" + I][e] for I in "HL"},
                              {I: seg["sig2_" + I] for I in "HL"})
+
+
+class _Trajectories:
+    """the trajectories of the segments ev of one epoch, as a sequence: traj[j] filters the segment ev[j] when it is
+    asked for (_filter: the same arrays every time) and only the one asked for last is kept, until drop().  A segment
+    is 16 n_template n_time bytes on the device and the matched filter takes about a millisecond on a GPU, far less
+    than a copy of the tables; so a pass over the tables holds as many segments as have room for their arrival times
+    (_fit_chunk), not as many as have room for their trajectories"""
+
+    def __init__(self, bank, seg, ev):
+        self.bank, self.seg, self.ev = bank, seg, list(ev)
+        self.j = self.last = None
+
+    def __len__(self):
+        return len(self.ev)
+
+    def __getitem__(self, j):
+        if j != self.j:
+            self.last = None                               # freed before the next is filtered
+            self.last = _filter(self.bank, self.seg, self.ev[j])
+            self.j = j
+        return self.last
+
+    def drop(self):
+        self.j = self.last = None
 
 
 def _node_geometry(bank, st, ymin, ymax=None):
@@ -394,6 +431,8 @@ def _single_setup(bank, seg, store, geometry, trim=False, asym_tol=0.0):
         for I, sg in (("H", 1.0), ("L", -1.0)):
             lnT[I].append(_single.merger_columns(e["store"].s[nodes] * (1.0 + sg * e["asym"])))
             e["s_b_" + I] = np.where(bnode >= 0, np.exp(blna) * bank.u * (1.0 + sg * e["asym"]), 0.0)
+            if (xp is not np) if BOUNDARY_TABLES is None else BOUNDARY_TABLES:
+                e["own_" + I] = _single.MergerTable(e["s_b_" + I], xp)   # Phi of the boundary point, once per bank
     out = dict(plan=plan, n_rho=_single.RHO_EDGES.size - 1)
     for I in "HL":
         out["lnT_" + I] = xp.asarray(np.concatenate(lnT[I], axis=1))
@@ -583,10 +622,18 @@ def _single_values(traj, sd, xp, gw=None):
     for I in "HL":
         lq, ln_u = traj["lq" + I], sd["ln_u_" + I]
         W = None if gw is None else xp.concatenate([xp.zeros((1, lq.shape[1])), gw[I]])
-        lnE = _single._host(_single.ln_evidence(lq, ln_u, sd["lnT_" + I], W, xp, log_weights=True))
-        b = [_single._host(_single.ln_merger_at(lq, ln_u, e["s_b_" + I], W, xp, log_weights=True)) for e in sd["plan"]]
-        out[I] = (lnE.reshape(-1, *lnE.shape[-2:]), [x.reshape(-1, x.shape[-1]) for x in b],
-                  _single._host(_single._wmax(lq, ln_u, xp)))
+        if "own_" + I in sd["plan"][0]:                     # the boundary point of each store: a column of its own
+            nc = sd["lnT_" + I].shape[1]
+            lnE = _single._host(_single.ln_evidence(lq, ln_u, sd["lnT_" + I], W, xp, log_weights=True,
+                                                    own=[e["own_" + I] for e in sd["plan"]]))
+            lnE = lnE.reshape(-1, *lnE.shape[-2:])
+            lnE, b = np.ascontiguousarray(lnE[..., :nc]), [lnE[..., nc + i].copy() for i in range(len(sd["plan"]))]
+        else:
+            lnE = _single._host(_single.ln_evidence(lq, ln_u, sd["lnT_" + I], W, xp, log_weights=True))
+            b = [_single._host(_single.ln_merger_at(lq, ln_u, e["s_b_" + I], W, xp, log_weights=True))
+                 for e in sd["plan"]]
+            lnE, b = lnE.reshape(-1, *lnE.shape[-2:]), [x.reshape(-1, x.shape[-1]) for x in b]
+        out[I] = (lnE, b, _single._host(_single._wmax(lq, ln_u, xp)))
     return out
 
 
@@ -676,6 +723,7 @@ def _launch(r, ks, tab, slot, lamN, far, block, xp):
             if fv is not None:
                 far[j, :, nn][:, bids] = fv[:, 0]
         del t
+    traj.drop()
 
 
 def _store_values(store, reads, groups, block, resident, xp):
@@ -714,15 +762,24 @@ def _epochs_values(jobs, groups, block, resident, n_loud, n_random, shared_times
     data = []
     for ep, ev in jobs:
         bank, seg, sd, gd = ep["bank"], ep["seg"], ep["sd"], ep["gd"]
-        traj = [_filter(bank, seg, e) for e in ev]
-        gw = [None] * len(ev) if gd is None else [_glitch_weights(t, gd, sd, xp) for t in traj]
-        one = None if sd is None else [_single_values(t, sd, xp, g) for t, g in zip(traj, gw)]
+        traj = _Trajectories(bank, seg, ev)
         tau = ep["plan"][0]["store"].tau_idx
-        net = None if sd is None else [_network(t, sd, tau, xp) for t in traj]
-        times = [_gather.select_times(t, tau, n_loud, n_random, ep["seed"] + int(seg["rows"][e]), xp, shared=shared_times)
-                 if n_loud > 0 else None for t, e in zip(traj, ev)]
-        data.append(dict(ep, traj=traj, gw=gw, one=one, times=times, tw=[None if g is None else g["tw"] for g in gw],
-                         net=net))
+        gw, one, net, times = [], [], [], []
+        for j, e in enumerate(ev):                          # what is kept of a segment; its trajectories are not
+            t = traj[j]
+            g = None if gd is None else _glitch_weights(t, gd, sd, xp)
+            if sd is not None:
+                one.append(_single_values(t, sd, xp, g))
+                net.append(_network(t, sd, tau, xp))
+            times.append(_gather.select_times(t, tau, n_loud, n_random, ep["seed"] + int(seg["rows"][e]), xp,
+                                              shared=shared_times) if n_loud > 0 else None)
+            if g is not None:                               # the rows of the one-detector sums were read above
+                g = {k: v for k, v in g.items() if k not in ("H", "L")}
+            gw.append(g)
+            del t
+        traj.drop()
+        data.append(dict(ep, traj=traj, gw=gw, one=one if sd is not None else None, times=times,
+                         tw=[None if g is None else g["tw"] for g in gw], net=net if sd is not None else None))
     read = {id(e["store"]): e["store"] for d in data for e in d["plan"]}
     parts = [[None] * len(d["plan"]) for d in data]
     for st in sorted(read.values(), key=lambda st: float(getattr(st, "asym", 0.0))):
@@ -829,8 +886,9 @@ def pe_redshift(segments, bank, store, rows=None, chunk=8, zmax=8.0, nz=1600,
                       nodes, grids and lags) whose range holds every w: the mixture of the two that
                       bracket it (module docstring).  ValueError otherwise
     rows              segment indices (default all)
-    chunk             segments filtered at once (16 n_template n_time bytes each; on the GPU
-                      at most what fits next to the tables)
+    chunk             segments of one pass over the tables (each launch of tables is copied
+                      once for all of them; on the GPU at most those whose arrival times, 8
+                      n_template (n_loud + n_random) bytes each, fit next to the tables)
     zmax, nz          z grid linspace(0.02, zmax, nz)
     m1_range, nm1     m1 grid geomspace(*m1_range, nm1)
     ymin              smallest y = D0 / D_L the store represents
@@ -907,10 +965,11 @@ def _check_bank(bank):
         raise ValueError("pe_redshift needs an ascending equal-mass zero-spin bank")
 
 
-def _epoch(ep, stores, ymin, ymax, trim, asym_tol, shape):
+def _epoch(ep, stores, ymin, ymax, trim, asym_tol, shape, setups=None):
     """what pe_redshift sets up once for one epoch (a dict of EPOCH, every key given): its segments, node geometry,
     glitch settings (gd), single-detector setup (sd) and plan of the stores read, and the arrays of its result (out,
-    extra), each checked as pe_redshift checks them"""
+    extra), each checked as pe_redshift checks them.  setups (a dict, filled here): the single-detector setup of a
+    bank is made once for the epochs that share the bank (it depends on the bank and the stores only)"""
     bank = ep["bank"]
     store = stores[0] if len(stores) == 1 else stores
     _store_weights(stores, bank, asym_tol)
@@ -919,7 +978,12 @@ def _epoch(ep, stores, ymin, ymax, trim, asym_tol, shape):
     out = np.full((seg["rows"].size,) + shape, -np.inf)
     gd = None if ep["glitch"] is None or ep["glitch"] is False else _glitch_setup(ep["glitch"], bank, seg, store)
     single = ep["single"] or gd is not None
-    sd = _single_setup(bank, seg, store, geometry, trim, asym_tol) if single else None
+    sd = None
+    if single:
+        setups = {} if setups is None else setups
+        if id(bank) not in setups:
+            setups[id(bank)] = _single_setup(bank, seg, store, geometry, trim, asym_tol)
+        sd = setups[id(bank)]
     extra = _single_out(single, seg["rows"].size, shape, bank, gd)
     if asym_tol:
         extra["asym_outside"] = _outside(stores, bank)
@@ -965,9 +1029,10 @@ def pe_redshift_epochs(epochs, store, chunk=8, zmax=8.0, nz=1600, m1_range=(3.0,
 
     epochs   sequence of dicts, each with segments and bank as for pe_redshift and, optionally, its own rows, seed,
              single and glitch (EPOCH; default the arguments of this call: rows None, all of them)
-    chunk    segments of all the epochs filtered at once, in the order of the epochs (16 n_template n_time bytes
-             each; on the GPU at most what fits next to the tables): each launch of tables is copied once per chunk
-             and read for every segment of it with its own epoch's arguments
+    chunk    segments of all the epochs in one pass over the tables, in the order of the epochs (on the GPU at most
+             those whose arrival times fit next to the tables, _fit_chunk): each launch of tables is copied once per
+             chunk and read for every segment of it with its own epoch's arguments, the segment filtered again for
+             the launch (_Trajectories)
     the other arguments as for pe_redshift, the same for every epoch.  The banks must be on one device.
 
     Example: res = pe_redshift_epochs([dict(segments=s1, bank=b1, seed=11), dict(segments=s2, bank=b2, seed=12,
@@ -992,11 +1057,14 @@ def pe_redshift_epochs(epochs, store, chunk=8, zmax=8.0, nz=1600, m1_range=(3.0,
     trim = zmin is not None or len(stores) > 1
     nn = stores[0].s.size
     groups = [list(range(g, min(g + nodes_per_launch, nn))) for g in range(0, nn, nodes_per_launch)]
-    eps = [_epoch(ep, stores, ymin, ymax, trim, asym_tol, (m1.size, z.size)) for ep in epochs]
+    setups = {}
+    eps = [_epoch(ep, stores, ymin, ymax, trim, asym_tol, (m1.size, z.size), setups) for ep in epochs]
     if not eps:
         return []
     store = stores[0] if len(stores) == 1 else stores
-    chunk = _fit_chunk([ep["bank"] for ep in eps], store, chunk, nodes_per_launch, resident)
+    kept = max((8 * ep["bank"].u.size * (n_loud + n_random) if n_loud > 0 else 0) + 16 * ep["bank"].n_time
+               for ep in eps)                             # the arrival times (sel, lw) and time weights of a segment
+    chunk = _fit_chunk([ep["bank"] for ep in eps], store, chunk, nodes_per_launch, resident, kept)
     for part in _epoch_chunks([ep["seg"]["rows"].size for ep in eps], chunk):
         values = _epochs_values([(eps[i], ev) for i, ev in part], groups, block, resident, n_loud, n_random,
                                 shared_times)

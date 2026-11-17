@@ -264,6 +264,44 @@ def test_log_weights():
     assert np.abs(got - ref).max() < 2e-5
 
 
+def test_own_columns_of_ln_evidence():
+    """the column of each template's own signal power in ln_evidence (MergerTable: Phi at the grid points, computed
+    once) against ln_merger_at, which computes Phi at the grid points each call reaches: the same interpolation and
+    the same sums, so the two agree to rounding.  Without weights, with log weights (a unit row; a row with a time at
+    w = 2000 that weighs exp(-1995); a row of -inf: no time at all) and with linear weights; a template with s = 0
+    (ln Phi = 0); blocks that cut the templates; a vloud off the grid.  The table grows when a segment is louder than
+    what it holds, and the columns of lnT are those of a call without own, bit for bit.  A table of another power is
+    told apart (the comparison can fail)"""
+    rng = np.random.default_rng(21)
+    lq, ln_u, w = trajectory(rng, 5, 4096, loud=[(1, 100, 2000.0), (2, 50, 30.0), (4, 7, 9.0)])
+    nm, nt = w.shape
+    lw = np.stack([np.zeros(nt), np.log(rng.uniform(0.01, 1.0, nt)), np.log(rng.uniform(0.01, 1.0, nt)),
+                   np.full(nt, -np.inf)])
+    lw[1, 100] = -1995.0
+    lnT = ln_l(single.V[:, None] ** 2, np.array([0.5, 25.0])[None, :])
+    powers = [np.array([0.3, 3000.0, 30.0, 0.0, 2.0]), np.array([1.0, 0.02, 700.0, 5.0, 0.0])]
+    worst = 0.0
+    for weights, kw in ((None, {}), (lw, dict(log_weights=True)), (np.exp(lw[2]), {})):
+        for block, vloud in ((256, 2.0), (2, 2.0), (256, 1.2349)):
+            tabs = [single.MergerTable(s) for s in powers]
+            assert tabs[0].P.shape == (nm, 256)
+            got = single.ln_evidence(lq, ln_u, lnT, weights, block=block, vloud=vloud, own=tabs, **kw)
+            plain = single.ln_evidence(lq, ln_u, lnT, weights, block=block, vloud=vloud, **kw)
+            assert got.shape == plain.shape[:-1] + (4,) and np.array_equal(got[..., :2], plain)
+            for k, s in enumerate(powers):
+                ref = single.ln_merger_at(lq, ln_u, s, weights, block=block, vloud=vloud, **kw)
+                fin = np.isfinite(ref)
+                assert np.array_equal(np.isfinite(got[..., 2 + k]), fin) and fin.any()
+                np.testing.assert_allclose(got[..., 2 + k][fin], ref[fin], rtol=1e-12, atol=1e-10)
+                worst = max(worst, np.abs(got[..., 2 + k][fin] - ref[fin]).max())
+            assert tabs[0].P.shape[1] >= 4474 and tabs[1].P.shape == tabs[0].P.shape     # w = 2000: grid point 4472
+            if weights is lw:
+                assert np.all(got[3] == -np.inf) and np.all(np.abs(got[0][:, 2 + 0][powers[0] == 0.0]) < 1e-12)
+    print("own columns against ln_merger_at: largest difference %.1e" % worst)
+    other = single.ln_evidence(lq, ln_u, lnT, own=[single.MergerTable(1.01 * powers[0])])[:, 2]
+    assert np.abs(other - single.ln_merger_at(lq, ln_u, powers[0])).max() > 1e-4
+
+
 def test_glitch_time_series_zero_weight_block():
     """templates with pi_m = 0 for a whole block (the log-sum-exp over the block has max -inf): the series is that of
     the templates with weight, whatever the block size, and glitch_time_weights of an all -inf series (no glitch

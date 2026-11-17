@@ -197,6 +197,27 @@ def merger_columns(s):
     return np.stack([_CACHE[("Phi", x)] for x in s], axis=1)
 
 
+class MergerTable:
+    """ln Phi(V[j]^2; s[m]) for a signal power per template, s (n_template,) on the host: the table (n_template, n)
+    on the device of xp of the first n grid points, grown when more are asked for (upto).  The columns of
+    ln_evidence's own: Phi at a grid point does not depend on the data, so a bank computes it once and not at every
+    segment (ln_merger_at computes it at the grid points each segment reaches)"""
+
+    def __init__(self, s, xp=np, n=256):
+        self.s, self.xp = np.asarray(s, float), xp
+        self.P = xp.empty((self.s.size, 0))
+        self.upto(n)
+
+    def upto(self, n):
+        """the table with at least the grid points j < n (at most NV of them): (n_template, >= n)"""
+        have, n = self.P.shape[1], min(int(n), NV)
+        if n > have:
+            j = np.arange(have, min(NV, max(n, 2 * have)))
+            add = _ln_phi(self.xp.asarray(np.tile(DV * j, self.s.size)), np.repeat(self.s, j.size), self.xp)
+            self.P = self.xp.concatenate([self.P, add.reshape(self.s.size, j.size)], axis=1)
+        return self.P
+
+
 def _ln_bin(v, a, b, n=16, reach=25.0):
     """ln int_a^b d rho l(v^2; rho^2 / 2) for v (n_v,), by n-point Gauss-Legendre on the part of [a, b] within
     reach / |lam| of its larger end, lam the secant slope of ln l (cut only when |lam| (b - a) > reach; the rest
@@ -331,7 +352,16 @@ def _quiet_columns(lnT, J, xp):
     return T[:J], xp.minimum(0.25 * (d2[:-1] + d2[1:]), T[:J - 1] + T[1:J]), top
 
 
-def ln_evidence(lq, ln_u, lnT, weights=None, xp=np, block=256, vloud=VLOUD, log_weights=False):
+def _quiet_own(P, J, xp):
+    """_quiet_columns for a column per template, P (n, >= J + 1) ln T_m at the grid points: B (n, J), Q (n, J - 1) and
+    the scales top (n,)"""
+    top = P[:, :J + 1].max(axis=1)
+    T = xp.exp(P[:, :J + 1] - top[:, None])
+    d2 = xp.concatenate([2.0 * (T[:, 1:2] - T[:, :1]), T[:, 2:] - 2.0 * T[:, 1:-1] + T[:, :-2]], axis=1)
+    return T[:, :J], xp.minimum(0.25 * (d2[:, :-1] + d2[:, 1:]), T[:, :J - 1] + T[:, 1:J]), top
+
+
+def ln_evidence(lq, ln_u, lnT, weights=None, xp=np, block=256, vloud=VLOUD, log_weights=False, own=None):
     """ln E[m, c] = ln (1/n_time) sum_t weights[t] T_c(w_m(t)) for tabulated columns.
 
     lq, ln_u           as for histogram
@@ -341,12 +371,16 @@ def ln_evidence(lq, ln_u, lnT, weights=None, xp=np, block=256, vloud=VLOUD, log_
                        one pass over the trajectories; their logarithms with log_weights, so that a weight below
                        1e-308 next to a large T (a glitch rings both) is kept.  A row of unit weights is summed
                        exactly as without weights
+    own                None, or MergerTables (of the n_template templates, on the device of xp): n_own more
+                       columns after the n_col of lnT, column k of template m the merger column of the signal power
+                       own[k].s[m], with the same interpolation and the same sums (what ln_merger_at(lq, ln_u,
+                       own[k].s, weights) returns, from the same pass over the trajectories)
 
     below vloud T is interpolated linearly in v, E = (H @ T - D @ Q) / n_time with the histogram H and the
     curvature term D @ Q of the interpolation; above vloud (the grid point DV (J - 2), J = round(vloud / DV) + 2,
     nearest to it, so that every arrival time is in exactly one of the two sets) ln T is interpolated linearly in
-    v, one arrival time at a time, the sum taken in the log domain.  returns (n_template, n_col), or
-    (n_w, n_template, n_col), float64 on the device.
+    v, one arrival time at a time, the sum taken in the log domain.  returns (n_template, n_col + n_own), or
+    (n_w, n_template, n_col + n_own), float64 on the device.
 
     Accuracy of the part below vloud for steep columns (the amplitude bins of glitch_columns, which grow by
     exp(sqrt(2) rho DV) per cell of the grid, and any column that grows as fast): the curvature-corrected linear
@@ -366,7 +400,9 @@ def ln_evidence(lq, ln_u, lnT, weights=None, xp=np, block=256, vloud=VLOUD, log_
     else:
         lnW, one = _ln_weight_rows(weights, nt, xp, log_weights)
     unit = [True] if lnW is None else [bool((lw == 0.0).all()) for lw in lnW]
-    out = xp.empty((len(unit), nm, nc))
+    own = [] if own is None else list(own)
+    na = nc + len(own)                                  # the columns of lnT, then one per table of own
+    out = xp.empty((len(unit), nm, na))
     for a in range(0, nm, block):
         b = min(a + block, nm)
         v = _v(lq[a:b], ln_u[a:b], xp)
@@ -374,15 +410,29 @@ def ln_evidence(lq, ln_u, lnT, weights=None, xp=np, block=256, vloud=VLOUD, log_
         jm, fm = _cic(v.max(axis=1), xp)                # the loudest time of each template sets its scale
         shift = (1.0 - fm)[:, None] * lnT[jm] + fm[:, None] * lnT[jm + 1]
         r, t = xp.nonzero(v > DV * (J - 2))
-        val = (1.0 - f[r, t])[:, None] * lnT[j[r, t]] + f[r, t][:, None] * lnT[j[r, t] + 1]
+        jl, fl = j[r, t], f[r, t]
+        val = (1.0 - fl)[:, None] * lnT[jl] + fl[:, None] * lnT[jl + 1]
+        qo = []
+        if own:                                         # the same interpolation in each template's own column
+            n_grid, rows = max(J + 1, int(jm.max()) + 2), xp.arange(b - a)
+            Po = [tab.upto(n_grid)[a:b] for tab in own]
+            shift = xp.concatenate([shift] + [((1.0 - fm) * P[rows, jm] + fm * P[rows, jm + 1])[:, None] for P in Po],
+                                   axis=1)
+            val = xp.concatenate([val] + [((1.0 - fl) * P[r, jl] + fl * P[r, jl + 1])[:, None] for P in Po], axis=1)
+            qo = [_quiet_own(P, J, xp) for P in Po]
+
+        def ln_quiet(H, D):
+            """ln of the sum below vloud of every column: (b - a, na)"""
+            with np.errstate(divide="ignore"):
+                return xp.concatenate([xp.log(_dot(H, B) - _dot(D, Q)) + top[None, :]] + [
+                    (xp.log((H * Bo).sum(axis=1) - (D * Qo).sum(axis=1)) + to)[:, None] for Bo, Qo, to in qo], axis=1)
         for i, u in enumerate(unit):
             if u:
                 H, D = _quiet(v, j, f, xp.ones(nt), xp, J)
-                loud = xp.bincount((r[:, None] * nc + xp.arange(nc)[None, :]).ravel(),
-                                   weights=xp.exp(val - shift[r]).ravel(), minlength=(b - a) * nc)
+                loud = xp.bincount((r[:, None] * na + xp.arange(na)[None, :]).ravel(),
+                                   weights=xp.exp(val - shift[r]).ravel(), minlength=(b - a) * na)
                 with np.errstate(divide="ignore"):
-                    quiet = xp.log(_dot(H, B) - _dot(D, Q)) + top[None, :]
-                    out[i, a:b] = _logaddexp(quiet, xp.log(loud.reshape(b - a, nc)) + shift, xp) - np.log(nt)
+                    out[i, a:b] = _logaddexp(ln_quiet(H, D), xp.log(loud.reshape(b - a, na)) + shift, xp) - np.log(nt)
                 continue
             lw = lnW[i]
             top_w = float(lw.max())
@@ -390,10 +440,8 @@ def ln_evidence(lq, ln_u, lnT, weights=None, xp=np, block=256, vloud=VLOUD, log_
                 out[i, a:b] = -np.inf
                 continue
             H, D = _quiet(v, j, f, xp.exp(lw - top_w), xp, J)   # T is bounded below vloud: no term lost here
-            with np.errstate(divide="ignore"):
-                quiet = xp.log(_dot(H, B) - _dot(D, Q)) + top[None, :] + top_w
-            loud = _ln_loud(val + lw[t][:, None], r, b - a, shift, lw[t], xp, nc)
-            out[i, a:b] = _logaddexp(quiet, loud, xp) - np.log(nt)
+            loud = _ln_loud(val + lw[t][:, None], r, b - a, shift, lw[t], xp, na)
+            out[i, a:b] = _logaddexp(ln_quiet(H, D) + top_w, loud, xp) - np.log(nt)
     return out[0] if one else out
 
 

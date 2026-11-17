@@ -146,6 +146,93 @@ def test_batched_equals_per_epoch(committed, case):
     print("\n%s: %d arrays bit for bit equal to the per-epoch calls" % (case, n))
 
 
+def test_trajectories_filtered_on_demand(monkeypatch):
+    """the trajectories of a pass over the tables (_Trajectories): traj[j] is _filter of the segment ev[j], the same
+    arrays whenever it is asked for; the one asked for last is kept (asking again does not filter again) and drop()
+    forgets it.  A pass filters every segment once for what it keeps of it (weights, single-detector values, arrival
+    times) and once for each launch of tables that reads it, and keeps no trajectory at its end"""
+    segs, bank = epoch("eq1", 11)
+    seg = pe.read_segments(segs, None)
+    calls, real = [], pe._filter
+    monkeypatch.setattr(pe, "_filter", lambda b, s, e: calls.append(int(e)) or real(b, s, e))
+    traj = pe._Trajectories(bank, seg, [2, 0])
+    assert len(traj) == 2 and calls == []
+    a, ref = traj[0], real(bank, seg, 2)
+    assert traj[0] is a and calls == [2] and all(bitwise(a[k], ref[k]) for k in ref)
+    b = traj[1]
+    assert calls == [2, 0] and traj.last is b and not bitwise(b["lqH"], a["lqH"])
+    traj.drop()
+    assert traj.last is None and traj.j is None
+    assert all(bitwise(traj[0][k], ref[k]) for k in ref) and calls == [2, 0, 2]
+    calls.clear()
+    st = stores("one")
+    need = pe._plan(bank, st, pe._node_geometry(bank, st, 0.5))[0]["need"]
+    launches = sum(bool(need[g:g + 2].any()) for g in (0, 2))            # nodes_per_launch = 2: groups [0, 1], [2]
+    kept = []
+    made = pe._Trajectories
+    monkeypatch.setattr(pe, "_Trajectories", lambda *a: kept.append(made(*a)) or kept[-1])
+    pe.pe_redshift_epochs([dict(segments=segs, bank=bank, seed=11)], st, chunk=100, single=True, **COMMON, **SEL)
+    assert launches >= 1 and sorted(calls) == sorted(list(range(3)) * (1 + launches))
+    assert len(kept) == 1 and kept[0].last is None
+
+
+def test_setup_shared_by_the_epochs_of_a_bank(monkeypatch):
+    """the single-detector setup (the columns and the tables of the boundary point) is made once for the epochs that
+    share a bank (the variants of one epoch of data in analyse.py) and once per bank; every epoch's arrays are those
+    of a call of its own"""
+    (s1, b1), (s2, b2) = epoch("eq1", 11), epoch("eq4", 12)
+    st = stores("one")
+    made, real = [], pe._single_setup
+    monkeypatch.setattr(pe, "_single_setup", lambda bank, *a, **k: made.append(bank) or real(bank, *a, **k))
+    eps = [dict(segments=s1, bank=b1, rows=[0, 1], seed=1), dict(segments=s2, bank=b2, seed=2),
+           dict(segments=s1, bank=b1, rows=[2], seed=1)]
+    got = pe.pe_redshift_epochs(eps, st, chunk=100, single=True, **COMMON, **SEL)
+    assert len(made) == 2 and made[0] is b1 and made[1] is b2
+    for ep, r in zip(eps, got):
+        ref = pe.pe_redshift(ep["segments"], ep["bank"], st, rows=ep.get("rows"), seed=ep["seed"], single=True,
+                             **COMMON, **SEL)
+        assert set(r) == set(ref) and all(bitwise(r[k], ref[k]) for k in ref)
+
+
+BOUNDARY = ("ln_lambda_H", "ln_lambda_L", "ln_lambda_gH", "ln_lambda_gL", "ln_lambda_gHL", "ln_B")
+
+
+@pytest.mark.parametrize("case", [c for c in CASES if CASES[c][2].get("single") or CASES[c][2].get("glitch")])
+def test_boundary_tables(monkeypatch, case):
+    """the boundary point from the tables of a bank (pe.BOUNDARY_TABLES = True, what a GPU does) against its
+    computation at every segment (the CPU's default): the arrays that go through the boundary point (BOUNDARY) agree
+    to rounding, finite at the same cells, and every other array is the same bit for bit.  With the table of another
+    signal power (1 percent off) they differ: the comparison can fail"""
+    kind, names, kw = CASES[case]
+    st = stores(kind)
+    eps = []
+    for name, seed, own in names:
+        segs, bank = epoch(name, seed)
+        eps.append(dict(segments=segs, bank=bank, seed=seed, **own))
+    assert pe.BOUNDARY_TABLES is None
+    ref = pe.pe_redshift_epochs(eps, st, chunk=100, **COMMON, **kw)
+    monkeypatch.setattr(pe, "BOUNDARY_TABLES", True)
+    got = pe.pe_redshift_epochs(eps, st, chunk=2, **COMMON, **kw)
+    worst, n = 0.0, 0
+    for r, g in zip(ref, got):
+        assert set(r) == set(g)
+        for k in r:
+            if k not in BOUNDARY:
+                assert bitwise(g[k], r[k]), (case, k)
+                continue
+            fin = np.isfinite(r[k])
+            assert np.array_equal(np.isfinite(g[k]), fin) and fin.any(), (case, k)
+            np.testing.assert_allclose(g[k][fin], r[k][fin], rtol=1e-12, atol=1e-11)
+            worst, n = max(worst, np.abs(g[k][fin] - r[k][fin]).max()), n + 1
+    assert n >= 2 * len(eps)
+    print("\n%s: %d arrays through the boundary point, largest difference %.1e" % (case, n, worst))
+    table = pe._single.MergerTable
+    monkeypatch.setattr(pe._single, "MergerTable", lambda s_, xp: table(1.01 * np.asarray(s_), xp))
+    off = pe.pe_redshift_epochs(eps, st, chunk=100, **COMMON, **kw)
+    fin = np.isfinite(ref[0]["ln_lambda_H"])
+    assert np.abs(off[0]["ln_lambda_H"][fin] - ref[0]["ln_lambda_H"][fin]).max() > 1e-6
+
+
 def test_union_of_nodes_and_stores():
     """the case the module docstring describes holds: with zmin the epochs 'eq1' and 'eq4' need different nodes of the
     launch [0, 1] (so a launch holds the union and 'eq1' reads with the grids of node 1, not node 0), and in the
