@@ -687,3 +687,17 @@ def test_c4_marginal_identity(marginal):
     print('\n' + '\n'.join(lines))
     assert ok, lines
     assert marginal['noisy, 14 glitches']['post']['r'][1] > 0.99 and marginal['one glitch, SNR 9']['lnM'].max() > 4
+
+
+def test_root_weights_rounding():
+    """the Hessian of the fit with mergers takes the square root of r_s a_w, which is >= 0 in exact arithmetic but
+    rounds to about -1e-16 where one window's merger evidence dwarfs its segment (the plant A30 at N = 0.2): those are
+    taken as zero, the square root of the rest is unchanged, and a value below the rounding of zero is an error.
+    Fires on: the plain square root (NaN for the rounded value), or a clip without the bound (no error for -1e-6)"""
+    w = np.array([0.0, 0.25, 1.0, -2.186e-23, -2.2e-16, 3.0e-11])
+    r = mixture._root_weights(w)
+    assert np.isfinite(r).all()
+    assert np.array_equal(r[[0, 3, 4]], np.zeros(3))
+    assert np.array_equal(r[[1, 2, 5]], np.sqrt(w[[1, 2, 5]]))
+    with pytest.raises(FloatingPointError):
+        mixture._root_weights(np.array([0.5, -1e-6]))

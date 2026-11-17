@@ -544,6 +544,22 @@ STALL_TOL = 1e-5            # nats: the predicted gain below which a fit that ca
 SMALL = 1e-8                # of its block (which sums to 1): an entry below it is removed to first order in ln L
 
 
+WEIGHT_ROUNDING = 1e-12     # the most negative r_s a_w (both at most 1) that _root_weights takes for rounding of zero
+
+
+def _root_weights(w):
+    """the square root of the window weights r_s a_w of the Hessian of _WindowsMerger, which are >= 0 in exact arithmetic
+    (a_w = 1 - Xi_w and Xi_w <= 1 by the bound in its docstring): where the merger evidence of one window dwarfs the
+    rest of its segment, 1 - Xi_w rounds to about -1e-16 (the plant A30 at N = 0.2: 2 of 65536 windows), and its
+    square root would make the Hessian NaN.  Values down to -WEIGHT_ROUNDING are taken as 0; anything below is an
+    error (FloatingPointError), not rounding"""
+    w = np.asarray(w, float)
+    if np.any(w < -WEIGHT_ROUNDING):
+        raise FloatingPointError('window weights r_s a_w down to %.3e: below the rounding of zero (%g)'
+                                 % (float(w.min()), WEIGHT_ROUNDING))
+    return np.sqrt(np.maximum(w, 0.0))
+
+
 class _WindowsMerger(_Windows):
     """sum_i ln c_i(theta, N) of a detector whose segments hold, with probability N, a merger of the population
     (docs/2026-11-15_mergers_in_stage1.md, Sec. 2), at fixed N, and its derivatives in the x of _Windows:
@@ -635,7 +651,7 @@ class _WindowsMerger(_Windows):
                 gB = -(Z3 * Xi[:, :, t, None]).sum(axis=1)                  # gamma beta, (n, P)
                 gB[:, 0] += self.nz * gb[:, t] / Om[t, 0]
                 S = self._roll(Z3).reshape(n * nw, P)
-                Wa = Z * np.sqrt(rw[:, t] * aw[:, t])[:, None]
+                Wa = Z * _root_weights(rw[:, t] * aw[:, t])[:, None]
                 rx = rw[:, t] * xi[:, :, t].ravel()
                 v = (r[:, t, None] * gB).sum(axis=0)
                 with np.errstate(all='ignore'):
