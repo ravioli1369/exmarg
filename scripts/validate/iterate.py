@@ -16,7 +16,8 @@ Pass p = first, first + 1, .., passes, each in its own folder <out>/pass<p>:
      (plant.py and analyse.py skip the files present, so an interrupted pass is resumed by running the same command);
   3. N^(p): plant_fit.py's estimate of the window model on <out>/pass<p> (or its sub-folder --results, the variant of
      analyse.py), nbar maximizing sum ln(1 + N (Bbar - 1)) over the kept segments, with its error from the curvature.
-Each pass writes <out>/pass<p>/estimate.json (nbar, err, the model's SHA-256 and nbar, the segments) when it is
+--f-det f: the detected fraction of the loudness cuts enters every estimate (plant_fit.nbar_fit, the paper's Eq. 35).
+Each pass writes <out>/pass<p>/estimate.json (nbar, err, the model's SHA-256 and nbar, f, the segments) when it is
 complete, and a pass with that file is not run again: --first p with --nbar0 N^(p-1) starts at pass p (a pass 1 made
 before, e.g. the analysis with the model at N = 0).  <out>/iteration.json records every pass.  --dry-run prints the
 commands.  The fit and stage 2 are the drivers' own, with their checks: windows_fit.py refuses N > 0 for a control of
@@ -52,14 +53,15 @@ def run(cmd, dry, log):
         subprocess.run(cmd, check=True)
 
 
-def estimate(results, veto_w):
-    """nbar of the window model on the plant files of results (plant_fit.report): dict nbar, err, segments, kept,
-    model_sha256, model_nbar"""
-    r = plant_fit.report(results, veto_w=veto_w)
+def estimate(results, veto_w, f_det=0.0):
+    """nbar of the window model on the plant files of results (plant_fit.report, with the detected fraction f_det of
+    the loudness cuts in the estimate, plant_fit.nbar_fit): dict nbar, err, segments, kept, model_sha256, model_nbar,
+    f_det"""
+    r = plant_fit.report(results, veto_w=veto_w, f_det=f_det)
     w = r['fits']['windows']
     return dict(nbar=float(w['nbar']), err=float(w['err']['nbar']), edge=w.get('edge'), segments=int(r['keep'].size),
                 kept=int(r['keep'].sum()), model_sha256=r['cfg'].get('glitch_model_sha256'),
-                model_nbar=float(r['cfg'].get('glitch_model_nbar', 0.0)))
+                model_nbar=float(r['cfg'].get('glitch_model_nbar', 0.0)), f_det=float(f_det))
 
 
 def main(argv=None, log=print):
@@ -77,14 +79,18 @@ def main(argv=None, log=print):
     p.add_argument('--results', default='', help='sub-folder of a pass that holds the plant files (analyse.py: the '
                                                  'variant)')
     p.add_argument('--veto-w', type=float, default=plant_fit.VETO_W, help='the loudness veto of the estimate')
+    p.add_argument('--f-det', type=float, default=0.0,
+                   help='the detected fraction of the loudness cuts in the estimate of every pass (plant_fit.nbar_fit; '
+                        'measured on a plant with the same cuts).  Without it the N handed to the next pass is too '
+                        'low by about n f sigma^2')
     p.add_argument('--python', default=sys.executable, help='the interpreter of windows_fit.py')
     p.add_argument('--dry-run', action='store_true')
     a = p.parse_args(argv[:k])
     stage2 = argv[k + 1:]
     if not stage2 or not any('{model}' in c for c in stage2) or not any('{out}' in c for c in stage2):
         p.error('the command of stage 2 must hold {model} and {out}')
-    if not 1 <= a.first <= a.passes or not 0 <= a.nbar0 <= 1:
-        p.error('need 1 <= first <= passes and 0 <= nbar0 <= 1')
+    if not 1 <= a.first <= a.passes or not 0 <= a.nbar0 <= 1 or not 0 <= a.f_det < 1:
+        p.error('need 1 <= first <= passes, 0 <= nbar0 <= 1 and 0 <= f-det < 1')
     os.makedirs(a.out, exist_ok=True)
     record_path = os.path.join(a.out, RECORD)
     record = json.load(open(record_path)) if os.path.exists(record_path) else dict(win=os.path.abspath(a.win), passes={})
@@ -96,6 +102,9 @@ def main(argv=None, log=print):
             est = json.load(open(done))
             if abs(est['model_nbar'] - nbar) > 1e-12 * max(1.0, nbar):
                 raise SystemExit('%s was made with a model at nbar %r, not %r' % (done, est['model_nbar'], nbar))
+            if abs(est.get('f_det', 0.0) - a.f_det) > 1e-15:
+                raise SystemExit('%s was made with the detected fraction %r, not %r' % (done, est.get('f_det', 0.0),
+                                                                                       a.f_det))
             log('%s  pass %d present: nbar %.6g +- %.2g (model at nbar %.6g)' % (stamp(), n, est['nbar'], est['err'],
                                                                                   nbar))
             record['passes'][str(n)] = est
@@ -115,8 +124,8 @@ def main(argv=None, log=print):
         if a.dry_run:
             nbar = float('nan')
             continue
-        est = dict(estimate(os.path.join(folder, a.results) if a.results else folder, a.veto_w), model_path=model,
-                   finished=stamp())
+        est = dict(estimate(os.path.join(folder, a.results) if a.results else folder, a.veto_w, a.f_det),
+                   model_path=model, finished=stamp())
         with open(done, 'w') as fh:
             json.dump(est, fh, indent=1)
         record['passes'][str(n)] = est

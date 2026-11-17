@@ -163,6 +163,33 @@ def test_iterate_dry_run(toy, tmp_path):
         iterate.main([new, out, '--', 'python', 'plant.py'])
 
 
+def test_iterate_detected_fraction(tmp_path, monkeypatch):
+    """iterate.py --f-det: the detected fraction of the cuts reaches the estimate of a pass (plant_fit.report f_det,
+    and so nbar_fit) and is written with it; a pass made with another fraction is refused, not reused; a fraction
+    outside [0, 1) is an error"""
+    seen = []
+
+    def report(results, veto_w=None, f_det=0.0):
+        seen.append((results, veto_w, f_det))
+        return dict(fits=dict(windows=dict(nbar=0.02 + f_det, err=dict(nbar=0.004), edge=None)),
+                    keep=np.ones(10, bool), cfg=dict(glitch_model_sha256='ab', glitch_model_nbar=0.0))
+    monkeypatch.setattr(iterate.plant_fit, 'report', report)
+    est = iterate.estimate('folder', 72.0, 0.005)
+    assert seen == [('folder', 72.0, 0.005)] and est['f_det'] == 0.005 and abs(est['nbar'] - 0.025) < 1e-15
+    assert iterate.estimate('folder', 72.0)['f_det'] == 0.0 and seen[-1][2] == 0.0
+    out = tmp_path / 'iter'
+    (out / 'pass1').mkdir(parents=True)
+    (out / 'pass1' / 'estimate.json').write_text(json.dumps(dict(est, model_nbar=0.0)))
+    cmd = ['--', 'python', 'plant.py', '--glitch-model', '{model}', '--out', '{out}']
+    lines = []
+    assert iterate.main(['win', str(out), '--passes', '1', '--f-det', '0.005', '--dry-run'] + cmd, log=lines.append) == 0
+    assert 'pass 1 present' in lines[0]
+    with pytest.raises(SystemExit, match='detected fraction 0.005, not 0.0'):
+        iterate.main(['win', str(out), '--passes', '1', '--dry-run'] + cmd, log=lines.append)
+    with pytest.raises(SystemExit):
+        iterate.main(['win', str(out), '--f-det', '1.0', '--dry-run'] + cmd)
+
+
 # ----------------------------------------------------------------------------------------- after the merge of a79e07d
 
 
