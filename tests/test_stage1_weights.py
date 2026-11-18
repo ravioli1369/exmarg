@@ -189,6 +189,43 @@ def test_windows_fit_with_weights(passes):
     assert plant.model_sha256(r['model']) != plant.model_sha256(plain['model'])
 
 
+def test_weights_at_the_estimate_of_the_pass(passes, capsys):
+    """--weights-nbar auto: the rate of the weights is the estimate of the window model on the fitted segments of the
+    merger-stage folder (plant_fit.nbar_fit of their ln_B_bar, with the detected fraction); the model records it with
+    estimated and f_det, and is otherwise the model of that number given by hand"""
+    root, folder, cfg, lnB = passes
+    st2 = str(root / 'pass_auto')
+    fin = np.where(np.isfinite(lnB), lnB, 0.0)                         # an estimate inside (0, 1): no infinite B
+    stage2(st2, cfg, fin, ((0, 900), (900, NS)))
+    for f_det in (0.0, 0.01):
+        r = windows_fit.fit(folder, record=(), weights=st2, weights_nbar='auto', f_det=f_det)
+        want = windows_fit.summarize.plant_fit.nbar_fit(fin[r['data']['k'][r['keep']]], f_det)
+        info = r['model']['weights']
+        assert want['edge'] is None and 0 < want['nbar'] < 1
+        assert info['nbar'] == want['nbar'] and info['estimated'] is True and info['f_det'] == f_det
+        by_hand = windows_fit.fit(folder, record=(), weights=st2, weights_nbar=want['nbar'])
+        assert set(info) - set(by_hand['model']['weights']) == {'estimated', 'f_det'}
+        for I in 'HL':
+            assert r['model'][I] == by_hand['model'][I]
+        assert any('its estimate on the fitted segments with f %g' % f_det in line for line in r['lines'])
+    assert windows_fit.fit(folder, record=(), weights=st2, weights_nbar='auto', f_det=0.01)['model']['weights']['nbar'] \
+        > windows_fit.fit(folder, record=(), weights=st2, weights_nbar='auto')['model']['weights']['nbar']
+    with pytest.raises(ValueError):                                    # f_det belongs to the estimate
+        windows_fit.fit(folder, record=(), weights=st2, weights_nbar=NB, f_det=0.01)
+    with pytest.raises(ValueError):
+        windows_fit.fit(folder, record=(), f_det=0.01)
+    # the script: auto and a number; the refusals of the options
+    model = str(root / 'auto' / 'glitch_model.json')
+    assert windows_fit.main([folder, '--record', '', '--weights', st2, '--weights-nbar', 'auto', '--f-det', '0.01',
+                             '--model', model]) == 0
+    assert plant.read_model(model)[0]['weights']['estimated'] is True
+    for bad in (['--weights-nbar', 'most'], ['--weights-nbar', '0.1', '--f-det', '0.01'],
+                ['--weights-nbar', 'auto', '--f-det', '1.0'], ['--weights-nbar', '1.5']):
+        with pytest.raises(SystemExit):
+            windows_fit.main([folder, '--record', '', '--weights', st2] + bad)
+    capsys.readouterr()
+
+
 def test_windows_fit_weights_refused(passes):
     root, folder, cfg, lnB = passes
     with pytest.raises(ValueError):

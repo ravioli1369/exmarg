@@ -33,6 +33,14 @@ detector's model (n_window sum_s f_s q_s, from <out>/<variant>/glitch_model.json
 the start of the model's SHA-256.  Every variant must then carry the window model (glitch_model and n_window are
 campaign keys); the SHA-256 belongs to the variant, each being analysed with the model of its own data.
 
+--pass2 FOLDER (week.py: <out>_p2): the variants that hold mergers have two passes of the glitch fit (windows_fit.py
+--weights: the model fitted again with every segment weighted by its probability of holding no merger at the estimate
+of the first pass, and stage 2 with it, in FOLDER).  The row of the injections, its criterion and, with --recorded,
+the week as recorded are then those of FOLDER; the first pass is printed below the table as a record, without a
+verdict.  FOLDER must hold the same selection and campaign as <out>, and FOLDER/<variant>/glitch_model.json must be
+the model of its files, fitted with the weights of the first pass of <out>/<variant> (its weights entry names the
+glitch model of those files); a violation is an error before any fit.
+
 Before any fit, <out>/selection.txt is read (analyse.py writes it) and every variant that is used must cover the
 segments k = 0 .. n_selected - 1 exactly once (no gap, no segment in two files, none missing at the end), and the
 controls must carry the same campaign (every key of the files' meta that the variant does not define: manifest hash,
@@ -58,6 +66,7 @@ _spec.loader.exec_module(plant_fit)
 
 ORDER = ('pr', 'rev', 'slide+0.5', 'slide-1.75', 'inj')
 RECORDED = 'zero'
+SECOND = ('inj',)                   # of ORDER: the variants that hold mergers, judged on their second pass (--pass2)
 HEAD = ('variant', 'kept', 'aside', 'Gaussian nbar', 'mixture nbar', 'eps_H', 'eps_L', 'gamma_H', 'gamma_L',
         'Gaussian ev. end/max', 'mixture ev. end/max', 'verdict')
 WIDTH = (11, 7, 6, 20, 20, 15, 15, 8, 8, 21, 21, 0)
@@ -174,6 +183,49 @@ def check_week(out, variants, recorded_by_name=()):
     return n, ref
 
 
+def _model_sha(folder, variant):
+    """glitch_model_sha256 of the first plant file of folder/variant (the files of a variant agree: check_week)"""
+    with np.load(sorted(glob.glob(os.path.join(folder, variant, 'plant_*.npz')))[0]) as z:
+        return json.loads(str(z['meta'])).get('glitch_model_sha256')
+
+
+def pass2_problems(out, out2, variant):
+    """the problems (list of text) of the second pass out2/variant against the first out/variant: the glitch model
+    of out2/variant must be the model of its files and carry the weights of the first pass's files"""
+    path = os.path.join(out2, variant, 'glitch_model.json')
+    if not os.path.exists(path):
+        return ['%s: no %s: the second pass has no glitch model' % (variant, path)]
+    with open(path) as fh:
+        model = json.load(fh)
+    w, first, second = model.get('weights'), _model_sha(out, variant), _model_sha(out2, variant)
+    problems = []
+    if model.get('sha256') != second:
+        problems.append('%s: %s (SHA-256 %s) is not the glitch model of the files of the second pass (%s)'
+                        % (variant, path, str(model.get('sha256'))[:12], str(second)[:12]))
+    if not w:
+        problems.append('%s: %s was fitted without weights: not a second pass' % (variant, path))
+    elif first is None or w.get('stage2_model_sha256') != first:
+        problems.append('%s: the weights of %s are of the glitch model %s, the first pass in %s has %s'
+                        % (variant, path, str(w.get('stage2_model_sha256'))[:12], out, str(first)[:12]))
+    return problems
+
+
+def check_pass2(out, out2, variants, n_selected, campaign, recorded_by_name=()):
+    """the guard of the second pass: SystemExit with every problem unless out2 holds the selection and the campaign
+    of out, covers every variant of `variants` once, and their glitch models are those of the second pass"""
+    n2, ref2 = check_week(out2, variants, recorded_by_name)
+    problems = []
+    if n2 != n_selected:
+        problems.append('%d selected segments, %s has %d' % (n2, out, n_selected))
+    other = sorted(k for k in set(ref2) | set(campaign) if ref2.get(k) != campaign.get(k))
+    if other:
+        problems.append('another campaign than %s (differs in %s)' % (out, ', '.join(other)))
+    for v in variants:
+        problems += pass2_problems(out, out2, v)
+    if problems:
+        raise SystemExit('%s: not the second pass of %s, nothing is fitted:\n  %s' % (out2, out, '\n  '.join(problems)))
+
+
 def _pm(r, p, fmt):
     v, e = r[p], r['err'].get(p, np.nan)
     return '%s+-%s' % (plant_fit._f(v, fmt), plant_fit._f(e, '%.2g'))
@@ -256,15 +308,24 @@ def main(argv=None):
                    'power this many widths above the median')
     p.add_argument('--extra-slides', action='store_true', help='also fit every other slide* folder of <out>, with the '
                    'criteria of the slid weeks, as rows marked (extra) after the frozen ones')
+    p.add_argument('--pass2', default=None, metavar='FOLDER',
+                   help='the folder of the second pass of the variants that hold mergers (week.py: <out>_p2): their '
+                        'rows and criteria are taken from it, the first pass is printed as a record')
     a = p.parse_args(argv)
     if not a.f_det < 1:
         p.error('need f-det < 1')
     extra = extra_slides(a.out) if a.extra_slides else []
     n_selected, campaign = check_week(a.out, ORDER + tuple(extra), (RECORDED,) if a.recorded else ())
-    results = {}
+    if a.pass2:
+        check_pass2(a.out, a.pass2, SECOND, n_selected, campaign, (RECORDED,) if a.recorded else ())
+    results, first = {}, {}
     for v in ORDER + tuple(extra):
         results[v] = fit(a.out, v, a, n_selected)
         print('fitted %s' % v if results[v] is not None else 'no files in %s' % os.path.join(a.out, v), flush=True)
+        if a.pass2 and v in SECOND:
+            first[v], results[v] = results[v], fit(a.pass2, v, a, n_selected)
+            print('fitted %s, second pass' % v if results[v] is not None else 'no files in %s'
+                  % os.path.join(a.pass2, v), flush=True)
     rho = next((r['rho_min'] for r in results.values() if r is not None), None)
     windows = any(r is not None and r.get('model') == 'windows' for r in results.values())
     nets = sorted({(r['veto']['note'] or 'on') if 'veto' in r else 'not reported' for r in results.values()
@@ -277,6 +338,11 @@ def main(argv=None):
              'the window model of each variant\'s own data (glitch parameters of stage 1)' if windows else
              'glitch law from rho_min %s' % plant_fit._f(rho, '%g'), plant_fit.PRIOR[0], plant_fit.PRIOR[1]))
     print('\n'.join(table([row(v, results[v]) for v in ORDER], windows)), flush=True)
+    if first:
+        print('\nthe first pass of %s (a record: the glitch model fitted on data that hold mergers as if they held '
+              'none; the row above is the second pass, %s):' % (', '.join(first), a.pass2))
+        print('\n'.join(table([row(v + ' (pass 1)', first[v]) for v in first], windows,
+                              max(WIDTH[0], max(len(v) for v in first) + 9))), flush=True)
     passed = all(results[v] is not None and results[v]['ok'] for v in ORDER)
     failed_extra = [v for v in extra if not results[v]['ok']]
     if a.extra_slides:
@@ -296,14 +362,24 @@ def main(argv=None):
               % (' and extra slides' if extra else ''))
         return 1
     print('\n--recorded: controls and injections checked again, all pass: opening the week as recorded.', flush=True)
-    r = fit(a.out, RECORDED, a, n_selected)
-    other = sorted(k for k in set(r['cfg']) - set(VARIANT_KEYS) | set(campaign) - set(VARIANT_KEYS)
-                   if r['cfg'].get(k) != campaign.get(k))
-    if other:
-        print('\n--recorded: the files of %s belong to another campaign than the controls (differ in %s): not shown.'
-              % (RECORDED, ', '.join(other)))
-        return 1
+    r = r1 = fit(a.out, RECORDED, a, n_selected)
+    if a.pass2:
+        problems = pass2_problems(a.out, a.pass2, RECORDED)
+        if problems:
+            print('\n--recorded: %s is not the second pass of the week as recorded: not shown.\n  %s'
+                  % (a.pass2, '\n  '.join(problems)))
+            return 1
+        r = fit(a.pass2, RECORDED, a, n_selected)
+    for x in (r, r1):
+        other = sorted(k for k in set(x['cfg']) - set(VARIANT_KEYS) | set(campaign) - set(VARIANT_KEYS)
+                       if x['cfg'].get(k) != campaign.get(k))
+        if other:
+            print('\n--recorded: the files of %s belong to another campaign than the controls (differ in %s): not '
+                  'shown.' % (RECORDED, ', '.join(other)))
+            return 1
     print('\n'.join(table([row(RECORDED, r)], windows)[1:]))
+    if a.pass2:
+        print('\n'.join(table([row(RECORDED + ' (pass 1)', r1)], windows, WIDTH[0] + 9)[1:]))
     if r is not None:
         print('\n' + '\n'.join(r['lines']))
     return 0 if r is not None and r['ok'] else 1

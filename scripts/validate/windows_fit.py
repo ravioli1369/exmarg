@@ -45,7 +45,10 @@ FOLDER (stage 2 of the pass before, of the same campaign_key, covering every fit
 of the part of the data without a merger; a loud merger leaves the fit with everything it puts in its segment).  Not with
 --nbar > 0 (the two accounts of the mergers do not combine).  The model records weights {nbar, stage2_model_sha256 (the
 glitch model of those files, null without one), sum, below_half}; it has no nbar entry: for the merger stage it is a model
-without mergers, and its own SHA-256 tells the passes apart.
+without mergers, and its own SHA-256 tells the passes apart.  --weights-nbar auto: N is the estimate of the window model on
+the fitted segments of FOLDER, plant_fit.nbar_fit of their ln_B_bar with the detected fraction --f-det (default 0) of the
+loudness cuts, the number plant_fit.py and summarize.py print for that folder with the same cuts; weights then records
+estimated true and f_det as well (the second pass of week.py).
 
 Run as a script the fit uses one BLAS thread whatever the environment says (set before numpy is loaded), so that the
 model and its sha256 do not depend on the number of cores of the machine.
@@ -90,6 +93,7 @@ RECORD = (1, 2, 3)
 GAMMAS = (2.0, 3.0, 4.0, 5.0, 6.0, 8.0)
 ZONE = 1
 MODEL = 'glitch_model.json'
+AUTO = 'auto'                   # --weights-nbar: the estimate of the merger-stage files themselves
 FILE = re.compile(r'^win_(\d+)_(\d+)\.npz$')
 SHARED = ('window_rho_edges', 'window_bin0')
 LARGE = ('ln_window_H', 'ln_window_L')
@@ -234,9 +238,11 @@ def describe(cfg):
     return text
 
 
-def no_merger_weights(folder, ks, nbar, cfg):
+def no_merger_weights(folder, ks, nbar, cfg, f_det=0.0):
     """(w (n,), info): w_i = 1 - p_i of the segments ks, p_i = nbar B_i / (1 + nbar (B_i - 1)) from ln_B_bar of the
-    merger-stage files of folder; SystemExit when the files are of another campaign_key than cfg, or miss a segment"""
+    merger-stage files of folder; SystemExit when the files are of another campaign_key than cfg, or miss a segment.
+    nbar None: the estimate of the window model on the segments ks, plant_fit.nbar_fit(ln_B_bar, f_det) (the summary's
+    when ks are its kept segments); info then holds estimated True and f_det too"""
     paths = sorted(glob.glob(os.path.join(folder, 'plant_*.npz')))
     if not paths:
         raise SystemExit('%s: no merger-stage files (plant_*.npz) for the weights' % folder)
@@ -266,6 +272,9 @@ def no_merger_weights(folder, ks, nbar, cfg):
     lb = lnB[[pos[int(v)] for v in ks]]
     if np.isnan(lb).any():
         raise SystemExit('%s: ln_B_bar is nan in %d fitted segments' % (folder, np.isnan(lb).sum()))
+    estimated = nbar is None
+    if estimated:
+        nbar = float(summarize.plant_fit.nbar_fit(lb, f_det)['nbar'])
     if nbar > 0:
         with np.errstate(over='ignore', divide='ignore', invalid='ignore'):
             inv = 1.0 / np.expm1(lb)                                   # 1 / (B - 1): infinite at B = 1 (p = nbar), 0 at B infinite (p = 1)
@@ -273,11 +282,14 @@ def no_merger_weights(folder, ks, nbar, cfg):
         w = np.clip(np.where(lb == np.inf, 0.0, w), 0.0, 1.0)
     else:
         w = np.ones(lb.size)
-    return w, dict(nbar=float(nbar), stage2_model_sha256=sha.pop(), sum=float(w.sum()), below_half=int((w < 0.5).sum()))
+    info = dict(nbar=float(nbar), stage2_model_sha256=sha.pop(), sum=float(w.sum()), below_half=int((w < 0.5).sum()))
+    if estimated:
+        info.update(estimated=True, f_det=float(f_det))
+    return w, info
 
 
 def fit(folder, n_state=N_STATE, basis='bins', rho_min=RHO[0], rho_max=RHO[1], veto_w=VETO_W, zone=ZONE,
-        record=RECORD, nbar=0.0, w_net=W_NET, weights=None, weights_nbar=None):
+        record=RECORD, nbar=0.0, w_net=W_NET, weights=None, weights_nbar=None, f_det=0.0):
     """the fits and the model of the folder: dict lines (the report), model (the content of glitch_model.json without
     its sha256), ok (the fits of the model written converged), fits {I: {K: fit_windows result}}, keep (n,), cols, data.
     nbar > 0: every fit with the mergers of the population at that rate (fit_windows with the merger evidence of the
@@ -285,15 +297,19 @@ def fit(folder, n_state=N_STATE, basis='bins', rho_min=RHO[0], rho_max=RHO[1], v
     reversal, phase randomization: their model is the one without mergers, Sec. 3) and for files without the merger
     evidence; the model then records nbar and the merger_population of the files.  weights (a merger-stage folder)
     and weights_nbar: the fit without mergers with the weights no_merger_weights of the kept segments (not with
-    nbar > 0); the model then records weights"""
+    nbar > 0); weights_nbar AUTO: at the estimate of that folder on the kept segments, with the detected fraction
+    f_det; the model then records weights"""
     if basis not in ('bins', 'power'):
         raise ValueError("basis must be 'bins' or 'power'")
     if n_state < 1 or zone < 0:
         raise ValueError('need n_state >= 1 and zone >= 0')
     if not 0.0 <= nbar <= 1.0:
         raise ValueError('need 0 <= nbar <= 1')
-    if weights is not None and (nbar > 0 or weights_nbar is None or not 0.0 <= weights_nbar <= 1.0):
-        raise ValueError('weights need 0 <= weights_nbar <= 1 and nbar = 0')
+    auto = isinstance(weights_nbar, str) and weights_nbar == AUTO
+    if weights is not None and (nbar > 0 or weights_nbar is None or not (auto or 0.0 <= weights_nbar <= 1.0)):
+        raise ValueError('weights need 0 <= weights_nbar <= 1 (or %r) and nbar = 0' % AUTO)
+    if f_det != 0 and not (weights is not None and auto):
+        raise ValueError('f_det enters the estimate of weights_nbar %r only' % AUTO)
     cfg, d, shared, paths = load(folder)
     if nbar > 0 and cfg.get('control') not in WITH_MERGERS:
         raise SystemExit('%s: the data are a control (%s): no merger has a partner in the other detector, the glitch '
@@ -325,7 +341,7 @@ def fit(folder, n_state=N_STATE, basis='bins', rho_min=RHO[0], rho_max=RHO[1], v
     R = {}
     wt = winfo = None
     if weights is not None:
-        wt, winfo = no_merger_weights(weights, d['k'][keep], weights_nbar, cfg)
+        wt, winfo = no_merger_weights(weights, d['k'][keep], None if auto else weights_nbar, cfg, f_det)
     for I in 'HL':
         E = evidences(paths, I, keep, cols)
         if wt is not None:
@@ -357,9 +373,10 @@ def fit(folder, n_state=N_STATE, basis='bins', rho_min=RHO[0], rho_max=RHO[1], v
                  % (nbar, mp['zmin'], mp['mdet_range'][0], mp['mdet_range'][1], len(mp['s']), mp['s'][0], mp['s'][-1],
                     mp['ymin'], zone))
     if wt is not None:
-        L.append('weights 1 - p of the merger stage of %s at nbar %.6g (glitch model %s): sum %.2f over the %d fitted '
-                 'segments, %d below one half' % (weights, weights_nbar, (winfo['stage2_model_sha256'] or 'none')[:12],
-                                                  winfo['sum'], keep.sum(), winfo['below_half']))
+        L.append('weights 1 - p of the merger stage of %s at nbar %.6g%s (glitch model %s): sum %.2f over the %d fitted '
+                 'segments, %d below one half' % (
+                     weights, winfo['nbar'], ', its estimate on the fitted segments with f %g' % f_det if auto else '',
+                     (winfo['stage2_model_sha256'] or 'none')[:12], winfo['sum'], keep.sum(), winfo['below_half']))
     det, record = {}, {}
     for I in 'HL':
         L.append('\n%s: fits with %s states' % (I, ', '.join(map(str, Ks))))
@@ -484,17 +501,29 @@ def main(argv=None):
     p.add_argument('--weights', default=None, metavar='FOLDER',
                    help='fit without mergers, every segment weighted by its probability of holding no merger, from the '
                         'merger-stage files of this folder at --weights-nbar')
-    p.add_argument('--weights-nbar', type=float, default=None, help='the merger rate of the weights')
+    p.add_argument('--weights-nbar', default=None, metavar='N',
+                   help='the merger rate of the weights: a number, or %s for the estimate of the window model on the '
+                        'fitted segments of that folder' % AUTO)
+    p.add_argument('--f-det', type=float, default=0.0,
+                   help='with --weights-nbar %s: the detected fraction of the loudness cuts in that estimate '
+                        '(plant_fit.nbar_fit; the --f-det of summarize.py)' % AUTO)
     p.add_argument('--model', default=None, metavar='JSON',
                    help='where to write the model (default <folder>/%s)' % MODEL)
     a = p.parse_args(argv)
     if not (0 <= a.rho_min < a.rho_max) or a.n_state < 1 or a.zone < 0 or not 0 <= a.nbar <= 1:
         p.error('need 0 <= rho-min < rho-max, n-state >= 1, zone >= 0, 0 <= nbar <= 1')
+    if a.weights_nbar is not None and a.weights_nbar != AUTO:
+        try:
+            a.weights_nbar = float(a.weights_nbar)
+        except ValueError:
+            p.error('--weights-nbar is a number in [0, 1] or %s' % AUTO)
     if (a.weights is None) != (a.weights_nbar is None) or (a.weights is not None and (
-            a.nbar > 0 or not 0 <= a.weights_nbar <= 1)):
-        p.error('--weights and --weights-nbar (in [0, 1]) go together, and not with --nbar > 0')
+            a.nbar > 0 or not (a.weights_nbar == AUTO or 0 <= a.weights_nbar <= 1))):
+        p.error('--weights and --weights-nbar (in [0, 1], or %s) go together, and not with --nbar > 0' % AUTO)
+    if a.f_det != 0 and (a.weights_nbar != AUTO or not a.f_det < 1):
+        p.error('--f-det (below 1) goes with --weights-nbar %s' % AUTO)
     r = fit(a.folder, a.n_state, a.basis, a.rho_min, a.rho_max, a.veto_w, a.zone,
-            tuple(int(x) for x in a.record.split(',') if x), a.nbar, a.w_net, a.weights, a.weights_nbar)
+            tuple(int(x) for x in a.record.split(',') if x), a.nbar, a.w_net, a.weights, a.weights_nbar, a.f_det)
     print('\n'.join(r['lines']), flush=True)
     if not r['ok']:
         return 1

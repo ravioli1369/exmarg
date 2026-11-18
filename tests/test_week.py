@@ -33,10 +33,41 @@ def test_commands_of_the_final_configuration():
     f = os.path.join(ROOT, 'scripts', 'validate', 'windows_fit.py')
     assert fits == ['py %s %s --rho-min 5 --record 1' % (f, os.path.join('out', x)) for x in ('pr', 'slide+0.5')]
     s = os.path.join(ROOT, 'scripts', 'real_data', 'summarize.py')
-    assert dry('summary', STORES, 'segs', '--out', 'out') == ['py %s out --extra-slides' % s]
-    assert dry('summary', STORES, 'segs', '--out', 'out', '--f-det', '0.007') == [
-        'py %s out --extra-slides --f-det 0.007' % s]
+    assert dry('summary', STORES, 'segs', '--out', 'out') == ['py %s out --extra-slides --pass2 out_p2' % s]
+    assert dry('summary', STORES, 'segs', '--out', 'out/', '--f-det', '0.007') == [
+        'py %s out/ --extra-slides --pass2 out_p2 --f-det 0.007' % s]
     assert week.RECORDED not in week.CONTROLS and 'inj' in week.CONTROLS
+
+
+def test_second_pass_of_the_variants_with_mergers(capsys):
+    """fit2 and merger2 act on the variants of --variants that hold mergers (inj; zero with --recorded): the glitch
+    model fitted again with the weights of the first pass at its own estimate, with the detected fraction, written to
+    <out>_p2, and stage 2 with it into <out>_p2 with the settings of the first pass; refused when no variant of
+    --variants holds mergers"""
+    a = os.path.join(ROOT, 'scripts', 'real_data', 'analyse.py')
+    f = os.path.join(ROOT, 'scripts', 'validate', 'windows_fit.py')
+    inj, model = os.path.join('out', 'inj'), os.path.join('out_p2', 'inj', 'glitch_model.json')
+    assert dry('fit2', STORES, 'segs', '--out', 'out') == [
+        'py %s %s --rho-min 5 --record 1 --weights %s --weights-nbar auto --model %s' % (f, inj, inj, model)]
+    assert dry('fit2', STORES, 'segs', '--out', 'out', '--f-det', '0.0005') == [
+        'py %s %s --rho-min 5 --record 1 --weights %s --weights-nbar auto --f-det 0.0005 --model %s' % (f, inj, inj, model)]
+    assert dry('merger2', STORES, 'segs', '--out', 'out', '--part', '1/4') == [
+        'py %s %s gpu segs --out out_p2 --variants inj --glitch-model auto --unequal --mmap --zmin 0.02 --part 1/4'
+        % (a, STORES)]
+    two = dry('fit2', STORES, 'segs', '--out', 'out', '--variants', 'pr,zero,inj', '--recorded')
+    assert [c.split()[2] for c in two] == [os.path.join('out', 'zero'), inj]
+    assert '--variants zero,inj ' in dry('merger2', STORES, 'segs', '--out', 'out', '--variants', 'zero,inj',
+                                         '--recorded')[0]
+    first = dry('merger', STORES, 'segs', '--out', 'out', '--variants', 'inj', '--part', '1/4')[0]
+    second = dry('merger2', STORES, 'segs', '--out', 'out', '--variants', 'inj', '--part', '1/4')[0]
+    assert second == first.replace('--out out ', '--out out_p2 ')          # the same stage 2, in the other folder
+    for step in ('fit2', 'merger2'):
+        with pytest.raises(SystemExit):
+            week.main([step, STORES, 'segs', '--out', 'out', '--variants', 'pr,slide+0.5', '--dry-run'])
+        assert 'hold mergers' in capsys.readouterr().err
+        with pytest.raises(SystemExit):                                   # zero still needs its flag
+            week.main([step, STORES, 'segs', '--out', 'out', '--variants', 'zero', '--dry-run'])
+        assert 'only with --recorded' in capsys.readouterr().err
 
 
 def test_the_recorded_week_needs_its_flag(capsys):
@@ -46,7 +77,7 @@ def test_the_recorded_week_needs_its_flag(capsys):
     assert 'only with --recorded' in capsys.readouterr().err
     lines = dry('merger', STORES, 'segs', '--out', 'out', '--variants', 'zero', '--recorded')
     assert '--variants zero ' in lines[0]
-    assert dry('summary', STORES, 'segs', '--out', 'out', '--recorded')[0].endswith('--extra-slides --recorded')
+    assert dry('summary', STORES, 'segs', '--out', 'out', '--recorded')[0].endswith('--pass2 out_p2 --recorded')
     assert not dry('summary', STORES, 'segs', '--out', 'out')[0].endswith('--recorded')
     with pytest.raises(SystemExit):
         week.main(['summary', STORES, 'segs', '--out', 'out', '--f-det', '1.0', '--dry-run'])

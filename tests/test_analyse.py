@@ -486,6 +486,127 @@ def test_summarize_guard(week, tmp_path, monkeypatch, capsys):
     assert 'another campaign' in out and 'seed' in out and 'the report of zero' not in out and log[-1] == 'zero'
 
 
+def second_pass(root, root2, week, variants=('inj',), sha1='11' * 32, sha2='22' * 32, weights='first'):
+    """the synthetic week root with its second pass root2: the files of `variants` in root carry the glitch model
+    sha1, those of root2 the model sha2, and root2/<variant>/glitch_model.json is that model with the weights of sha1
+    (weights: 'first'; another SHA-256; None: a model without weights).  returns n_selected"""
+    n = guard_week(root, week)
+    guard_week(root2, week, only=variants)
+    args = analyse.parse(['x', 'cpu', week, '--out', 'x', '--seed', '7'])[1]
+    for folder, sha in ((root, sha1), (root2, sha2)):
+        for v in variants:
+            if v == 'zero':
+                continue
+            for first, end in ((0, n // 2), (n // 2, n)):
+                plant.write_batch(os.path.join(folder, v, 'plant_%010d_%010d.npz' % (first, end)),
+                                  dict(analyse.campaign(args, week, v), glitch_model_sha256=sha),
+                                  dict(first=first, end=end), dict(k=np.arange(first, end)))
+    for v in variants:
+        model = dict(model='windows', sha256=sha2)
+        if weights is not None:
+            model['weights'] = dict(nbar=0.3, stage2_model_sha256=sha1 if weights == 'first' else weights)
+        with open(os.path.join(root2, v, 'glitch_model.json'), 'w') as fh:
+            json.dump(model, fh)
+    return n
+
+
+def test_summarize_second_pass(week, tmp_path, monkeypatch, capsys):
+    """summarize --pass2: the injections are fitted in both folders, judged on the second pass and the first printed
+    as a record; a failing second pass fails the week whatever the first did; the folder of the second pass must hold
+    the selection and campaign of the week, every segment once, and the glitch model of its files fitted with the
+    weights of the first pass: otherwise an error before any fit"""
+    root, root2 = tmp_path / 'w', tmp_path / 'w_p2'
+    second_pass(root, root2, week)
+    order = list(summarize.ORDER)
+    seen = []
+
+    def report(path, **kw):
+        seen.append(os.path.relpath(path, tmp_path))
+        return fake_report([], failing)(path, **kw)
+    monkeypatch.setattr(summarize.plant_fit, 'report', report)
+    failing = ()
+    assert summarize.main([str(root), '--pass2', str(root2)]) == 0
+    out = capsys.readouterr().out
+    assert seen == [os.path.join('w', v) for v in order] + [os.path.join('w_p2', 'inj')]
+    assert 'fitted inj, second pass' in out and 'inj (pass 1)' in out and 'all pass' in out
+    rows = [l.split()[0] for l in out.splitlines() if l.split(' ')[0] in order and '(pass 1)' not in l]
+    assert rows == order and out.index('\ninj ') < out.index('inj (pass 1)')
+    # the verdict is that of the second pass: the stand-in fails a variant by its name, in both folders, so the two
+    # passes are told apart by the path
+    def report2(path, **kw):
+        r = fake_report([], ())(path, **kw)
+        if os.path.relpath(path, tmp_path) == os.path.join(bad, 'inj'):
+            r['ok'], r['criteria'] = False, [('mixture: nbar within 2.5 sigma', False, '', True)]
+        return r
+    monkeypatch.setattr(summarize.plant_fit, 'report', report2)
+    bad = 'w'
+    assert summarize.main([str(root), '--pass2', str(root2)]) == 0 and 'all pass' in capsys.readouterr().out
+    bad = 'w_p2'
+    assert summarize.main([str(root), '--pass2', str(root2)]) == 1 and 'NOT all pass' in capsys.readouterr().out
+    assert summarize.main([str(root)]) == 0                           # without --pass2: the first pass, as before
+    capsys.readouterr()
+    # the guards
+    for name, kw, says in (('plain', dict(weights=None), 'fitted without weights'),
+                           ('other', dict(weights='33' * 32), 'the weights of'),
+                           ('files', dict(sha2='44' * 32), None)):
+        a, b = tmp_path / name, tmp_path / (name + '_p2')
+        second_pass(a, b, week, **kw)
+        if name == 'files':                                           # the model in the folder is not that of the files
+            with open(b / 'inj' / 'glitch_model.json', 'w') as fh:
+                json.dump(dict(model='windows', sha256='55' * 32, weights=dict(stage2_model_sha256='11' * 32)), fh)
+            says = 'is not the glitch model of the files'
+        msg = refused(a, monkeypatch, '--pass2', str(b))
+        assert says in msg and 'not the second pass' in msg, msg
+    a, b = tmp_path / 'nomodel', tmp_path / 'nomodel_p2'
+    second_pass(a, b, week)
+    os.remove(b / 'inj' / 'glitch_model.json')
+    assert 'has no glitch model' in refused(a, monkeypatch, '--pass2', str(b))
+    a, b = tmp_path / 'short', tmp_path / 'short_p2'
+    n = second_pass(a, b, week)
+    os.remove(b / 'inj' / ('plant_%010d_%010d.npz' % (n // 2, n)))
+    msg = refused(a, monkeypatch, '--pass2', str(b))
+    assert 'inj' in msg and 'missing' in msg and str(b) in msg, msg
+    a, b = tmp_path / 'seed', tmp_path / 'seed_p2'
+    n = second_pass(a, b, week)
+    args = analyse.parse(['x', 'cpu', week, '--out', 'x', '--seed', '8'])[1]
+    for first, end in ((0, n // 2), (n // 2, n)):
+        plant.write_batch(os.path.join(b, 'inj', 'plant_%010d_%010d.npz' % (first, end)),
+                          dict(analyse.campaign(args, week, 'inj'), glitch_model_sha256='22' * 32),
+                          dict(first=first, end=end), dict(k=np.arange(first, end)))
+    msg = refused(a, monkeypatch, '--pass2', str(b))
+    assert 'another campaign' in msg and 'seed' in msg, msg
+
+
+def test_summarize_second_pass_recorded(week, tmp_path, monkeypatch, capsys):
+    """--recorded with --pass2: the week as recorded is opened last, both passes fitted, the second shown as its
+    row and the first as a record; without the second pass of zero (no model with the weights of its first pass) its
+    numbers are not shown"""
+    root, root2 = tmp_path / 'w', tmp_path / 'w_p2'
+    n = second_pass(root, root2, week, variants=('inj', 'zero'))
+    args = analyse.parse(['x', 'cpu', week, '--out', 'x', '--seed', '7'])[1]
+    cfgs = {v: analyse.campaign(args, week, v) for v in analyse.VARIANTS}
+    for folder, sha in ((root, '11' * 32), (root2, '22' * 32)):       # zero's files, read only at the opening
+        for first, end in ((0, n // 2), (n // 2, n)):
+            plant.write_batch(os.path.join(folder, 'zero', 'plant_%010d_%010d.npz' % (first, end)),
+                              dict(cfgs['zero'], glitch_model_sha256=sha), dict(first=first, end=end),
+                              dict(k=np.arange(first, end)))
+    log = []
+    monkeypatch.setattr(summarize.plant_fit, 'report', fake_report(log, (), cfgs))
+    assert summarize.main([str(root), '--pass2', str(root2), '--recorded']) == 0
+    out = capsys.readouterr().out
+    assert log == list(summarize.ORDER) + ['inj', 'zero', 'zero'] and 'zero (pass 1)' in out
+    assert 'opening the week as recorded' in out and 'the report of zero' in out
+    os.remove(root2 / 'zero' / 'glitch_model.json')
+    log.clear()
+    assert summarize.main([str(root), '--pass2', str(root2), '--recorded']) == 1
+    out = capsys.readouterr().out
+    assert 'is not the second pass of the week as recorded' in out and 'the report of zero' not in out
+    log.clear()
+    monkeypatch.setattr(summarize.plant_fit, 'report', fake_report(log, ('inj',), cfgs))
+    assert summarize.main([str(root), '--pass2', str(root2), '--recorded']) == 1 and 'zero' not in log
+    assert 'stays closed' in capsys.readouterr().out
+
+
 def refused(root, monkeypatch, *argv):
     """summarize.main on root: the SystemExit message, and the variants fitted before it (must be none)"""
     log = []
