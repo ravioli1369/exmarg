@@ -33,10 +33,11 @@ the tables', where lnS rises by more than 9 across a cell: tests/test_store.py).
 segments with mergers planted at nbar 0.30 the published tables as built give nbar 0.2985, our rebuilt tables as built
 0.2985, and the same tables with unbias 0.2543 (difference -0.044 +- 0.004); unbias lowers ln Lambda_bar by about 0.004
 for faint segments and by 0.04 to 0.12 for loud mergers.  Those runs took ln Lambda linear between the nodes of the
-store and between the templates (pe.pe_redshift(interp='log')), a geometric mean of likelihood ratios, which lowers the
-likelihood ratio and so works against the error of the tables as built.  plant.py and analyse.py read the tables with
-unbias and take Lambda linear there (interp='linear', whose mean under noise is 1); --as-built and --interp log give
-the other readings, for comparisons.
+store and between the templates (interp='log', the default of pe.pe_redshift), a geometric mean of likelihood ratios,
+which lowers the likelihood ratio and so works against the error of the tables as built.  The defaults of this module
+and of pe.py are that reading, the paper's.  plant.py and analyse.py read the tables with unbias and take Lambda
+linear there (they pass unbiased=True and interp='linear', whose mean under noise is 1); their --as-built and --interp
+log give the other readings, for comparisons.
 """
 
 import glob

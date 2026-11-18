@@ -34,7 +34,8 @@ table lnS on its grid raises it (store.unbias removes it), and that of ln Lambda
 templates, a geometric mean of two likelihood ratios, lowers it (pe._to_source_frame; Lambda linear between them keeps
 the mean at 1).  The merger stage reads the tables with unbias (store.load_redshift_store(unbiased=True)) and takes
 Lambda linear (pe_redshift(interp='linear')).  For comparisons, --as-built reads the tables as built and --interp log
-takes ln Lambda linear: the two together are the authors' method, in which the two errors work against each other.
+takes ln Lambda linear: the two together are the authors' method, in which the two errors work against each other, and
+the defaults of the library (store.load_redshift_store, pe.pe_redshift), which this script does not rely on.
 With ln Lambda linear unbias lowers the merger rate (16384 segments with mergers planted at nbar 0.30: 0.2543 with it,
 0.2985 as built; src/exmarg/search/store.py).  --unbias names the default and changes nothing; --published-tables is
 the older name of --as-built (neither with --unbias).
@@ -167,6 +168,7 @@ STAGES = ('merger', 'windows')
 N_WINDOW = 64
 WINDOW_RHO = (3.0, 12.2)
 WINDOW_CHUNK = 8                            # segments filtered at once by window_evidences (its default)
+INTERP_DEFAULT = 'linear'                   # --interp of the drivers (Tables); the default of pe_redshift is 'log'
 # the campaign settings of the merger stage alone, and those of the stages: campaign_key leaves them out
 MERGER_KEYS = ('grid', 'ymin', 'n_loud', 'n_random', 'glitch_settings', 'tables', 'shared_times', 'glitch_model',
                'glitch_model_sha256', 'tables_asym', 'zmin_cut', 'asym_tol', 'signal_gain', 'glitch_model_nbar',
@@ -472,11 +474,12 @@ def window_shared(bins):
 
 
 def make_analysis(store, device, resident=False, chunk=CHUNK, ymin=None, shared_times=False, zmin=None, asym_tol=None,
-                  interp=INTERP[0]):
+                  interp=INTERP_DEFAULT):
     """the analysis behind a narrow interface: factory(segments) builds the bank on these segments (every batch has the
     same frequency grid and noise curves) and returns pe(segments, seed, glitch) -> the pe_redshift dict on GRID, with
     glitch=True or None, or the dict of the window model (glitch_model); store one store or a list (the mixture), zmin
-    and asym_tol those of pe_redshift (each given only when not None), interp that of pe_redshift"""
+    and asym_tol those of pe_redshift (each given only when not None), interp that of pe_redshift, always given
+    (default the drivers' INTERP_DEFAULT, not pe_redshift's own)"""
     from exmarg.search import mass_bank, pe_redshift
     cut = {k: v for k, v in (('zmin', zmin), ('asym_tol', asym_tol)) if v is not None}
 
@@ -604,7 +607,7 @@ def store_settings(args):
     if getattr(args, 'stage', 'merger') == 'windows':
         return {}
     out = dict(tables=tables_kind(args))
-    if getattr(args, 'interp', INTERP[0]) == 'linear':
+    if getattr(args, 'interp', INTERP_DEFAULT) == 'linear':
         out['interp'] = 'linear'
     dirs = [d for d in args.store.split(',') if d]
     if len(dirs) > 1:
@@ -905,7 +908,7 @@ def parser():
     p.add_argument('--unbias', action='store_true',
                    help='the tables with the unbias correction, the default: changes nothing (kept so that older '
                         'command lines run; not with --as-built)')
-    p.add_argument('--interp', choices=INTERP, default=INTERP[0],
+    p.add_argument('--interp', choices=INTERP, default=INTERP_DEFAULT,
                    help='between the nodes of the tables and between the templates: linear, Lambda linear (default), '
                         'or log, ln Lambda linear (the authors\' code, for comparisons: it lowers the noise mean of '
                         'B); the campaign records interp linear, and no entry with log')
@@ -958,7 +961,7 @@ def main(argv=None, factory=None):
     windows = a.stage == 'windows'
     if a.chunk is None:
         a.chunk = WINDOW_CHUNK if windows else CHUNK
-    if windows and (a.glitch_model or a.plain or a.unbias or a.as_built or a.interp != INTERP[0] or a.shared_times
+    if windows and (a.glitch_model or a.plain or a.unbias or a.as_built or a.interp != INTERP_DEFAULT or a.shared_times
                     or a.zmin_cut or a.mmap):
         p.error('--glitch-model, --plain, --unbias, --as-built (--published-tables), --interp, --shared-times, '
                 '--zmin-cut and --mmap are of the merger stage')

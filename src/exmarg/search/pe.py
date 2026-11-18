@@ -79,7 +79,7 @@ WINDOWS = dict(model="windows", n_window=64, zone=1, pi_m=None, H=None, L=None) 
 STATE = ("f", "q", "pi_k")                          # the settings of one detector in model='windows'
 SUM_TOL = 1e-6                                      # how far from 1 the sum of a law may be
 ASYM_TOL = 1e-9                                     # how far a template's w may be from the asym of the one store
-INTERP = ("linear", "log")                          # linear between two nodes: Lambda, or ln Lambda (pe_redshift)
+INTERP = ("linear", "log")                          # linear between two nodes: Lambda, or ln Lambda (the default)
 # The single-detector merger term at the boundary point of each template (its own signal power): from a table of Phi
 # made once per bank (single.MergerTable, True) or computed at every segment (single.ln_merger_at, False).  The two
 # use the same interpolation and agree to rounding (tests/test_single.py, tests/test_pe_batch.py); the table saves
@@ -341,17 +341,16 @@ def _between(v0, v1, t, interp, cp):
         return cp.logaddexp(a, b)
 
 
-def _to_source_frame(lamN, yN, Mdet, yq, m1, z, cp, interp="linear"):
+def _to_source_frame(lamN, yN, Mdet, yq, m1, z, cp, interp="log"):
     """node values (n_node + 1, n_template) -> ln Lambda on (m1, z) (cp: numpy or cupy):
     interpolated in y per template, then in M_det = 2 m1 (1 + z) per z, each
     between the neighbouring finite values (as np.interp on the finite ones), -inf outside them.
 
-    interp 'linear': Lambda linear between the two values, ln((1 - t) e^v0 + t e^v1) at the fraction t.  That is the
-    likelihood ratio of a population on the two nodes with the weights 1 - t and t, so under noise its mean is 1
-    where theirs is.  'log': ln Lambda linear, v0 + t (v1 - v0), the form of the code up to 2026-11-17, bit for bit.
-    It is a geometric mean of two likelihood ratios, whose mean under noise is below 1 (Hoelder): for two amplitudes
-    dA apart of a Gaussian model exp(-t (1 - t) dA^2 / 2) (tests/test_pe_interp.py), which lowers B.  ValueError for
-    another interp"""
+    interp 'log' (the default, the paper's reading): ln Lambda linear between the two values, v0 + t (v1 - v0) at the
+    fraction t.  It is a geometric mean of two likelihood ratios, whose mean under noise is below 1 (Hoelder): for
+    two amplitudes dA apart of a Gaussian model exp(-t (1 - t) dA^2 / 2) (tests/test_pe_interp.py), which lowers B.
+    'linear': Lambda linear, ln((1 - t) e^v0 + t e^v1), the likelihood ratio of a population on the two nodes with
+    the weights 1 - t and t, so under noise its mean is 1 where theirs is.  ValueError for another interp"""
     if interp not in INTERP:
         raise ValueError("interp is one of %s; got %r" % (", ".join(INTERP), interp))
     L = cp.asarray(lamN)
@@ -898,7 +897,7 @@ def _segment_keys(gd):
 def pe_redshift(segments, bank, store, rows=None, chunk=8, zmax=8.0, nz=1600,
                 m1_range=(3.0, 150.0), nm1=1600, ymin=0.1267, nodes_per_launch=6, block=256,
                 mdet_range=(10.0, 500.0), resident=False, n_loud=1024, n_random=1024, seed=0, single=False,
-                glitch=None, shared_times=False, zmin=None, asym_tol=0.0, interp="linear"):
+                glitch=None, shared_times=False, zmin=None, asym_tol=0.0, interp="log"):
     """ln Lambda(m1_source, z) of each segment.
 
     segments          anything read_segments takes (see there)
@@ -947,9 +946,11 @@ def pe_redshift(segments, bank, store, rows=None, chunk=8, zmax=8.0, nz=1600,
                       (one store: differs from its asym by at most asym_tol) is read from the end
                       store alone, its data scaled to that store's model; 0: none (ValueError)
     interp            how every grid of the result is interpolated between the nodes in y and between
-                      the templates in M_det (_to_source_frame): 'linear', Lambda linear (the mean
-                      under noise stays 1), or 'log', ln Lambda linear (the code up to 2026-11-17,
-                      which lowers it; for comparisons).  ValueError for another
+                      the templates in M_det (_to_source_frame): 'log', ln Lambda linear (the default,
+                      the paper's reading, which lowers the mean under noise), or 'linear', Lambda
+                      linear (the mean stays 1).  The search drivers (scripts/validate/plant.py,
+                      scripts/real_data/analyse.py) read the tables with unbias and pass 'linear'.
+                      ValueError for another
 
     ln B averages Lambda over the prior uniform in M_det = 2 m1 (1+z) on
     mdet_range and proportional to D_L^2 in luminosity distance, i.e.
@@ -1018,7 +1019,7 @@ def _epoch(ep, stores, ymin, ymax, trim, asym_tol, shape, setups=None):
     return dict(bank=bank, seg=seg, geometry=geometry, plan=plan, sd=sd, gd=gd, seed=ep["seed"], out=out, extra=extra)
 
 
-def _source_frame(ep, ev, values, yq, m1, z, below, interp="linear"):
+def _source_frame(ep, ev, values, yq, m1, z, below, interp="log"):
     """the node values of the segments ev of one epoch (_node_values) through the source frame into its result,
     every grid with the same interp (_to_source_frame)"""
     bank, geometry, gd, out, extra = ep["bank"], ep["geometry"], ep["gd"], ep["out"], ep["extra"]
@@ -1052,7 +1053,7 @@ def _prior_cells(m1, z, mdet_range, below):
 def pe_redshift_epochs(epochs, store, chunk=8, zmax=8.0, nz=1600, m1_range=(3.0, 150.0), nm1=1600, ymin=0.1267,
                        nodes_per_launch=6, block=256, mdet_range=(10.0, 500.0), resident=False, n_loud=1024,
                        n_random=1024, seed=0, single=False, glitch=None, shared_times=False, zmin=None, asym_tol=0.0,
-                       interp="linear"):
+                       interp="log"):
     """pe_redshift of several epochs, each with its own bank (its own noise curves), in one pass over the tables per
     chunk of their segments: the list of the dicts pe_redshift returns for each epoch alone, bit for bit.
 

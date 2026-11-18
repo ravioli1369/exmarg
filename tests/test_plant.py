@@ -267,7 +267,7 @@ def test_driver_with_stub(tmp_path, capsys):
 def test_analysis_wiring(monkeypatch):
     """make_analysis on the CPU: the bank is the 120 masses of plant.MASSES built on the segments, and pe_redshift is
     called with the store, chunk 128, the given seed and ymin, the grid of notebook 7, glitch True or None, and
-    interp 'linear' unless another is given"""
+    interp, always given: 'linear' (the drivers' default, not pe_redshift's own, 'log') unless another is asked"""
     import exmarg.search as search
     seen = []
     monkeypatch.setattr(search, 'pe_redshift', lambda seg, bank, store, **kw: seen.append((seg, bank, store, kw)))
@@ -1265,7 +1265,8 @@ def test_campaign_records_the_interpolation(tmp_path, monkeypatch):
     and between the templates, with tables 'unbiased') and no interp entry with --interp log, the campaign being
     otherwise the same; so does analyse.py; the windows stage of both records none and refuses --interp log; interp is
     a setting of the merger stage (MERGER_KEYS), so the campaign_key, which ties the two stages and the glitch model,
-    is the same for both.  main gives --interp to make_analysis.  A file written before 2026-11-18 has no interp
+    is the same for both.  main gives --interp to make_analysis, 'linear' when it is not given (INTERP_DEFAULT; the
+    default of pe_redshift is 'log', and the drivers do not rely on it).  A file written before 2026-11-18 has no interp
     entry and was read with ln Lambda linear: a run of today's default into its folder stops as another campaign
     (differs in interp), a run with --interp log is taken (its file records no entry either, and plant_fit.load reads
     the folder as one campaign), and a run with --interp log into the folder of a default run stops.  Fires on: a
@@ -1277,6 +1278,7 @@ def test_campaign_records_the_interpolation(tmp_path, monkeypatch):
     assert lin['interp'] == 'linear' and lin['tables'] == 'unbiased' and 'interp' not in log
     assert {key: v for key, v in lin.items() if key != 'interp'} == log
     assert 'interp' in plant.MERGER_KEYS and plant.campaign_key(lin) == plant.campaign_key(log)
+    assert plant.INTERP_DEFAULT == analyse.plant.INTERP_DEFAULT == 'linear'
     assert 'interp' not in plant.campaign_key(lin) and 'interp' not in config('--nbar', '0', '--stage', 'windows')
     assert config('--nbar', '0', '--as-built')['interp'] == 'linear'
     ana = lambda *extra: analyse.parse(['store', 'cpu', 'segs', '--out', 'x'] + list(extra))[1]

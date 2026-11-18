@@ -363,14 +363,14 @@ def variants(cfg, ep, names, sampler, own=False, gain=False):
 
 
 def make_analysis(store, device, resident=False, chunk=CHUNK, ymin=None, zmin=None, asym_tol=None,
-                  interp=plant.INTERP[0]):
+                  interp=plant.INTERP_DEFAULT):
     """factory(segments) builds the bank of plant.MASSES on the epoch's noise curves, with the signal gain the segments
     carry (segments['gain'], set by variants with gain; gains 1 without it), and returns pe(segments, seed, rows,
     glitch=True) -> the pe_redshift dict (glitch=True, or the dict of the window model) of those rows of the segments,
     on plant.GRID; store one store or a list (the mixture), zmin and asym_tol those of pe_redshift (each given only when
-    not None), interp that of pe_redshift.  pe.epoch(segments, seed, rows, glitch=True) is the same call as an epoch of
-    pe_redshift_epochs, and pe.batch(epochs) analyses such epochs (of any epoch's bank) in one pass over the tables:
-    [the dict of each]"""
+    not None), interp that of pe_redshift, always given (default plant.INTERP_DEFAULT, not pe_redshift's own).
+    pe.epoch(segments, seed, rows, glitch=True) is the same call as an epoch of pe_redshift_epochs, and
+    pe.batch(epochs) analyses such epochs (of any epoch's bank) in one pass over the tables: [the dict of each]"""
     from exmarg.search import mass_bank, pe_redshift, pe_redshift_epochs
     cut = {k: v for k, v in (('zmin', zmin), ('asym_tol', asym_tol)) if v is not None}
     settings = dict(chunk=chunk, resident=resident, ymin=ymin, mdet_range=plant.MDET, interp=interp, **cut,
@@ -711,7 +711,7 @@ def parser():
     p.add_argument('--unbias', action='store_true',
                    help='merger stage: the tables with the unbias correction, the default: changes nothing (kept so '
                         'that older command lines run; not with --as-built)')
-    p.add_argument('--interp', choices=plant.INTERP, default=plant.INTERP[0],
+    p.add_argument('--interp', choices=plant.INTERP, default=plant.INTERP_DEFAULT,
                    help='merger stage, between the nodes of the tables and between the templates: linear, Lambda '
                         'linear (default), or log, ln Lambda linear (the authors\' code, for comparisons: it lowers '
                         'the noise mean of B); the campaign records interp linear, and no entry with log')
@@ -737,7 +737,7 @@ def parse(argv=None):
     if a.chunk is None:
         a.chunk = plant.WINDOW_CHUNK if a.stage == 'windows' else CHUNK
     if a.stage == 'windows' and (a.glitch_model or a.zmin_cut or a.mmap or a.unbias or a.as_built
-                                 or a.interp != plant.INTERP[0]):
+                                 or a.interp != plant.INTERP_DEFAULT):
         p.error('--glitch-model, --zmin-cut, --mmap, --unbias, --as-built and --interp are of the merger stage')
     if a.unbias and a.as_built:
         p.error('--as-built reads the tables as built: not with --unbias')

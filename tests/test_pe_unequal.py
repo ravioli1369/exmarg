@@ -307,21 +307,18 @@ def pe_before(tmp_path_factory):
 
 @pytest.mark.parametrize("glitch", [None, "single", True, "windows"])
 def test_equal_curves_unchanged(pe_before, glitch):
-    """equal curves and one store of asym 0 (the published one): every output of pe_redshift (with interp 'log': the
-    committed pe.py takes ln Lambda linear between the nodes), pe_intrinsic and window_evidences is the array of the
-    committed pe.py bit for bit (same keys), with every arrival time and with the default selection; also when the
-    store is given as a list of one"""
+    """equal curves and one store of asym 0 (the published one): every output of pe_redshift, pe_intrinsic and
+    window_evidences is the array of the committed pe.py bit for bit (same keys), with every arrival time and with the
+    default selection; also when the store is given as a list of one"""
     c = make_case(0.0)
     st = inc_store(0.0)
     kw = dict(single=True) if glitch == "single" else dict(glitch=WINDOWS if glitch == "windows" else glitch)
     n = 0
     for name, extra in (("pe_redshift", REDSHIFT), ("pe_intrinsic", {})):
         for sel in (dict(n_loud=0), dict(seed=3, n_loud=256, n_random=256)):
-            log = dict(interp="log") if name == "pe_redshift" else {}
-            a = getattr(pe, name)(c["segs"], c["bank"], st, ymin=0.1, nodes_per_launch=1, **kw, **sel, **extra, **log)
+            a = getattr(pe, name)(c["segs"], c["bank"], st, ymin=0.1, nodes_per_launch=1, **kw, **sel, **extra)
             b = getattr(pe_before, name)(c["segs"], c["bank"], st, ymin=0.1, nodes_per_launch=1, **kw, **sel, **extra)
-            a1 = getattr(pe, name)(c["segs"], c["bank"], [st], ymin=0.1, nodes_per_launch=1, **kw, **sel, **extra,
-                                   **log)
+            a1 = getattr(pe, name)(c["segs"], c["bank"], [st], ymin=0.1, nodes_per_launch=1, **kw, **sel, **extra)
             assert set(a) == set(a1) and set(a) - {"wnet"} == set(b)      # wnet: added after BEFORE
             for k in a:
                 assert np.array_equal(np.asarray(a1[k]), np.asarray(a[k])), (name, k)

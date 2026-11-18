@@ -1492,8 +1492,9 @@ def test_interp_recorded_and_passed(week, tmp_path, monkeypatch):
     nodes), the meta being otherwise the same; --as-built records tables 'as built'.  A run with the default into a
     folder of files without the entry stops as another campaign (differs in interp), as does a run with --interp log
     into the folder of a default run; a run with --interp log into the first writes the rest of one campaign, which
-    plant_fit.load reads.  make_analysis gives interp to pe_redshift and to pe_redshift_epochs ('linear' when none is
-    given), and main gives --interp to make_analysis.  Fires on: a missing entry taken as 'linear'"""
+    plant_fit.load reads.  make_analysis gives interp to pe_redshift and to pe_redshift_epochs, always ('linear' when
+    none is asked: the drivers' default, not that of pe_redshift, 'log'), and main gives --interp to make_analysis.
+    Fires on: a missing entry taken as 'linear', and on a driver leaving interp to the default of the library"""
     import exmarg.search as search
     from test_store import write_store
     lin, log = tmp_path / 'lin', tmp_path / 'log'
