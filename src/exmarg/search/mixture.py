@@ -439,10 +439,14 @@ def fit_noise(E, pi_m=None, log=False, n_iter=500, tol=1e-9, floor=1e-10):
 class _Windows:
     """sum_i ln c_i of Sec. 4a on fixed window evidences and its derivatives, in x = (f, Om[0], .., Om[K-1]) with
     Om[s] = (1 - q_s, q_s a^s): the factor of a window in state s is D = Om[s] . (1, F), F_b = basis[b] . E_w, kept
-    as Om[s] . Y, Y = (1, F) e^-h, h = max(0, ln F) of the row.  Segments in chunks, on threads"""
+    as Om[s] . Y, Y = (1, F) e^-h, h = max(0, ln F) of the row.  Segments in chunks, on threads.  With weights
+    (n_segment,) the sum is sum_i w_i ln c_i: every sum over the segments below carries w_i (None: every weight 1, the
+    sums as they were)"""
 
-    def __init__(self, ln_E, basis, identity, chunk):
+    def __init__(self, ln_E, basis, identity, chunk, weights=None):
         self.n, self.nw, nk = ln_E.shape
+        self.w = None if weights is None else np.asarray(weights, float)
+        self.wsum = float(self.n) if self.w is None else float(self.w.sum())
         self.nb = basis.shape[0]
         if identity:
             lnF = ln_E.reshape(-1, nk)
@@ -476,12 +480,17 @@ class _Windows:
         ln_c = logsumexp(lnC + _log(f), axis=1)
         Q = np.exp(np.minimum(lnC - ln_c[:, None], 345.0))                  # C_s / c = d ln c_i / d f_s
         r = Q * f
-        rw = np.repeat(r, nw, axis=0)
+        if self.w is None:                                                  # Qw, rs: Q and r times the weight of the segment
+            Qw, rs, lnl = Q, r, math.fsum(ln_c)
+        else:
+            wi = self.w[a:b]
+            Qw, rs, lnl = Q * wi[:, None], r * wi[:, None], math.fsum(wi * ln_c)
+        rw = np.repeat(rs, nw, axis=0)
         with np.errstate(all='ignore'):
             G = Y.T @ (rw / D)                                              # sum r_s Y / D_s, (P, K)
         if i.size:
             np.add.at(G.T, k, rw[i, k][:, None] * rho)
-        out = dict(lnl=math.fsum(ln_c), Q=Q.sum(axis=0), R=r.sum(axis=0), G=G)
+        out = dict(lnl=lnl, Q=Qw.sum(axis=0), R=rs.sum(axis=0), G=G)
         if hess:
             Gi, M = np.empty((b - a, P, K)), np.empty((K, P, P))           # sum_w Y / D_s; sum r_s Y Y^T / D_s^2
             for t in range(K):
@@ -493,9 +502,9 @@ class _Windows:
                 with np.errstate(all='ignore'):
                     M[t] = W.T @ W
             with np.errstate(all='ignore'):
-                out.update(M=M, QQ=Q.T @ Q, QG=np.einsum('is,ips->sp', Q, Gi),
-                           QrG=np.einsum('is,it,ipt->stp', Q, r, Gi), GG=np.einsum('is,ips,iqs->spq', r, Gi, Gi),
-                           rrGG=np.einsum('is,it,ips,iqt->sptq', r, r, Gi, Gi))
+                out.update(M=M, QQ=Qw.T @ Q, QG=np.einsum('is,ips->sp', Qw, Gi),
+                           QrG=np.einsum('is,it,ipt->stp', Qw, r, Gi), GG=np.einsum('is,ips,iqs->spq', rs, Gi, Gi),
+                           rrGG=np.einsum('is,it,ips,iqt->sptq', rs, r, Gi, Gi))
         return out
 
     def __call__(self, x, K, hess=False):
@@ -507,9 +516,9 @@ class _Windows:
         return out
 
     def gradient(self, ev):
-        """d ln L / dx, and mu (n for f, n_w R_s for Om[s]): EM is x -> x g / mu"""
+        """d ln L / dx, and mu (n, or the sum of the weights, for f; n_w R_s for Om[s]): EM is x -> x g / mu"""
         K = ev['R'].size
-        mu = np.concatenate([np.full(K, float(self.n)), np.repeat(self.nw * ev['R'], self.nb + 1)])
+        mu = np.concatenate([np.full(K, self.wsum), np.repeat(self.nw * ev['R'], self.nb + 1)])
         return np.concatenate([ev['Q'], ev['G'].T.ravel()]), mu
 
     def hessian(self, ev):
@@ -815,7 +824,7 @@ def _windows_result(model, x, ev, K, B, blocks, trace, n_iter, converged):
 
 
 def fit_windows(ln_E, n_state=2, basis=None, start=None, tol=1e-9, max_iter=500, chunk=1024, ln_M=None, nbar=0.0,
-                zone=1):
+                zone=1, weights=None):
     """the glitch model of one detector, Sec. 4a, from its window evidences: the maximum of
 
         sum_i ln c_i,   c_i = sum_s f_s prod_w (1 - q_s + q_s pi^s . E_iw),   pi^s = a^s @ basis
@@ -840,6 +849,14 @@ def fit_windows(ln_E, n_state=2, basis=None, start=None, tol=1e-9, max_iter=500,
     nbar     the probability of a merger in a segment, in [0, 1], held fixed (stage 2 gives it); 0 or ln_M None: the
              model without mergers, every number that of the fit without these arguments
     zone     the zone of a window (with mergers only; that of pe_redshift's window model)
+    weights  None, or (n_segment,) w_i >= 0, not all zero: the maximum is that of sum_i w_i ln c_i (the model without
+             mergers).  With w_i = 1 - p_i, p_i the probability that segment i holds a merger (stage 2: p = nbar B /
+             (1 + nbar (B - 1))), the score sum_i (1 - p_i) d ln c_i / d theta has the mean (1 - nbar) E_0[d ln c /
+             d theta] = 0 at the true model, E_0 over the segments without a merger, of which c is the density over
+             Gaussian noise: the model is fitted on the part of the data that holds no merger, and what a merger puts
+             in its segment (its own window and the windows where other templates respond to it) stays out of it.
+             Not together with ln_M and nbar > 0.  The errors are those of the curvature of the weighted sum (a
+             segment of weight w counts as w segments)
 
     In x = (f, Om[0], .., Om[K-1]), Om[s] = (1 - q_s, q_s a^s), every block on a simplex, c_i is linear in each
     Om[s].  EM over the state of the segment, glitch or not in each window and the basis component of the glitch
@@ -868,7 +885,14 @@ def fit_windows(ln_E, n_state=2, basis=None, start=None, tol=1e-9, max_iter=500,
         raise ValueError('the rows of basis must be normalized laws over the %d columns' % nk)
     if not 0.0 <= nbar <= 1.0:
         raise ValueError('nbar must lie in [0, 1], not %r' % (nbar,))
-    model = _Windows(lnE, B, basis is None, chunk)
+    if weights is not None:
+        weights = np.asarray(weights, float)
+        if weights.shape != (lnE.shape[0],) or not np.all(np.isfinite(weights)) or np.any(weights < 0) \
+                or not weights.sum() > 0:
+            raise ValueError('weights must be (n_segment,) = (%d,) finite numbers >= 0, not all zero' % lnE.shape[0])
+        if ln_M is not None and nbar != 0:
+            raise ValueError('weights are of the model without mergers: not together with ln_M and nbar > 0')
+    model = _Windows(lnE, B, basis is None, chunk, weights)
     merger = None if ln_M is None or nbar == 0 else _WindowsMerger(model, ln_M, nbar, zone)
     K, nb = n_state, B.shape[0]
     P = nb + 1

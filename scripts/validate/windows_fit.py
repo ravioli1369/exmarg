@@ -7,6 +7,8 @@ when a fit of the model written does not converge (the fits with other numbers o
                                            [--veto-w 72] [--zone 1]
     python scripts/validate/windows_fit.py runs/week_w/slide+0.5        # a variant of the week: the whole selection
     python scripts/validate/windows_fit.py runs/states --nbar 0.0184 --model runs/states_pass2/glitch_model.json
+    python scripts/validate/windows_fit.py runs/states --weights runs/states --weights-nbar 0.0184 \
+                                           --model runs/states_pass2/glitch_model.json
 
 The files.  Every win_<first>_<end>.npz of the folder, of one campaign (the meta of every file the same, stage
 'windows'), each holding the segments first .. end - 1, together a contiguous range of k once each; for a variant of the
@@ -35,6 +37,15 @@ zone --zone; refused for a control of the data (a time slide, time reversal, pha
 not none, zero or inj).  The report adds the law, f and n_window q of the fit without mergers next to those with them,
 and the model records nbar and the merger_population of the files (a model at N = 0 has neither entry, and is the file
 written before these options, byte for byte).  --model: where to write the model (default <folder>/glitch_model.json).
+
+--weights FOLDER --weights-nbar N: the fit without mergers with every segment weighted by its probability of holding no
+merger, w_i = 1 - p_i, p_i = N B_i / (1 + N (B_i - 1)) with B_i = exp(ln_B_bar) of the merger-stage files plant_*.npz of
+FOLDER (stage 2 of the pass before, of the same campaign_key, covering every fitted segment) and N its estimate
+(mixture.fit_windows weights: the score of the weighted sum has zero mean at the true model, so the glitch model is that
+of the part of the data without a merger; a loud merger leaves the fit with everything it puts in its segment).  Not with
+--nbar > 0 (the two accounts of the mergers do not combine).  The model records weights {nbar, stage2_model_sha256 (the
+glitch model of those files, null without one), sum, below_half}; it has no nbar entry: for the merger stage it is a model
+without mergers, and its own SHA-256 tells the passes apart.
 
 Run as a script the fit uses one BLAS thread whatever the environment says (set before numpy is loaded), so that the
 model and its sha256 do not depend on the number of cores of the machine.
@@ -223,20 +234,66 @@ def describe(cfg):
     return text
 
 
+def no_merger_weights(folder, ks, nbar, cfg):
+    """(w (n,), info): w_i = 1 - p_i of the segments ks, p_i = nbar B_i / (1 + nbar (B_i - 1)) from ln_B_bar of the
+    merger-stage files of folder; SystemExit when the files are of another campaign_key than cfg, or miss a segment"""
+    paths = sorted(glob.glob(os.path.join(folder, 'plant_*.npz')))
+    if not paths:
+        raise SystemExit('%s: no merger-stage files (plant_*.npz) for the weights' % folder)
+    k, lnB, sha = [], [], set()
+    mine = plant.campaign_key(cfg)
+    for path in paths:
+        with np.load(path) as f:
+            meta = json.loads(str(f['meta']))
+            meta.pop('run', None)
+            if plant.campaign_key(meta) != mine:
+                raise SystemExit('%s: the weights are of another campaign' % path)
+            if 'ln_B_bar' not in f.files:
+                raise SystemExit('%s holds no ln_B_bar (not the merger stage with a window model)' % path)
+            sha.add(meta.get('glitch_model_sha256'))
+            k.append(np.asarray(f['k']))
+            lnB.append(np.asarray(f['ln_B_bar'], float))
+    k, lnB = np.concatenate(k), np.concatenate(lnB)
+    if len(sha) != 1:
+        raise SystemExit('%s: merger-stage files of %d glitch models' % (folder, len(sha)))
+    pos = {int(v): i for i, v in enumerate(k)}
+    if len(pos) != k.size:
+        raise SystemExit('%s: segments in more than one merger-stage file' % folder)
+    miss = [int(v) for v in ks if int(v) not in pos]
+    if miss:
+        raise SystemExit('%s: no merger-stage result for %d of the %d fitted segments (first k %d)'
+                         % (folder, len(miss), len(ks), miss[0]))
+    lb = lnB[[pos[int(v)] for v in ks]]
+    if np.isnan(lb).any():
+        raise SystemExit('%s: ln_B_bar is nan in %d fitted segments' % (folder, np.isnan(lb).sum()))
+    if nbar > 0:
+        with np.errstate(over='ignore', divide='ignore', invalid='ignore'):
+            inv = 1.0 / np.expm1(lb)                                   # 1 / (B - 1): infinite at B = 1 (p = nbar), 0 at B infinite (p = 1)
+            w = np.where(np.isinf(inv), 1.0 - nbar, 1.0 - nbar * (1.0 + inv) / (nbar + inv))
+        w = np.clip(np.where(lb == np.inf, 0.0, w), 0.0, 1.0)
+    else:
+        w = np.ones(lb.size)
+    return w, dict(nbar=float(nbar), stage2_model_sha256=sha.pop(), sum=float(w.sum()), below_half=int((w < 0.5).sum()))
+
+
 def fit(folder, n_state=N_STATE, basis='bins', rho_min=RHO[0], rho_max=RHO[1], veto_w=VETO_W, zone=ZONE,
-        record=RECORD, nbar=0.0, w_net=W_NET):
+        record=RECORD, nbar=0.0, w_net=W_NET, weights=None, weights_nbar=None):
     """the fits and the model of the folder: dict lines (the report), model (the content of glitch_model.json without
     its sha256), ok (the fits of the model written converged), fits {I: {K: fit_windows result}}, keep (n,), cols, data.
     nbar > 0: every fit with the mergers of the population at that rate (fit_windows with the merger evidence of the
     files, docs/2026-11-15_mergers_in_stage1.md), refused (SystemExit) for a control of the data (a time slide, time
     reversal, phase randomization: their model is the one without mergers, Sec. 3) and for files without the merger
-    evidence; the model then records nbar and the merger_population of the files"""
+    evidence; the model then records nbar and the merger_population of the files.  weights (a merger-stage folder)
+    and weights_nbar: the fit without mergers with the weights no_merger_weights of the kept segments (not with
+    nbar > 0); the model then records weights"""
     if basis not in ('bins', 'power'):
         raise ValueError("basis must be 'bins' or 'power'")
     if n_state < 1 or zone < 0:
         raise ValueError('need n_state >= 1 and zone >= 0')
     if not 0.0 <= nbar <= 1.0:
         raise ValueError('need 0 <= nbar <= 1')
+    if weights is not None and (nbar > 0 or weights_nbar is None or not 0.0 <= weights_nbar <= 1.0):
+        raise ValueError('weights need 0 <= weights_nbar <= 1 and nbar = 0')
     cfg, d, shared, paths = load(folder)
     if nbar > 0 and cfg.get('control') not in WITH_MERGERS:
         raise SystemExit('%s: the data are a control (%s): no merger has a partner in the other detector, the glitch '
@@ -266,9 +323,14 @@ def fit(folder, n_state=N_STATE, basis='bins', rho_min=RHO[0], rho_max=RHO[1], v
     loud, keep = {I: v['loud_' + I] for I in 'HL'}, v['keep']
     Ks = sorted(set(record) | {n_state})
     R = {}
+    wt = winfo = None
+    if weights is not None:
+        wt, winfo = no_merger_weights(weights, d['k'][keep], weights_nbar, cfg)
     for I in 'HL':
         E = evidences(paths, I, keep, cols)
-        if nbar > 0:
+        if wt is not None:
+            R[I] = {K: mixture.fit_windows(E, n_state=K, basis=B, weights=wt) for K in Ks}
+        elif nbar > 0:
             lnM = merger_evidences(paths, I, keep)
             R[I] = {K: mixture.fit_windows(E, n_state=K, basis=B, ln_M=lnM, nbar=nbar, zone=zone) for K in Ks}
         else:
@@ -294,6 +356,10 @@ def fit(folder, n_state=N_STATE, basis='bins', rho_min=RHO[0], rho_max=RHO[1], v
                  'files, population z >= %g, M_det %g to %g, ladder of %d nodes s %.4g to %.4g, ymin %.6g; zone %d'
                  % (nbar, mp['zmin'], mp['mdet_range'][0], mp['mdet_range'][1], len(mp['s']), mp['s'][0], mp['s'][-1],
                     mp['ymin'], zone))
+    if wt is not None:
+        L.append('weights 1 - p of the merger stage of %s at nbar %.6g (glitch model %s): sum %.2f over the %d fitted '
+                 'segments, %d below one half' % (weights, weights_nbar, (winfo['stage2_model_sha256'] or 'none')[:12],
+                                                  winfo['sum'], keep.sum(), winfo['below_half']))
     det, record = {}, {}
     for I in 'HL':
         L.append('\n%s: fits with %s states' % (I, ', '.join(map(str, Ks))))
@@ -371,6 +437,8 @@ def fit(folder, n_state=N_STATE, basis='bins', rho_min=RHO[0], rho_max=RHO[1], v
         model['segments']['set_aside_net'] = int(v['net'].sum())
     if nbar > 0:
         model.update(nbar=float(nbar), merger_population=cfg['merger_population'])
+    if wt is not None:
+        model['weights'] = winfo
     model = json.loads(json.dumps(model))
     slow = ['%s with %d states' % (I, K) for I in 'HL' for K in Ks if not R[I][K]['converged']]
     if not ok:
@@ -413,13 +481,20 @@ def main(argv=None):
     p.add_argument('--nbar', type=float, default=0.0,
                    help='the merger rate of stage 2 at which the glitch model is fitted with the mergers of the '
                         'population (default 0: without; not for the controls of the data)')
+    p.add_argument('--weights', default=None, metavar='FOLDER',
+                   help='fit without mergers, every segment weighted by its probability of holding no merger, from the '
+                        'merger-stage files of this folder at --weights-nbar')
+    p.add_argument('--weights-nbar', type=float, default=None, help='the merger rate of the weights')
     p.add_argument('--model', default=None, metavar='JSON',
                    help='where to write the model (default <folder>/%s)' % MODEL)
     a = p.parse_args(argv)
     if not (0 <= a.rho_min < a.rho_max) or a.n_state < 1 or a.zone < 0 or not 0 <= a.nbar <= 1:
         p.error('need 0 <= rho-min < rho-max, n-state >= 1, zone >= 0, 0 <= nbar <= 1')
+    if (a.weights is None) != (a.weights_nbar is None) or (a.weights is not None and (
+            a.nbar > 0 or not 0 <= a.weights_nbar <= 1)):
+        p.error('--weights and --weights-nbar (in [0, 1]) go together, and not with --nbar > 0')
     r = fit(a.folder, a.n_state, a.basis, a.rho_min, a.rho_max, a.veto_w, a.zone,
-            tuple(int(x) for x in a.record.split(',') if x), a.nbar, a.w_net)
+            tuple(int(x) for x in a.record.split(',') if x), a.nbar, a.w_net, a.weights, a.weights_nbar)
     print('\n'.join(r['lines']), flush=True)
     if not r['ok']:
         return 1
