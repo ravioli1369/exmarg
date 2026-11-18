@@ -266,7 +266,8 @@ def test_driver_with_stub(tmp_path, capsys):
 
 def test_analysis_wiring(monkeypatch):
     """make_analysis on the CPU: the bank is the 120 masses of plant.MASSES built on the segments, and pe_redshift is
-    called with the store, chunk 128, the given seed and ymin, the grid of notebook 7, glitch True or None"""
+    called with the store, chunk 128, the given seed and ymin, the grid of notebook 7, glitch True or None, and
+    interp 'linear' unless another is given"""
     import exmarg.search as search
     seen = []
     monkeypatch.setattr(search, 'pe_redshift', lambda seg, bank, store, **kw: seen.append((seg, bank, store, kw)))
@@ -278,8 +279,10 @@ def test_analysis_wiring(monkeypatch):
     assert s is seg and store == 'the store' and bank is bank2 and bank.device == 'cpu'
     assert np.array_equal(bank.M, plant.MASSES) and np.all(bank.q == 1) and np.all(bank.chi == 0)
     assert kw == dict(chunk=128, resident=False, seed=17, ymin=0.0982, mdet_range=(20.0, 400.0), glitch=True, shared_times=False,
-                      m1_range=(4.0, 200.0), nm1=150, zmax=10.0, nz=150), kw
+                      m1_range=(4.0, 200.0), nm1=150, zmax=10.0, nz=150, interp='linear'), kw
     assert kw2 == dict(kw, glitch=None)
+    plant.make_analysis('the store', 'cpu', ymin=0.0982, interp='log')(seg)(seg, 17, True)
+    assert seen[-1][3] == dict(kw, interp='log')
 
 
 def test_reduce_coverage():
@@ -1158,37 +1161,44 @@ def test_tables_cuts_are_recorded_and_enforced(tmp_path):
 
 
 def test_campaign_records_the_kind_of_tables(tmp_path, monkeypatch):
-    """the merger stage of plant.py records tables 'as built' by default and with --published-tables (the default since
-    2026-11-17; refused with --unbias), 'unbiased' with --unbias; so does analyse.py (its default, --unbias); the
-    windows stage of both records no tables and refuses --unbias.  load_stores asks load_redshift_store for the kind
-    explicitly (unbiased False or True, never None, so that a cache of the other kind is refused).  A run of one kind
-    into the folder of the other stops as another campaign (differs in tables); so does a run of either kind into a
-    folder of files written before the entry (none: read with unbias; 'published': as built), which plant_fit.load still
-    reads.  Fires on: store_settings without the tables entry (the files of the two kinds are then one campaign)"""
+    """the merger stage of plant.py records tables 'unbiased' by default and with --unbias (the default named), 'as
+    built' with --as-built and with its older name --published-tables (both refused with --unbias); so does analyse.py
+    (its default, --unbias, --as-built); the windows stage of both records no tables and refuses --unbias and
+    --as-built.  load_stores asks load_redshift_store for the kind explicitly (unbiased True or False, never None, so
+    that a cache of the other kind is refused).  A run of one kind into the folder of the other stops as another
+    campaign (differs in tables); so does a run of either kind, with Lambda or ln Lambda linear between the nodes,
+    into a folder of files written before the entry (none: read with unbias; 'published': as built), which
+    plant_fit.load still reads.  Fires on: store_settings without the tables entry (the files of the two kinds are then
+    one campaign)"""
     from types import SimpleNamespace
     import exmarg.search as search
     from test_analyse import analyse
     from test_store import write_store
-    assert config('--nbar', '0')['tables'] == 'as built'
-    assert config('--nbar', '0', '--published-tables')['tables'] == 'as built'
+    assert config('--nbar', '0')['tables'] == 'unbiased'
     assert config('--nbar', '0', '--unbias')['tables'] == 'unbiased'
+    assert config('--nbar', '0', '--as-built')['tables'] == 'as built'
+    assert config('--nbar', '0', '--published-tables')['tables'] == 'as built'
     assert 'tables' not in config('--nbar', '0', '--stage', 'windows') and 'tables' in plant.MERGER_KEYS
-    for extra in (['--unbias', '--published-tables'], ['--unbias', '--stage', 'windows']):
+    for extra in (['--unbias', '--published-tables'], ['--unbias', '--as-built'], ['--unbias', '--stage', 'windows'],
+                  ['--as-built', '--stage', 'windows'], ['--published-tables', '--stage', 'windows']):
         with pytest.raises(SystemExit):
             plant.main(['store', 'cpu', '--nbar', '0', '--n', '1', '--out', str(tmp_path / 'x')] + extra)
     ana = lambda *extra: analyse.parse(['store', 'cpu', 'segs', '--out', 'x'] + list(extra))[1]
-    assert analyse.plant.store_settings(ana())['tables'] == 'as built'
+    assert analyse.plant.store_settings(ana())['tables'] == 'unbiased'
     assert analyse.plant.store_settings(ana('--unbias'))['tables'] == 'unbiased'
+    assert analyse.plant.store_settings(ana('--as-built'))['tables'] == 'as built'
     assert analyse.plant.store_settings(ana('--stage', 'windows')) == {}
-    with pytest.raises(SystemExit):
-        ana('--unbias', '--stage', 'windows')
+    for extra in (['--unbias', '--stage', 'windows'], ['--as-built', '--stage', 'windows'], ['--unbias', '--as-built']):
+        with pytest.raises(SystemExit):
+            ana(*extra)
     asked = []
 
     def load(d, **kw):
         asked.append(kw['unbiased'])
         return SimpleNamespace(s=np.ones(1), asym=0.0, unbiased=kw['unbiased'])
     monkeypatch.setattr(search, 'load_redshift_store', load)
-    for extra, kind in (([], False), (['--unbias'], True), (['--mmap'], False), (['--mmap', '--unbias'], True)):
+    for extra, kind in (([], True), (['--unbias'], True), (['--as-built'], False), (['--published-tables'], False),
+                        (['--mmap'], True), (['--mmap', '--as-built'], False)):
         args = plant.parser().parse_args(['a,b', 'cpu', '--nbar', '0', '--n', '1', '--out', 'x'] + extra)
         assert [s.unbiased for s in plant.load_stores(args)] == [kind, kind] and asked[-2:] == [kind, kind]
     assert all(type(x) is bool for x in asked)
@@ -1199,28 +1209,29 @@ def test_campaign_records_the_kind_of_tables(tmp_path, monkeypatch):
     assert plant.main([store] + rest + ['--out', str(out)], factory=Stub().factory) == 0
     path = out / ('plant_%010d_%010d.npz' % (0, 3))
     meta = plant.read_meta(path)
-    assert meta['tables'] == 'as built'
+    assert meta['tables'] == 'unbiased'
     with pytest.raises(SystemExit, match='another campaign.*tables'):
-        plant.main([store] + rest + ['--out', str(out), '--start', '3', '--unbias'], factory=Stub().factory)
+        plant.main([store] + rest + ['--out', str(out), '--start', '3', '--as-built'], factory=Stub().factory)
     with np.load(path) as f:
         arrays = {key: f[key] for key in f.files if key != 'meta'}
     for tag, entry in (('old', None), ('published', 'published')):
         folder = tmp_path / tag
         folder.mkdir()
-        cfg = {key: v for key, v in meta.items() if key not in ('run', 'tables')}
+        cfg = {key: v for key, v in meta.items() if key not in ('run', 'tables', 'interp')}
         plant.write_batch(str(folder / path.name), cfg if entry is None else dict(cfg, tables=entry), meta['run'],
                           arrays)
         assert plant_fit.load(str(folder))[0].get('tables') == entry
-        for extra in ([], ['--unbias']):
+        for extra in ([], ['--as-built'], ['--interp', 'log'], ['--interp', 'log', '--as-built']):
             with pytest.raises(SystemExit, match='another campaign.*tables'):
                 plant.main([store] + rest + ['--out', str(folder), '--start', '3'] + extra, factory=Stub().factory)
 
 
 def test_drivers_refuse_a_cache_of_the_other_kind(tmp_path, capsys):
     """plant.py and analyse.py stop before any work (exit status 2, the reason on stderr, no output folder) on a cache
-    of the other kind than the run reads: --unbias with a cache as built, the default with an unbiased cache (alone, or
-    after a cache as built in a list of stores, with --mmap), and on --mmap --unbias of a store folder, whose tables
-    would have to be corrected in memory.  Fires on: plant.store_problem not comparing the kinds"""
+    of the other kind than the run reads: the default (and --unbias) with a cache as built (alone, or after an
+    unbiased cache in a list of stores, with --mmap), --as-built with an unbiased cache (alone, or after a cache as
+    built in a list, with --mmap), and on --mmap of a store folder without --as-built, whose tables would have to be
+    corrected in memory.  Fires on: plant.store_problem not comparing the kinds"""
     from exmarg.search.store import write_cache
     from test_analyse import analyse
     from test_store import write_store
@@ -1230,18 +1241,83 @@ def test_drivers_refuse_a_cache_of_the_other_kind(tmp_path, capsys):
     out = str(tmp_path / 'out')
     rest = ['cpu', '--nbar', '0.3', '--n', '1', '--out', out]
     for main, argv, reason in (
+            (plant.main, [built] + rest, 'cache of the tables as built'),
             (plant.main, [built] + rest + ['--unbias'], 'cache of the tables as built'),
-            (plant.main, [unb] + rest, 'cache of the tables unbiased'),
-            (plant.main, ['%s,%s' % (built, unb)] + rest + ['--mmap'], '%s is a cache of the tables unbiased' % unb),
+            (plant.main, ['%s,%s' % (unb, built)] + rest + ['--mmap'], '%s is a cache of the tables as built' % built),
+            (plant.main, [unb] + rest + ['--as-built'], 'cache of the tables unbiased'),
+            (plant.main, ['%s,%s' % (built, unb)] + rest + ['--mmap', '--as-built'],
+             '%s is a cache of the tables unbiased' % unb),
+            (plant.main, [src] + rest + ['--mmap'], 'is a store folder'),
             (plant.main, [src] + rest + ['--mmap', '--unbias'], 'is a store folder'),
-            (analyse.main, [built, 'cpu', 'segments', '--out', out, '--unbias'], 'cache of the tables as built'),
-            (analyse.main, [unb, 'cpu', 'segments', '--out', out, '--mmap'], 'cache of the tables unbiased')):
+            (analyse.main, [built, 'cpu', 'segments', '--out', out], 'cache of the tables as built'),
+            (analyse.main, [unb, 'cpu', 'segments', '--out', out, '--mmap', '--as-built'],
+             'cache of the tables unbiased')):
         with pytest.raises(SystemExit) as stop:
             main(argv)
         assert stop.value.code == 2 and reason in capsys.readouterr().err, argv
     assert not os.path.exists(out)
     assert plant.store_problem(built, False, True) is None and plant.store_problem(unb, True, True) is None
     assert plant.store_problem(src, False, True) is None and plant.store_problem(src, True) is None
+
+
+def test_campaign_records_the_interpolation(tmp_path, monkeypatch):
+    """the merger stage of plant.py records interp 'linear' by default (Lambda linear between the nodes of the tables
+    and between the templates, with tables 'unbiased') and no interp entry with --interp log, the campaign being
+    otherwise the same; so does analyse.py; the windows stage of both records none and refuses --interp log; interp is
+    a setting of the merger stage (MERGER_KEYS), so the campaign_key, which ties the two stages and the glitch model,
+    is the same for both.  main gives --interp to make_analysis.  A file written before 2026-11-18 has no interp
+    entry and was read with ln Lambda linear: a run of today's default into its folder stops as another campaign
+    (differs in interp), a run with --interp log is taken (its file records no entry either, and plant_fit.load reads
+    the folder as one campaign), and a run with --interp log into the folder of a default run stops.  Fires on: a
+    missing entry taken as 'linear' (Lambda linear would be written among files of ln Lambda linear), and --interp log
+    recording an entry (it would leave the campaign of the files before)"""
+    from test_analyse import analyse
+    from test_store import write_store
+    lin, log = config('--nbar', '0'), config('--nbar', '0', '--interp', 'log')
+    assert lin['interp'] == 'linear' and lin['tables'] == 'unbiased' and 'interp' not in log
+    assert {key: v for key, v in lin.items() if key != 'interp'} == log
+    assert 'interp' in plant.MERGER_KEYS and plant.campaign_key(lin) == plant.campaign_key(log)
+    assert 'interp' not in plant.campaign_key(lin) and 'interp' not in config('--nbar', '0', '--stage', 'windows')
+    assert config('--nbar', '0', '--as-built')['interp'] == 'linear'
+    ana = lambda *extra: analyse.parse(['store', 'cpu', 'segs', '--out', 'x'] + list(extra))[1]
+    assert analyse.plant.store_settings(ana()) == dict(tables='unbiased', interp='linear')
+    assert analyse.plant.store_settings(ana('--interp', 'log')) == dict(tables='unbiased')
+    assert analyse.plant.store_settings(ana('--interp', 'log', '--as-built')) == dict(tables='as built')
+    for argv in (['--interp', 'log', '--stage', 'windows'], ['--interp', 'cubic']):
+        with pytest.raises(SystemExit):
+            ana(*argv)
+        with pytest.raises(SystemExit):
+            plant.main(['store', 'cpu', '--nbar', '0', '--n', '1', '--out', str(tmp_path / 'x')] + argv)
+    store = write_store(str(tmp_path / 'a'))
+    rest = ['cpu', '--nbar', '0.3', '--seed', '5', '--n', '3', '--batch', '3']
+    given = []
+    monkeypatch.setattr(plant, 'load_stores', lambda a: 'the stores')
+    monkeypatch.setattr(plant, 'make_analysis', lambda *a: given.append(a) or Stub().factory)
+    for extra, interp in (([], 'linear'), (['--interp', 'log'], 'log')):
+        assert plant.main([store] + rest + ['--out', str(tmp_path / ('wired_' + interp))] + extra) == 0
+        assert given[-1][0] == 'the stores' and given[-1][-1] == interp and len(given[-1]) == 9
+    monkeypatch.undo()
+    out = tmp_path / 'm'
+    assert plant.main([store] + rest + ['--out', str(out)], factory=Stub().factory) == 0
+    path = out / ('plant_%010d_%010d.npz' % (0, 3))
+    meta = plant.read_meta(path)
+    assert meta['interp'] == 'linear' and meta['tables'] == 'unbiased'
+    with pytest.raises(SystemExit, match='another campaign.*interp'):
+        plant.main([store] + rest + ['--out', str(out), '--start', '3', '--interp', 'log'], factory=Stub().factory)
+    with np.load(path) as f:
+        arrays = {key: f[key] for key in f.files if key != 'meta'}
+    old = tmp_path / 'old'
+    old.mkdir()
+    plant.write_batch(str(old / path.name), {key: v for key, v in meta.items() if key not in ('run', 'interp')},
+                      meta['run'], arrays)
+    for extra in ([], ['--interp', 'linear']):
+        with pytest.raises(SystemExit, match='another campaign .differs in interp.'):
+            plant.main([store] + rest + ['--out', str(old), '--start', '3'] + extra, factory=Stub().factory)
+    assert plant.main([store] + rest + ['--out', str(old), '--start', '3', '--interp', 'log'],
+                      factory=Stub().factory) == 0
+    assert 'interp' not in plant.read_meta(old / ('plant_%010d_%010d.npz' % (3, 6)))
+    cfg, _, a, _, _ = plant_fit.load(str(old))
+    assert 'interp' not in cfg and cfg['tables'] == 'unbiased' and np.array_equal(a['k'], np.arange(6))
 
 
 def test_window_model_with_a_store_that_records_its_cuts(tmp_path):

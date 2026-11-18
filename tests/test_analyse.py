@@ -1484,3 +1484,50 @@ def test_analysis_wiring_stores_and_zmin(week, monkeypatch):
     assert st1 == ['a', 'b'] and kw1['zmin'] == 0.5 and kw1['asym_tol'] == 0.05 and st2 == 'a'
     assert 'zmin' not in kw2 and 'asym_tol' not in kw2
     assert {k: v for k, v in kw1.items() if k not in ('zmin', 'asym_tol')} == kw2
+
+
+def test_interp_recorded_and_passed(week, tmp_path, monkeypatch):
+    """analyse.py: the files of the merger stage record tables 'unbiased' and interp 'linear' by default and, with
+    --interp log, no interp entry (as the files written before 2026-11-18, read with ln Lambda linear between the
+    nodes), the meta being otherwise the same; --as-built records tables 'as built'.  A run with the default into a
+    folder of files without the entry stops as another campaign (differs in interp), as does a run with --interp log
+    into the folder of a default run; a run with --interp log into the first writes the rest of one campaign, which
+    plant_fit.load reads.  make_analysis gives interp to pe_redshift and to pe_redshift_epochs ('linear' when none is
+    given), and main gives --interp to make_analysis.  Fires on: a missing entry taken as 'linear'"""
+    import exmarg.search as search
+    from test_store import write_store
+    lin, log = tmp_path / 'lin', tmp_path / 'log'
+    args = ('--epochs-per-file', '1', '--variants', 'pr,inj')
+    drive(week, lin, *args, '--part', '0/2')
+    drive(week, log, *args, '--part', '0/2', '--interp', 'log')
+    for v in ('pr', 'inj'):
+        a, b = (plant.read_meta(sorted(glob.glob(str(d / v / 'plant_*.npz')))[0]) for d in (lin, log))
+        assert a['tables'] == 'unbiased' and a.pop('interp') == 'linear' and 'interp' not in b
+        a.pop('run'), b.pop('run')
+        assert a == b
+    with pytest.raises(SystemExit, match='another campaign .differs in interp.'):
+        drive(week, log, *args, '--part', '1/2')
+    with pytest.raises(SystemExit, match='another campaign .differs in interp.'):
+        drive(week, lin, *args, '--part', '1/2', '--interp', 'log')
+    drive(week, log, *args, '--part', '1/2', '--interp', 'log')
+    cfg, _, arrays, _, _ = plant_fit.load(str(log / 'pr'))
+    assert 'interp' not in cfg and cfg['tables'] == 'unbiased' and np.array_equal(arrays['k'], np.arange(94))
+    built = analyse.campaign(analyse.parse(['x', 'cpu', week, '--out', 'x', '--as-built'])[1], week, 'pr')
+    assert built['tables'] == 'as built' and built['interp'] == 'linear'
+    seen = []
+    monkeypatch.setattr(search, 'pe_redshift', lambda seg, bank, store, **kw: seen.append(kw))
+    monkeypatch.setattr(search, 'pe_redshift_epochs', lambda epochs, store, **kw: seen.append(kw))
+    ep = strain.read_epoch(os.path.join(week, 'epoch_1266934560.npz'))
+    seg = analyse.variants(dict(seed=7, nbar_inj=0.0), ep, ('pr',), None)[0]['pr']
+    for interp, kw in (('linear', {}), ('log', dict(interp='log'))):
+        pe = analyse.make_analysis('a', 'cpu', **kw)(seg)
+        pe(seg, 17, [0, 1]), pe.batch([pe.epoch(seg, 17, [0, 1])])
+        assert seen[-2]['interp'] == seen[-1]['interp'] == interp
+    given = []
+    monkeypatch.setattr(analyse.plant, 'load_stores', lambda a: 'the stores')
+    monkeypatch.setattr(analyse, 'make_analysis', lambda *a: given.append(a) or Stub().factory)
+    store = write_store(str(tmp_path / 'store'))
+    for interp, extra in (('linear', []), ('log', ['--interp', 'log'])):
+        assert analyse.main([store, 'cpu', week, '--out', str(tmp_path / ('wired_' + interp)), '--seed', '7',
+                             '--variants', 'pr'] + extra) == 0
+        assert given[-1][0] == 'the stores' and given[-1][-1] == interp and len(given[-1]) == 8

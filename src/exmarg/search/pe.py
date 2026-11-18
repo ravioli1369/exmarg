@@ -79,6 +79,7 @@ WINDOWS = dict(model="windows", n_window=64, zone=1, pi_m=None, H=None, L=None) 
 STATE = ("f", "q", "pi_k")                          # the settings of one detector in model='windows'
 SUM_TOL = 1e-6                                      # how far from 1 the sum of a law may be
 ASYM_TOL = 1e-9                                     # how far a template's w may be from the asym of the one store
+INTERP = ("linear", "log")                          # linear between two nodes: Lambda, or ln Lambda (pe_redshift)
 # The single-detector merger term at the boundary point of each template (its own signal power): from a table of Phi
 # made once per bank (single.MergerTable, True) or computed at every segment (single.ln_merger_at, False).  The two
 # use the same interpolation and agree to rounding (tests/test_single.py, tests/test_pe_batch.py); the table saves
@@ -328,10 +329,31 @@ def _node_geometry(bank, st, ymin, ymax=None):
     return valid, lna, y, bnode, blna
 
 
-def _to_source_frame(lamN, yN, Mdet, yq, m1, z, cp):
+def _between(v0, v1, t, interp, cp):
+    """ln Lambda at the fraction t between two nodes of values v0 and v1 (_to_source_frame): interp 'linear'
+    ln((1 - t) e^v0 + t e^v1), the term of weight zero left out (v0 at t = 0 and v1 at t = 1 exactly, a value -inf
+    adds nothing); 'log' v0 + t (v1 - v0)"""
+    if interp == "log":
+        return v0 + t * (v1 - v0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        a = cp.where(t < 1.0, cp.log1p(-cp.minimum(t, 1.0)) + v0, -cp.inf)
+        b = cp.where(t > 0.0, cp.log(cp.maximum(t, 0.0)) + v1, -cp.inf)
+        return cp.logaddexp(a, b)
+
+
+def _to_source_frame(lamN, yN, Mdet, yq, m1, z, cp, interp="linear"):
     """node values (n_node + 1, n_template) -> ln Lambda on (m1, z) (cp: numpy or cupy):
-    linear in y per template, then linear in M_det = 2 m1 (1 + z) per z, each
-    between the neighbouring finite values (as np.interp on the finite ones)"""
+    interpolated in y per template, then in M_det = 2 m1 (1 + z) per z, each
+    between the neighbouring finite values (as np.interp on the finite ones), -inf outside them.
+
+    interp 'linear': Lambda linear between the two values, ln((1 - t) e^v0 + t e^v1) at the fraction t.  That is the
+    likelihood ratio of a population on the two nodes with the weights 1 - t and t, so under noise its mean is 1
+    where theirs is.  'log': ln Lambda linear, v0 + t (v1 - v0), the form of the code up to 2026-11-17, bit for bit.
+    It is a geometric mean of two likelihood ratios, whose mean under noise is below 1 (Hoelder): for two amplitudes
+    dA apart of a Gaussian model exp(-t (1 - t) dA^2 / 2) (tests/test_pe_interp.py), which lowers B.  ValueError for
+    another interp"""
+    if interp not in INTERP:
+        raise ValueError("interp is one of %s; got %r" % (", ".join(INTERP), interp))
     L = cp.asarray(lamN)
     Y = cp.asarray(yN)
     ok = cp.isfinite(L) & (Y > 0)
@@ -349,7 +371,7 @@ def _to_source_frame(lamN, yN, Mdet, yq, m1, z, cp):
     t = cp.where(y1 > y0, (yq_[:, None] - y0) / cp.where(y1 > y0, y1 - y0, 1.0), 1.0)
     ylast = Ys[cp.maximum(n - 1, 0), cp.arange(Ys.shape[1])][None, :]
     inside = (n[None, :] >= 2) & (yq_[:, None] >= Ys[0][None, :]) & (yq_[:, None] <= ylast)
-    surf = cp.where(inside, v0 + t * (v1 - v0), -cp.inf)        # (nz, nm)
+    surf = cp.where(inside, _between(v0, v1, t, interp, cp), -cp.inf)        # (nz, nm)
 
     M = cp.asarray(Mdet)
     good = cp.isfinite(surf)                                      # (nz, nm)
@@ -372,7 +394,7 @@ def _to_source_frame(lamN, yN, Mdet, yq, m1, z, cp):
     last = M[G[zi[0], cp.maximum(ngood - 1, 0)]][None, :]
     inb = (ngood[None, :] >= 2) & (Md >= first) & (Md <= last)
     with np.errstate(invalid="ignore"):                 # -inf - (-inf) outside the bank; those points are masked by inb
-        out = cp.where(inb, w0 + t * (w1 - w0), -cp.inf)
+        out = cp.where(inb, _between(w0, w1, t, interp, cp), -cp.inf)
     return out if cp is np else cp.asnumpy(out)
 
 
@@ -876,7 +898,7 @@ def _segment_keys(gd):
 def pe_redshift(segments, bank, store, rows=None, chunk=8, zmax=8.0, nz=1600,
                 m1_range=(3.0, 150.0), nm1=1600, ymin=0.1267, nodes_per_launch=6, block=256,
                 mdet_range=(10.0, 500.0), resident=False, n_loud=1024, n_random=1024, seed=0, single=False,
-                glitch=None, shared_times=False, zmin=None, asym_tol=0.0):
+                glitch=None, shared_times=False, zmin=None, asym_tol=0.0, interp="linear"):
     """ln Lambda(m1_source, z) of each segment.
 
     segments          anything read_segments takes (see there)
@@ -924,6 +946,10 @@ def pe_redshift(segments, bank, store, rows=None, chunk=8, zmax=8.0, nz=1600,
     asym_tol          a template whose w lies outside the range of the stores by at most asym_tol
                       (one store: differs from its asym by at most asym_tol) is read from the end
                       store alone, its data scaled to that store's model; 0: none (ValueError)
+    interp            how every grid of the result is interpolated between the nodes in y and between
+                      the templates in M_det (_to_source_frame): 'linear', Lambda linear (the mean
+                      under noise stays 1), or 'log', ln Lambda linear (the code up to 2026-11-17,
+                      which lowers it; for comparisons).  ValueError for another
 
     ln B averages Lambda over the prior uniform in M_det = 2 m1 (1+z) on
     mdet_range and proportional to D_L^2 in luminosity distance, i.e.
@@ -955,7 +981,7 @@ def pe_redshift(segments, bank, store, rows=None, chunk=8, zmax=8.0, nz=1600,
                               store, chunk=chunk, zmax=zmax, nz=nz, m1_range=m1_range, nm1=nm1, ymin=ymin,
                               nodes_per_launch=nodes_per_launch, block=block, mdet_range=mdet_range, resident=resident,
                               n_loud=n_loud, n_random=n_random, shared_times=shared_times, zmin=zmin,
-                              asym_tol=asym_tol)[0]
+                              asym_tol=asym_tol, interp=interp)[0]
 
 
 EPOCH = ("segments", "bank", "rows", "seed", "single", "glitch")    # the keys of an epoch of pe_redshift_epochs
@@ -992,16 +1018,17 @@ def _epoch(ep, stores, ymin, ymax, trim, asym_tol, shape, setups=None):
     return dict(bank=bank, seg=seg, geometry=geometry, plan=plan, sd=sd, gd=gd, seed=ep["seed"], out=out, extra=extra)
 
 
-def _source_frame(ep, ev, values, yq, m1, z, below):
-    """the node values of the segments ev of one epoch (_node_values) through the source frame into its result"""
+def _source_frame(ep, ev, values, yq, m1, z, below, interp="linear"):
+    """the node values of the segments ev of one epoch (_node_values) through the source frame into its result,
+    every grid with the same interp (_to_source_frame)"""
     bank, geometry, gd, out, extra = ep["bank"], ep["geometry"], ep["gd"], ep["out"], ep["extra"]
     single = ep["sd"] is not None
     xp = array_module(bank.device)
     lamN, one = values if single else (values, None)
     for j, e in enumerate(ev):
-        out[e] = _to_source_frame(lamN[j], geometry[2], bank.M, yq, m1, z, xp)
+        out[e] = _to_source_frame(lamN[j], geometry[2], bank.M, yq, m1, z, xp, interp)
         for key, node in _node_keys(gd) if single else ():
-            extra[key][e] = _to_source_frame(one[node][j], geometry[2], bank.M, yq, m1, z, xp)
+            extra[key][e] = _to_source_frame(one[node][j], geometry[2], bank.M, yq, m1, z, xp, interp)
         for key in _segment_keys(gd) if single else ():
             extra[key][e] = one[key][j]
         if below is not None:
@@ -1024,7 +1051,8 @@ def _prior_cells(m1, z, mdet_range, below):
 
 def pe_redshift_epochs(epochs, store, chunk=8, zmax=8.0, nz=1600, m1_range=(3.0, 150.0), nm1=1600, ymin=0.1267,
                        nodes_per_launch=6, block=256, mdet_range=(10.0, 500.0), resident=False, n_loud=1024,
-                       n_random=1024, seed=0, single=False, glitch=None, shared_times=False, zmin=None, asym_tol=0.0):
+                       n_random=1024, seed=0, single=False, glitch=None, shared_times=False, zmin=None, asym_tol=0.0,
+                       interp="linear"):
     """pe_redshift of several epochs, each with its own bank (its own noise curves), in one pass over the tables per
     chunk of their segments: the list of the dicts pe_redshift returns for each epoch alone, bit for bit.
 
@@ -1049,6 +1077,8 @@ def pe_redshift_epochs(epochs, store, chunk=8, zmax=8.0, nz=1600, m1_range=(3.0,
         _check_bank(ep["bank"])
     if len({ep["bank"].device for ep in epochs}) > 1:
         raise ValueError("the banks of pe_redshift_epochs must be on one device")
+    if interp not in INTERP:
+        raise ValueError("interp is one of %s; got %r" % (", ".join(INTERP), interp))
     stores = _store_list(store)
     z = np.linspace(0.02, zmax, int(nz))
     m1 = np.geomspace(m1_range[0], m1_range[1], int(nm1))
@@ -1070,7 +1100,7 @@ def pe_redshift_epochs(epochs, store, chunk=8, zmax=8.0, nz=1600, m1_range=(3.0,
         values = _epochs_values([(eps[i], ev) for i, ev in part], groups, block, resident, n_loud, n_random,
                                 shared_times)
         for (i, ev), v in zip(part, values):
-            _source_frame(eps[i], ev, v, yq, m1, z, below)
+            _source_frame(eps[i], ev, v, yq, m1, z, below, interp)
     w = _prior_cells(m1, z, mdet_range, below)
     return [dict(m1=m1.copy(), z=z.copy(), ln_lambda=ep["out"], ln_b=np.array([_log_mean(L, w) for L in ep["out"]]),
                  rows=ep["seg"]["rows"], **ep["extra"]) for ep in eps]

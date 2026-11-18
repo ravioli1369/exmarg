@@ -1,7 +1,8 @@
 """the unbiased tables: linear interpolation of a convex function overshoots by h^2 T'' / 12 on average, and unbias()
 removes exactly that (constructed functions, no store needed), while the average of exp(lnS) over a cell, which the
-likelihood takes, is closer to the truth without it where lnS is steep (why the search reads the tables as built); and
-the loading of a store folder of small random tables: asym, nodes, the caches of both kinds."""
+likelihood takes, is closer to the truth without it where lnS is steep (the reason given on 2026-11-17 for reading
+the tables as built; the search reads them with unbias again, scripts/validate/plant.py, Tables); and the loading of a
+store folder of small random tables: asym, nodes, the caches of both kinds and the script that writes them."""
 import numpy as np
 import pytest
 from scipy.interpolate import RegularGridInterpolator
@@ -52,7 +53,8 @@ def cell_errors(f, grid, table, n_point=1000):
 
 
 def test_cell_average_of_exp_is_closer_without_unbias_where_lnS_is_steep():
-    """why the search reads the tables as built.  unbias() gives the interpolated lnS no mean error over a cell, but
+    """the reason given on 2026-11-17 for reading the tables as built (the search reads them with unbias again:
+    scripts/validate/plant.py, Tables).  unbias() gives the interpolated lnS no mean error over a cell, but
     the likelihood averages S = exp(lnS).  The table: lnS(beta) = ln sum_n e^(n beta) / (n!)^2 = ln I_0(2 e^(beta / 2)),
     the form of a lag sum at fixed lag, phi and Delta (a power series in e^beta with coefficients >= 0, convex), on 100
     nodes beta = -4 + 0.139 j (the beta step of the tables), lnS from 0.02 to 260, as a table (1, 3, 100, 3) constant
@@ -232,3 +234,31 @@ def test_cache_of_the_other_kind_is_refused(tmp_path):
         for cache in (unb, old):
             with pytest.raises(ValueError, match='cache of the tables unbiased .*, not as built as asked'):
                 load_redshift_store(cache, mmap=mmap, unbiased=False)
+
+
+def test_store_cache_script_writes_the_unbiased_cache_by_default(tmp_path, capsys):
+    """scripts/real_data/store_cache.py writes the cache that plant.py and analyse.py read by default: the tables with
+    unbias (cache.json unbiased true, the tables those of load_redshift_store(unbiased=True) bit for bit), also with
+    --unbiased, which names the default; --as-built writes them as built (the tables of the store folder), and the two
+    options together are refused.  The library's own default stays as built (write_cache, above).  Fires on: the
+    script leaving the kind to write_cache's default"""
+    import importlib.util
+    import json
+    import os
+    from exmarg.search.store import load_redshift_store
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    spec = importlib.util.spec_from_file_location('store_cache', os.path.join(root, 'scripts', 'real_data',
+                                                                             'store_cache.py'))
+    script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(script)
+    src = write_store(str(tmp_path / 'store'))
+    for name, extra, kind in (('a', [], True), ('b', ['--unbiased'], True), ('c', ['--as-built'], False)):
+        cache = str(tmp_path / name)
+        assert script.main([src, cache, '--readers', '2'] + extra) == 0
+        assert ('tables %s' % ('unbiased' if kind else 'as built')) in capsys.readouterr().out
+        assert json.load(open(os.path.join(cache, 'cache.json')))['unbiased'] is kind
+        got, want = load_redshift_store(cache, mmap=True), load_redshift_store(src, unbiased=kind)
+        assert got.unbiased is kind and all(a.tobytes() == b.tobytes() for a, b in zip(got.tables, want.tables))
+    with pytest.raises(SystemExit):
+        script.main([src, str(tmp_path / 'd'), '--unbiased', '--as-built'])
+    assert not os.path.exists(str(tmp_path / 'd'))

@@ -50,13 +50,16 @@ rho_I and t0_I NaN), merger_truth 'injections' for inj and 'none' otherwise (mer
 Per segment also: gps, gps_epoch, the flags event, analysable, loud_H, loud_L, dq_H, dq_L, inj_H, inj_L, the band
 monitors monitor_H, monitor_L (n, 5) and the epoch's u_ratio_60.
 
-Tables.  The merger stage reads the tables as built, as plant.py does (its docstring, Tables); --unbias reads them with
-the correction of store.unbias, for comparisons only (it lowers the merger rate: 0.2543 against 0.2985 as built for
-mergers planted at nbar 0.30 in 16384 Gaussian segments).  The campaign of every merger-stage run records the kind,
-tables 'as built' or 'unbiased' (a setting of the merger stage, plant.MERGER_KEYS), so that files of the two kinds are
-never one campaign.  Files written before 2026-11-17 record no tables entry and were read with unbias: a run of today
-into their folders is refused as another campaign.  --mmap maps caches of the kind asked for (store_cache.py, with
---unbiased for --unbias) or store folders as built.
+Tables.  The merger stage reads the tables with the correction of store.unbias and takes Lambda linear between their
+nodes and between the templates, as plant.py does (its docstring, Tables).  For comparisons only, --as-built reads the
+tables as built and --interp log takes ln Lambda linear (the two together: the authors' method; with ln Lambda linear
+unbias lowers the merger rate: 0.2543 against 0.2985 as built for mergers planted at nbar 0.30 in 16384 Gaussian
+segments); --unbias names the default and changes nothing.  The campaign of every merger-stage run records the kind,
+tables 'unbiased' or 'as built', and interp 'linear' (settings of the merger stage, plant.MERGER_KEYS), so that files
+of two readings are never one campaign; a run with --interp log records no interp entry, as the files written before
+2026-11-18, all of them read that way, whose campaign it continues.  Files written before 2026-11-17 record no tables
+entry and were read with unbias: a run of today into their folders is refused as another campaign.  --mmap maps caches
+of the kind the run reads (store_cache.py, as built with its --as-built) or, with --as-built, store folders.
 
 The window model (docs/glitch_likelihood.md, Sec. 4a), in two stages:
     python scripts/real_data/analyse.py none gpu data/segments/O3b_v2 --out runs/week_w --stage windows
@@ -359,16 +362,19 @@ def variants(cfg, ep, names, sampler, own=False, gain=False):
     return out, rows, inj
 
 
-def make_analysis(store, device, resident=False, chunk=CHUNK, ymin=None, zmin=None, asym_tol=None):
+def make_analysis(store, device, resident=False, chunk=CHUNK, ymin=None, zmin=None, asym_tol=None,
+                  interp=plant.INTERP[0]):
     """factory(segments) builds the bank of plant.MASSES on the epoch's noise curves, with the signal gain the segments
     carry (segments['gain'], set by variants with gain; gains 1 without it), and returns pe(segments, seed, rows,
     glitch=True) -> the pe_redshift dict (glitch=True, or the dict of the window model) of those rows of the segments,
     on plant.GRID; store one store or a list (the mixture), zmin and asym_tol those of pe_redshift (each given only when
-    not None).  pe.epoch(segments, seed, rows, glitch=True) is the same call as an epoch of pe_redshift_epochs, and
-    pe.batch(epochs) analyses such epochs (of any epoch's bank) in one pass over the tables: [the dict of each]"""
+    not None), interp that of pe_redshift.  pe.epoch(segments, seed, rows, glitch=True) is the same call as an epoch of
+    pe_redshift_epochs, and pe.batch(epochs) analyses such epochs (of any epoch's bank) in one pass over the tables:
+    [the dict of each]"""
     from exmarg.search import mass_bank, pe_redshift, pe_redshift_epochs
     cut = {k: v for k, v in (('zmin', zmin), ('asym_tol', asym_tol)) if v is not None}
-    settings = dict(chunk=chunk, resident=resident, ymin=ymin, mdet_range=plant.MDET, **cut, **plant.GRID)
+    settings = dict(chunk=chunk, resident=resident, ymin=ymin, mdet_range=plant.MDET, interp=interp, **cut,
+                    **plant.GRID)
 
     def factory(seg0):
         bank = mass_bank(plant.MASSES, seg0, device, gain=seg0.get('gain'))
@@ -699,13 +705,20 @@ def parser():
                    help='with --unequal or several stores: a template whose asymmetry lies outside the stores\' range by at '
                         'most this is read from the end store (default %g; recorded, and the number of such templates '
                         'per segment in asym_outside)' % plant.ASYM_TOL)
+    p.add_argument('--as-built', dest='as_built', action='store_true',
+                   help='merger stage: read the tables as built, without the unbias correction (store.unbias), for '
+                        'comparisons; recorded in the campaign as tables as built (default: unbiased)')
     p.add_argument('--unbias', action='store_true',
-                   help='merger stage: read the tables with the unbias correction (store.unbias), for comparisons: it '
-                        'lowers the merger rate; recorded in the campaign as tables unbiased (default: as built)')
+                   help='merger stage: the tables with the unbias correction, the default: changes nothing (kept so '
+                        'that older command lines run; not with --as-built)')
+    p.add_argument('--interp', choices=plant.INTERP, default=plant.INTERP[0],
+                   help='merger stage, between the nodes of the tables and between the templates: linear, Lambda '
+                        'linear (default), or log, ln Lambda linear (the authors\' code, for comparisons: it lowers '
+                        'the noise mean of B); the campaign records interp linear, and no entry with log')
     p.add_argument('--mmap', action='store_true',
-                   help='map the tables from disk instead of reading them: caches of the kind asked for '
-                        '(store_cache.py, as built by default, with --unbiased for --unbias) or store folders as '
-                        'built; the jobs of a machine share them')
+                   help='map the tables from disk instead of reading them: caches of the kind the run reads '
+                        '(store_cache.py, unbiased by default, as built with --as-built) or, with --as-built, store '
+                        'folders; the jobs of a machine share them')
     return p
 
 
@@ -723,8 +736,11 @@ def parse(argv=None):
         p.error('--variants: %s' % err)
     if a.chunk is None:
         a.chunk = plant.WINDOW_CHUNK if a.stage == 'windows' else CHUNK
-    if a.stage == 'windows' and (a.glitch_model or a.zmin_cut or a.mmap or a.unbias):
-        p.error('--glitch-model, --zmin-cut, --mmap and --unbias are of the merger stage')
+    if a.stage == 'windows' and (a.glitch_model or a.zmin_cut or a.mmap or a.unbias or a.as_built
+                                 or a.interp != plant.INTERP[0]):
+        p.error('--glitch-model, --zmin-cut, --mmap, --unbias, --as-built and --interp are of the merger stage')
+    if a.unbias and a.as_built:
+        p.error('--as-built reads the tables as built: not with --unbias')
     if a.stage == 'windows' and a.ymin is not None and plant.store_ladder(a.store) is None:
         p.error('--ymin with the windows stage sets the population of its merger evidence: give the store')
     if not a.zmin >= 0:
@@ -759,7 +775,7 @@ def main(argv=None, factory=None):
         factory = make_windows(a.device, a.n_window, a.chunk, pop, plant.store_lags(a.store))
     elif factory is None:
         for d in a.store.split(','):
-            problem = plant.store_problem(d, a.unbias, a.mmap)
+            problem = plant.store_problem(d, not a.as_built, a.mmap)
             if problem:
                 p.error(problem)
         loaded = {}
@@ -769,7 +785,7 @@ def main(argv=None, factory=None):
                 loaded['store'] = plant.load_stores(a)
             return make_analysis(loaded['store'], a.device, a.resident, a.chunk,
                                  plant.default_ymin() if a.ymin is None else a.ymin,
-                                 a.zmin if a.zmin_cut else None, plant.asym_tol(a))(seg)
+                                 a.zmin if a.zmin_cut else None, plant.asym_tol(a), a.interp)(seg)
     print('%s  %s, part %d/%d, variants %s, into %s; stage %s%s%s, zmin %g%s' % (
         stamp(), a.segments, a.part[0], a.part[1], ','.join(a.variants), a.out, a.stage,
         ', glitch model %s' % a.glitch_model if a.glitch_model else '', ', own noise curves' if a.unequal else '',

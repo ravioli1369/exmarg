@@ -3,7 +3,8 @@ the tables give, for every epoch, the arrays of a pe_redshift call of its own, b
 
 The reference is pe.py as committed before the batched path (COMMITTED, imported from git as a module of
 exmarg.search, as tests/test_pe_unequal.py does): one call per epoch.  The new pe_redshift (the call of one epoch) is
-compared with it too.
+compared with it too.  The committed pe.py takes ln Lambda linear between the nodes of the tables, so the calls
+compared with it are made with interp 'log' (LOG).
 
 Stores: the incoherent stores of tests/test_pe_unequal.py on the nodes S_NODES, each node with its own beta grid, read
 two nodes per launch (groups [0, 1], [2]), so that a launch holds nodes some epochs need and others do not.  Epochs
@@ -39,6 +40,7 @@ from test_pe_windows import add_glitch, law
 ROOT = Path(__file__).resolve().parents[1]
 COMMITTED = "ee47f02"                       # pe.py before pe_redshift_epochs
 NEW = {"wnet"}                              # outputs added after COMMITTED (with single or glitch)
+LOG = dict(interp="log")                    # ln Lambda linear between the nodes, as COMMITTED takes it (pe_redshift)
 S_NODES = (0.5, 2.0, 8.0)
 MIX = (-0.45, -0.30, -0.15)
 GRID = dict(nz=40, nm1=30, m1_range=(10.0, 60.0))
@@ -128,10 +130,10 @@ def test_batched_equals_per_epoch(committed, case):
         eps.append(ep)
         args = dict(kw, **{k: v for k, v in ep.items() if k not in ("segments", "bank")})
         refs.append((committed.pe_redshift(segs, bank, st, **COMMON, **args),
-                     pe.pe_redshift(segs, bank, st, **COMMON, **args)))
+                     pe.pe_redshift(segs, bank, st, **COMMON, **args, **LOG)))
     n = 0
     for chunk in (2, 100):
-        got = pe.pe_redshift_epochs(eps, st, chunk=chunk, **COMMON, **kw)
+        got = pe.pe_redshift_epochs(eps, st, chunk=chunk, **COMMON, **kw, **LOG)
         assert len(got) == len(eps)
         for (name, _, _), r, (old, new) in zip(names, got, refs):
             assert set(r) == set(new) and set(r) - NEW == set(old), (case, name)
@@ -328,7 +330,7 @@ def test_driver_batched_equals_committed(tmp_path, committed, committed_driver, 
     from test_store import write_store
     week = small_week(str(tmp_path / 'segments'))
     store = load_redshift_store(write_store(str(tmp_path / 'store')))
-    new = analyse.make_analysis(store, 'cpu', chunk=3, ymin=plant.default_ymin())
+    new = analyse.make_analysis(store, 'cpu', chunk=3, ymin=plant.default_ymin(), **LOG)
     monkeypatch.setattr(search, 'pe_redshift', committed.pe_redshift)        # what the committed driver binds
     old = committed_driver.make_analysis(store, 'cpu', chunk=3, ymin=plant.default_ymin())
     variants = 'pr,slide+2.25' if model else 'pr,rev,slide+2.25'

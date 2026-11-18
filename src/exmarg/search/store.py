@@ -17,9 +17,10 @@ cache            the tables of a store written once (write_cache): T_<k>.npy flo
                  with unbias, below).  load_redshift_store(cache, mmap=True) maps them, so that the jobs of a machine
                  share one copy in the page cache instead of each holding a private page-locked one.
 
-The tables are read as built by default (below): load_redshift_store(unbiased=False) for a store folder, and a cache is
-loaded as the kind its cache.json records (a cache without the entry is an older one written with unbias).  A request
-for the other kind of a cache is refused, and the store returned records its kind (RedshiftStore.unbiased).
+A store folder is read as built unless unbiased=True is asked (below; plant.py and analyse.py ask for it by default,
+and for unbiased=False with --as-built), and a cache is loaded as the kind its cache.json records (a cache without the
+entry is an older one written with unbias).  A request for the other kind of a cache is refused, and the store returned
+records its kind (RedshiftStore.unbiased).
 
 The tables hold lnS at the points of a grid and are read by linear interpolation.  On a grid of spacing h a function of
 curvature T'' is then overestimated by h^2 T'' f (1 - f) / 2 at the fraction f of a cell, h^2 T'' / 12 on average, and
@@ -31,8 +32,11 @@ small, and the subtraction lowers the average of exp(lnS) by more than the inter
 the tables', where lnS rises by more than 9 across a cell: tests/test_store.py).  On 16384 Gaussian
 segments with mergers planted at nbar 0.30 the published tables as built give nbar 0.2985, our rebuilt tables as built
 0.2985, and the same tables with unbias 0.2543 (difference -0.044 +- 0.004); unbias lowers ln Lambda_bar by about 0.004
-for faint segments and by 0.04 to 0.12 for loud mergers.  unbias() is kept for such comparisons (unbiased=True;
-plant.py and analyse.py --unbias).
+for faint segments and by 0.04 to 0.12 for loud mergers.  Those runs took ln Lambda linear between the nodes of the
+store and between the templates (pe.pe_redshift(interp='log')), a geometric mean of likelihood ratios, which lowers the
+likelihood ratio and so works against the error of the tables as built.  plant.py and analyse.py read the tables with
+unbias and take Lambda linear there (interp='linear', whose mean under noise is 1); --as-built and --interp log give
+the other readings, for comparisons.
 """
 
 import glob
@@ -228,7 +232,7 @@ def load_redshift_store(store_dir, pinned=False, readers=6, mmap=False, unbiased
             raise ValueError("%s is a cache of the tables %s (its cache.json), not %s as asked (unbiased=%s): give a "
                              "cache of that kind (scripts/real_data/store_cache.py%s) or the store folder"
                              % (store_dir, TABLE_KINDS[own], TABLE_KINDS[bool(unbiased)], bool(unbiased),
-                                " --unbiased" if unbiased else ""))
+                                "" if unbiased else " --as-built"))
         unbiased = own
     unbiased = bool(unbiased)
     keep = np.arange(h["s"].size) if nodes is None else np.unique(np.asarray(nodes, int))

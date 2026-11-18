@@ -3,7 +3,9 @@ one place, so that every week of a run is analysed with the same commands:
 
     each detector on its own noise curve, with the signal gain of the conditioning       analyse.py --unequal
     the whole population of the paper, z from 0.02                                       --zmin 0.02
-    the stores of the asymmetries w = 0, -0.30, -0.60, mapped from their caches as built <stores>, --mmap
+    the stores of the asymmetries w = 0, -0.30, -0.60, mapped from their unbiased caches <stores>, --mmap
+    the tables with unbias and Lambda linear between their nodes and between the         the defaults of analyse.py
+    templates                                                                            (its docstring, Tables)
     the window model: stage 1, the fit of each variant on its own data, stage 2          --stage windows, windows_fit.py
                                                                                          --rho-min 5 --record 1,
                                                                                          --glitch-model auto
@@ -70,7 +72,7 @@ def commands(a):
 def parse(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('step', choices=STEPS)
-    p.add_argument('stores', help='the three caches as built (store_cache.py), comma separated')
+    p.add_argument('stores', help='the three unbiased caches (store_cache.py), comma separated')
     p.add_argument('segments', help='the folder of the conditioned epochs of the week')
     p.add_argument('--out', required=True, help='the folder of the week\'s results')
     p.add_argument('--variants', default=','.join(CONTROLS), help='default: the controls, %s' % ','.join(CONTROLS))

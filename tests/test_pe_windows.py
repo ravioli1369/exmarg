@@ -585,16 +585,18 @@ NAMED = dict(model=None, window=0.05)                # the default model, named:
 
 @pytest.mark.parametrize("which", range(len(IDENTITY)))
 def test_default_path_unchanged(data, pe_head, which):
-    """glitch None / True / dict without model: every output of pe_redshift and pe_intrinsic is the array of the
-    committed pe.py bit for bit (same keys), with every arrival time and with the default selection of arrival
-    times, single=True and False; an unnormalized pi_k is used as given (kbar does not depend on its scale)"""
+    """glitch None / True / dict without model: every output of pe_redshift (with interp 'log': the committed pe.py
+    takes ln Lambda linear between the nodes) and pe_intrinsic is the array of the committed pe.py bit for bit (same
+    keys), with every arrival time and with the default selection of arrival times, single=True and False; an
+    unnormalized pi_k is used as given (kbar does not depend on its scale)"""
     glitch = IDENTITY[which]
     args = (data["segs"], data["bank"], data["store"])
     n = 0
     for name, kw in (("pe_redshift", REDSHIFT), ("pe_intrinsic", {})):
         for extra in (dict(n_loud=0), dict(seed=3)):
             for sgl in ((False, True) if glitch is None else (False,)):
-                a = getattr(pe, name)(*args, glitch=glitch, single=sgl, **extra, **kw)
+                log = dict(interp="log") if name == "pe_redshift" else {}
+                a = getattr(pe, name)(*args, glitch=glitch, single=sgl, **extra, **kw, **log)
                 b = getattr(pe_head, name)(*args, glitch=glitch, single=sgl, **extra, **kw)
                 assert set(a) - {"wnet"} == set(b)                   # wnet: added after the committed pe.py
                 for k in b:

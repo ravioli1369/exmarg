@@ -170,8 +170,9 @@ def traj_wnet(c, e, lags, ubar=False):
 
 
 def test_wnet_outputs_bit_identical(base):
-    """every array of pe_redshift, pe_intrinsic, pe_redshift_epochs (two epochs, their own seeds, rows and glitch
-    settings) and window_evidences is that of pe.py at BASE bit for bit, for glitch None, single, True and the window
+    """every array of pe_redshift and pe_redshift_epochs (two epochs, their own seeds, rows and glitch settings),
+    both with interp 'log' (pe.py at BASE takes ln Lambda linear between the nodes), of pe_intrinsic and of
+    window_evidences is that of pe.py at BASE bit for bit, for glitch None, single, True and the window
     model, equal curves (one store) and unequal curves (the mixture of three stores); the only new key is wnet
     (n_segment, n_template), with single or glitch, and in window_evidences only when given the lags; wnet is the brute
     force of the unscaled data with u_H, u_L (not ubar: that differs on unequal curves) and the store's lags, and is the
@@ -191,7 +192,7 @@ def test_wnet_outputs_bit_identical(base):
             kw = dict(single=True) if glitch == 'single' else dict(glitch=tu.WINDOWS if glitch == 'windows' else glitch)
             for name, extra in (('pe_redshift', tu.REDSHIFT), ('pe_intrinsic', {})):
                 a = getattr(pe, name)(c['segs'], c['bank'], stores, ymin=0.1, nodes_per_launch=1, n_loud=0, **kw,
-                                      **extra)
+                                      **extra, **(dict(interp='log') if name == 'pe_redshift' else {}))
                 b = getattr(base['pe'], name)(c['segs'], c['bank'], stores, ymin=0.1, nodes_per_launch=1, n_loud=0,
                                               **kw, **extra)
                 assert set(a) - set(b) == (set() if glitch is None else {'wnet'}) and set(b) <= set(a), (name, glitch)
@@ -214,7 +215,8 @@ def test_wnet_outputs_bit_identical(base):
     eps = [dict(segments=c['segs'], bank=c['bank'], seed=3, glitch=True),
            dict(segments=c['segs'], bank=c['bank'], rows=[2, 0], seed=4, glitch=tu.WINDOWS)]
     common = dict(ymin=0.1, nodes_per_launch=1, n_loud=64, n_random=64, chunk=2, **tu.REDSHIFT)
-    new, old = pe.pe_redshift_epochs(eps, st, **common), base['pe'].pe_redshift_epochs(eps, st, **common)
+    new = pe.pe_redshift_epochs(eps, st, interp='log', **common)
+    old = base['pe'].pe_redshift_epochs(eps, st, **common)
     for a, b, rows in zip(new, old, ([0, 1, 2], [2, 0])):
         assert set(a) == set(b) | {'wnet'} and all(np.array_equal(np.asarray(a[k]), np.asarray(b[k])) for k in b)
         assert np.allclose(a['wnet'], refs[0.0][rows], rtol=1e-13, atol=0)

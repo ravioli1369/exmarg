@@ -549,9 +549,10 @@ def select_times(traj, tau_idx, n_loud, n_random, seed, xp=np, block=256, shared
               weight ln(n_time / n_random), and no weight (LK_MIN) for a
               template on whose n_loud times a draw falls.  The estimate of
               each template stays unbiased, and neighbouring templates then
-              err together: ln Lambda is interpolated between templates, and
-              the interpolation of two estimates with independent errors, a
-              geometric mean, is biased low.
+              err together: with ln Lambda interpolated between templates
+              (pe_redshift's interp 'log') the interpolation of two estimates
+              with independent errors, a geometric mean, is biased low; with
+              Lambda linear between them ('linear', the default) it is not.
 
     returns (sel, lw): (n_template, n_loud + n_random) int32 times, sorted,
     and float32 log weights, on the device of xp."""

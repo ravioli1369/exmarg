@@ -192,9 +192,12 @@ def same(a, b):
 
 
 def all_outputs(mod, segs, bank, st, glitch):
+    """every output of pe_redshift, pe_intrinsic and window_evidences of the module mod; pe.py itself with interp
+    'log' (pe.py of BASE takes ln Lambda linear between the nodes and has no interp)"""
     kw = dict(single=True) if glitch == "single" else dict(glitch=tu.WINDOWS if glitch == "windows" else glitch)
     out = {}
-    for name, extra in (("pe_redshift", tu.REDSHIFT), ("pe_intrinsic", {})):
+    for name, extra in (("pe_redshift", dict(tu.REDSHIFT, **(dict(interp="log") if mod is pe else {}))),
+                        ("pe_intrinsic", {})):
         r = getattr(mod, name)(segs, bank, st, ymin=0.1, nodes_per_launch=1, n_loud=0, **kw, **extra)
         out.update({"%s %s" % (name, k): np.asarray(v) for k, v in r.items()})
     out.update({"windows %s" % k: np.asarray(v) for k, v in mod.window_evidences(segs, bank).items()})

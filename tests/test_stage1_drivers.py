@@ -363,9 +363,10 @@ def same_win_files(a, b, prefix, new=('wnet',), tables=None):
 def test_plant_default_outputs_as_main(tmp_path):
     """plant.py's outputs are those of the main branch merged in (a79e07d, its tree in a process of its own): the
     windows stage without a store (2 segments, the plant's bank and window evidences on the CPU), and the merger stage
-    with the default glitch terms on a small store (write_store, 2 segments), with --unbias, the default of a79e07d
-    (which read the tables with unbias and recorded no tables entry): every array bit for bit, the meta but the run's
-    record and the tables entry (unbiased here)"""
+    with the default glitch terms on a small store (write_store, 2 segments), with --unbias --interp log, the reading
+    of a79e07d (the tables with unbias, ln Lambda linear between their nodes; it recorded no tables entry and, as the
+    run with --interp log, no interp entry): every array bit for bit, the meta but the run's record and the tables
+    entry (unbiased here)"""
     from test_store import write_store
     tree = tm.committed('a79e07d')
     if tree is None:
@@ -375,7 +376,8 @@ def test_plant_default_outputs_as_main(tmp_path):
             '--gamma', '4', '--rho-min', '5', '--zmin', '0.5']
     n = 0
     for stage, store_arg, extra, now, prefix in (('windows', 'none', ['--stage', 'windows'], [], 'win'),
-                                                 ('merger', store, ['--chunk', '2'], ['--unbias'], 'plant')):
+                                                 ('merger', store, ['--chunk', '2'],
+                                                  ['--unbias', '--interp', 'log'], 'plant')):
         a, b = tmp_path / ('main_' + stage), tmp_path / ('merged_' + stage)
         run_committed_plant(tree, [store_arg, 'cpu'] + base + extra + ['--out', str(a)], str(tmp_path))
         assert plant.main([store_arg, 'cpu'] + base + extra + now + ['--out', str(b)]) == 0
